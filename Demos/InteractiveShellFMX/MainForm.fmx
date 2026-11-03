@@ -1,0 +1,112 @@
+object frmMainForm: TfrmMainForm
+  Left = 0
+  Top = 0
+  Caption = 'Interactive Shell - VSoft.Process FMX demo'
+  ClientHeight = 580
+  ClientWidth = 800
+  Position = ScreenCenter
+  FormFactor.Width = 320
+  FormFactor.Height = 480
+  FormFactor.Devices = [Desktop]
+  OnCreate = FormCreate
+  OnCloseQuery = FormCloseQuery
+  OnDestroy = FormDestroy
+  DesignerMasterStyle = 0
+  object lvOutput: TListView
+    ItemAppearanceClassName = 'TListItemAppearance'
+    ItemEditAppearanceClassName = 'TListItemShowCheckAppearance'
+    HeaderAppearanceClassName = 'TListHeaderObjects'
+    FooterAppearanceClassName = 'TListHeaderObjects'
+    Align = Client
+    Margins.Left = 8.000000000000000000
+    Margins.Top = 8.000000000000000000
+    Margins.Right = 8.000000000000000000
+    Size.Width = 784.000000000000000000
+    Size.Height = 482.000000000000000000
+    Size.PlatformDefault = False
+    TabOrder = 0
+    CanSwipeDelete = False
+  end
+  object layBottom: TLayout
+    Align = Bottom
+    Padding.Left = 8.000000000000000000
+    Padding.Top = 6.000000000000000000
+    Padding.Right = 8.000000000000000000
+    Padding.Bottom = 8.000000000000000000
+    Position.Y = 490.000000000000000000
+    Size.Width = 800.000000000000000000
+    Size.Height = 90.000000000000000000
+    Size.PlatformDefault = False
+    TabOrder = 1
+    object lblStatus: TLabel
+      Align = Top
+      Position.X = 8.000000000000000000
+      Position.Y = 6.000000000000000000
+      Size.Width = 784.000000000000000000
+      Size.Height = 20.000000000000000000
+      Size.PlatformDefault = False
+      Text = 'Idle'
+      TabOrder = 0
+    end
+    object layInput: TLayout
+      Align = Top
+      Margins.Top = 2.000000000000000000
+      Position.X = 8.000000000000000000
+      Position.Y = 28.000000000000000000
+      Size.Width = 784.000000000000000000
+      Size.Height = 24.000000000000000000
+      Size.PlatformDefault = False
+      TabOrder = 1
+      object edInput: TEdit
+        Touch.InteractiveGestures = [LongTap, DoubleTap]
+        Align = Client
+        TabOrder = 0
+        Size.Width = 698.000000000000000000
+        Size.Height = 24.000000000000000000
+        Size.PlatformDefault = False
+        OnKeyDown = edInputKeyDown
+      end
+      object btnSend: TButton
+        Align = Right
+        Margins.Left = 6.000000000000000000
+        Position.X = 704.000000000000000000
+        Size.Width = 80.000000000000000000
+        Size.Height = 24.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 1
+        Text = 'Send'
+        OnClick = btnSendClick
+      end
+    end
+    object layButtons: TLayout
+      Align = Top
+      Margins.Top = 6.000000000000000000
+      Position.X = 8.000000000000000000
+      Position.Y = 58.000000000000000000
+      Size.Width = 784.000000000000000000
+      Size.Height = 24.000000000000000000
+      Size.PlatformDefault = False
+      TabOrder = 2
+      object btnStart: TButton
+        Align = Left
+        Size.Width = 100.000000000000000000
+        Size.Height = 24.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 0
+        Text = 'Start shell'
+        OnClick = btnStartClick
+      end
+      object btnStop: TButton
+        Align = Left
+        Margins.Left = 6.000000000000000000
+        Position.X = 106.000000000000000000
+        Size.Width = 100.000000000000000000
+        Size.Height = 24.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 1
+        Text = 'Stop'
+        OnClick = btnStopClick
+      end
+    end
+  end
+end

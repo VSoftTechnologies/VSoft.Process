@@ -12,6 +12,9 @@
         <Projects Include="InteractiveShell\InteractiveShell.dproj">
             <Dependencies/>
         </Projects>
+        <Projects Include="InteractiveShellFMX\InteractiveShellFMX.dproj">
+            <Dependencies/>
+        </Projects>
     </ItemGroup>
     <ProjectExtensions>
         <Borland.Personality>Default.Personality.12</Borland.Personality>
@@ -47,14 +50,23 @@
     <Target Name="InteractiveShell:Make">
         <MSBuild Projects="InteractiveShell\InteractiveShell.dproj" Targets="Make"/>
     </Target>
+    <Target Name="InteractiveShellFMX">
+        <MSBuild Projects="InteractiveShellFMX\InteractiveShellFMX.dproj"/>
+    </Target>
+    <Target Name="InteractiveShellFMX:Clean">
+        <MSBuild Projects="InteractiveShellFMX\InteractiveShellFMX.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="InteractiveShellFMX:Make">
+        <MSBuild Projects="InteractiveShellFMX\InteractiveShellFMX.dproj" Targets="Make"/>
+    </Target>
     <Target Name="Build">
-        <CallTarget Targets="BasicConsole;PipeTargets;InteractiveShell"/>
+        <CallTarget Targets="BasicConsole;PipeTargets;InteractiveShell;InteractiveShellFMX"/>
     </Target>
     <Target Name="Clean">
-        <CallTarget Targets="BasicConsole:Clean;PipeTargets:Clean;InteractiveShell:Clean"/>
+        <CallTarget Targets="BasicConsole:Clean;PipeTargets:Clean;InteractiveShell:Clean;InteractiveShellFMX:Clean"/>
     </Target>
     <Target Name="Make">
-        <CallTarget Targets="BasicConsole:Make;PipeTargets:Make;InteractiveShell:Make"/>
+        <CallTarget Targets="BasicConsole:Make;PipeTargets:Make;InteractiveShell:Make;InteractiveShellFMX:Make"/>
     </Target>
     <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
 </Project>
