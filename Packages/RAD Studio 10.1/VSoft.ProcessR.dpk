@@ -1,0 +1,51 @@
+package VSoft.ProcessR;
+
+{$R *.res}
+{$IFDEF IMPLICITBUILDING This IFDEF should not be used by users}
+{$ALIGN 8}
+{$ASSERTIONS ON}
+{$BOOLEVAL OFF}
+{$DEBUGINFO OFF}
+{$EXTENDEDSYNTAX ON}
+{$IMPORTEDDATA ON}
+{$IOCHECKS ON}
+{$LOCALSYMBOLS ON}
+{$LONGSTRINGS ON}
+{$OPENSTRINGS ON}
+{$OPTIMIZATION OFF}
+{$OVERFLOWCHECKS OFF}
+{$RANGECHECKS OFF}
+{$REFERENCEINFO ON}
+{$SAFEDIVIDE OFF}
+{$STACKFRAMES ON}
+{$TYPEDADDRESS OFF}
+{$VARSTRINGCHECKS ON}
+{$WRITEABLECONST OFF}
+{$MINENUMSIZE 1}
+{$IMAGEBASE $400000}
+{$DEFINE DEBUG}
+{$ENDIF IMPLICITBUILDING}
+{$DESCRIPTION 'Runtime package for VSoft.Process'}
+{$LIBSUFFIX '240'}
+{$RUNONLY}
+{$IMPLICITBUILD OFF}
+
+requires
+  rtl,
+  VSoft.CancellationTokenR;
+
+contains
+  VSoft.Process.Base in '..\..\Source\VSoft.Process.Base.pas',
+  VSoft.Process.CommandLine in '..\..\Source\VSoft.Process.CommandLine.pas',
+  VSoft.Process.Credentials in '..\..\Source\VSoft.Process.Credentials.pas',
+  VSoft.Process.Environment in '..\..\Source\VSoft.Process.Environment.pas',
+  VSoft.Process in '..\..\Source\VSoft.Process.pas',
+  VSoft.Process.PipeSource.Classes in '..\..\Source\VSoft.Process.PipeSource.Classes.pas',
+  VSoft.Process.PipeTarget.Classes in '..\..\Source\VSoft.Process.PipeTarget.Classes.pas',
+  VSoft.Process.StartInfo in '..\..\Source\VSoft.Process.StartInfo.pas',
+  VSoft.Process.Utils in '..\..\Source\VSoft.Process.Utils.pas',
+  VSoft.Process.WinAPI in '..\..\Source\VSoft.Process.WinAPI.pas'{$IFDEF MSWINDOWS},
+  VSoft.Process.Windows in '..\..\Source\VSoft.Process.Windows.pas'{$ENDIF}{$IFDEF POSIX},
+  VSoft.Process.Posix in '..\..\Source\VSoft.Process.Posix.pas'{$ENDIF};
+
+end.

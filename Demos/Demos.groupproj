@@ -1,0 +1,60 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{72636652-0142-47D1-A9EC-A95E1CDFA5A0}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="BasicConsole\BasicConsole.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="PipeTargets\PipeTargets.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="InteractiveShell\InteractiveShell.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="BasicConsole">
+        <MSBuild Projects="BasicConsole\BasicConsole.dproj"/>
+    </Target>
+    <Target Name="BasicConsole:Clean">
+        <MSBuild Projects="BasicConsole\BasicConsole.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="BasicConsole:Make">
+        <MSBuild Projects="BasicConsole\BasicConsole.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="PipeTargets">
+        <MSBuild Projects="PipeTargets\PipeTargets.dproj"/>
+    </Target>
+    <Target Name="PipeTargets:Clean">
+        <MSBuild Projects="PipeTargets\PipeTargets.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="PipeTargets:Make">
+        <MSBuild Projects="PipeTargets\PipeTargets.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="InteractiveShell">
+        <MSBuild Projects="InteractiveShell\InteractiveShell.dproj"/>
+    </Target>
+    <Target Name="InteractiveShell:Clean">
+        <MSBuild Projects="InteractiveShell\InteractiveShell.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="InteractiveShell:Make">
+        <MSBuild Projects="InteractiveShell\InteractiveShell.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="BasicConsole;PipeTargets;InteractiveShell"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="BasicConsole:Clean;PipeTargets:Clean;InteractiveShell:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="BasicConsole:Make;PipeTargets:Make;InteractiveShell:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

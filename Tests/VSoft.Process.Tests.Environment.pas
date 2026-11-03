@@ -1,0 +1,498 @@
+unit VSoft.Process.Tests.Environment;
+
+interface
+
+uses
+  DUnitX.TestFramework,
+  System.Classes,
+  VSoft.Process,
+  VSoft.Process.Environment;
+
+type
+  [TestFixture]
+  TEnvironmentTests = class
+  public
+    [Test]
+    procedure Create_PopulatesFromCurrentProcess;
+
+    [Test]
+    procedure AddOrSet_AddsAndUpdates;
+
+    [Test]
+    procedure Remove_DropsVariable;
+
+    [Test]
+    procedure Reset_ReloadsCurrent;
+
+    [Test]
+    procedure Clone_DeepCopies;
+
+    {$IFDEF MSWINDOWS}
+    // Windows env block is a flat double-null-terminated UTF-16 buffer:
+    //   VAR1=VALUE1\0VAR2=VALUE2\0...VARN=VALUEN\0\0
+    [Test]
+    procedure ToEnvironmentBlock_TerminatesWithDoubleNull;
+    {$ENDIF}
+
+    // H10/H12 - a freshly-created or freshly-Reset builder reflects the
+    // current process env unchanged; the platform impl should pass nil to
+    // CreateProcess instead of building a custom block. HasOverrides is
+    // the signal it checks.
+    [Test]
+    procedure HasOverrides_FalseAfterCreate;
+
+    [Test]
+    procedure HasOverrides_FalseAfterReset;
+
+    [Test]
+    procedure HasOverrides_TrueAfterAddOrSet;
+
+    [Test]
+    procedure HasOverrides_TrueAfterRemove;
+
+    [Test]
+    procedure HasOverrides_FalseAfterModifyThenReset;
+
+    [Test]
+    procedure HasOverrides_PropagatesThroughClone;
+
+    [Test]
+    procedure Remove_AbsentName_DoesNotChangeCount;
+
+    [Test]
+    procedure AddOrSetValues_AddsAllPairs;
+
+    [Test]
+    procedure ToString_ContainsAddedVariable;
+
+    // L7 - empty names and names containing '=' are rejected.
+    [Test]
+    procedure AddOrSet_InvalidName_Raises;
+
+    // M14 - names are case sensitive on POSIX, case insensitive on Windows.
+    [Test]
+    procedure AddOrSet_NameCaseFollowsPlatform;
+
+    {$IFDEF MSWINDOWS}
+    // L7 - CreateProcess requires the block sorted by name.
+    [Test]
+    procedure ToEnvironmentBlock_SortedByName;
+    {$ENDIF}
+
+    // Clear removes every variable, so only the ones added afterwards reach
+    // the child.
+    [Test]
+    procedure Clear_RemovesEveryVariable;
+    [Test]
+    procedure Clear_SetsHasOverrides;
+    [Test]
+    procedure Clear_IsFluent;
+    [Test]
+    procedure Clear_ThenClone_StaysCleared;
+    [Test]
+    procedure Clear_ThenReset_ReloadsCurrent;
+    {$IFDEF MSWINDOWS}
+    // An empty Unicode block is two NULs (four zero bytes).
+    [Test]
+    procedure Clear_EmptyBlock_IsTwoNulls;
+    {$ENDIF}
+    // An empty environ array holds only the terminating nil.
+    [Test]
+    procedure Clear_EmptyEnvironArray_IsOnlyTheTerminator;
+  end;
+
+implementation
+
+uses
+  System.SysUtils,
+  VSoft.Process.Tests.Common;
+
+function MakeBuilder : IEnvironmentBuilder;
+begin
+  result := TEnvironmentBuilder.Create;
+end;
+
+procedure TEnvironmentTests.Create_PopulatesFromCurrentProcess;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  // Every reasonable test host has at least one env var (PATH, OS, USER...).
+  Assert.IsTrue(env.Count > 0, 'Environment should contain current process vars');
+end;
+
+procedure TEnvironmentTests.AddOrSet_AddsAndUpdates;
+var
+  env : IEnvironmentBuilder;
+  before : integer;
+begin
+  env := MakeBuilder;
+  before := env.Count;
+  env.AddOrSet('VSOFT_TEST_VAR', 'one');
+  Assert.AreEqual(before + 1, env.Count, 'AddOrSet must add when missing');
+
+  env.AddOrSet('VSOFT_TEST_VAR', 'two');
+  Assert.AreEqual(before + 1, env.Count, 'AddOrSet must update when present');
+end;
+
+procedure TEnvironmentTests.Remove_DropsVariable;
+var
+  env : IEnvironmentBuilder;
+  before : integer;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_TEST_REMOVABLE', '1');
+  before := env.Count;
+  env.Remove('VSOFT_TEST_REMOVABLE');
+  Assert.AreEqual(before - 1, env.Count);
+end;
+
+procedure TEnvironmentTests.Reset_ReloadsCurrent;
+var
+  env : IEnvironmentBuilder;
+  baseline : integer;
+begin
+  env := MakeBuilder;
+  baseline := env.Count;
+  env.AddOrSet('VSOFT_TEST_RESET', 'x');
+  Assert.AreEqual(baseline + 1, env.Count);
+  env.Reset;
+  // Reset should bring us back to the same set of vars (count may not match
+  // baseline exactly if vars changed between calls, but it shouldn't include
+  // our just-added one).
+  Assert.IsTrue(env.Count >= 1, 'After reset, env should still be populated');
+end;
+
+procedure TEnvironmentTests.Clone_DeepCopies;
+var
+  src, dst : IEnvironmentBuilder;
+begin
+  src := MakeBuilder;
+  src.AddOrSet('VSOFT_CLONE_TEST', 'value-1');
+  dst := src.Clone;
+  Assert.AreEqual(src.Count, dst.Count, 'Clone count mismatch');
+
+  dst.AddOrSet('VSOFT_CLONE_TEST_ONLY_ON_DST', 'x');
+  Assert.IsTrue(dst.Count > src.Count, 'Clone mutation leaked into source');
+end;
+
+{$IFDEF MSWINDOWS}
+procedure TEnvironmentTests.ToEnvironmentBlock_TerminatesWithDoubleNull;
+var
+  env : IEnvironmentBuilder;
+  blockPtr : Pointer;
+  pWide : PWideChar;
+  walker : PWideChar;
+  count : integer;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_BLOCK_KEY', 'BLOCK_VALUE');
+  blockPtr := env.ToEnvironmentBlock;
+  Assert.IsTrue(blockPtr <> nil, 'Block pointer should not be nil');
+  pWide := PWideChar(blockPtr);
+
+  // Walk the block: each entry is a null-terminated wide string; the block
+  // ends with an extra null (i.e. two consecutive #0 wide chars). We just need
+  // to confirm walking terminates within a sane bound and lands on #0#0.
+  walker := pWide;
+  count := 0;
+  while (walker^ <> #0) and (count < 100000) do
+  begin
+    // Advance past this string and its null terminator.
+    while walker^ <> #0 do
+    begin
+      Inc(walker);
+      Inc(count);
+    end;
+    Inc(walker); // step over the null
+    Inc(count);
+  end;
+  Assert.IsTrue(count < 100000,
+                'Walker did not find double-null terminator within reasonable bound');
+end;
+{$ENDIF}
+
+procedure TEnvironmentTests.HasOverrides_FalseAfterCreate;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  Assert.IsFalse(env.HasOverrides,
+                 'A fresh builder mirrors the current process env - no overrides');
+end;
+
+procedure TEnvironmentTests.HasOverrides_FalseAfterReset;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_OV_RESET', 'x');
+  Assert.IsTrue(env.HasOverrides, 'Sanity: AddOrSet should flag overrides');
+  env.Reset;
+  Assert.IsFalse(env.HasOverrides,
+                 'Reset returns the builder to the parent-env baseline');
+end;
+
+procedure TEnvironmentTests.HasOverrides_TrueAfterAddOrSet;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_OV_ADD', 'v');
+  Assert.IsTrue(env.HasOverrides);
+end;
+
+procedure TEnvironmentTests.HasOverrides_TrueAfterRemove;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_OV_REMOVE', 'v');
+  env.Reset; // baseline
+  env.Remove('PATH'); // PATH should always be present on the test host
+  Assert.IsTrue(env.HasOverrides,
+                'Remove of an existing parent-env variable counts as an override');
+end;
+
+procedure TEnvironmentTests.HasOverrides_FalseAfterModifyThenReset;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_OV_TOGGLE', 'one');
+  env.AddOrSet('VSOFT_OV_TOGGLE', 'two');
+  env.Remove('VSOFT_OV_TOGGLE');
+  env.Reset;
+  Assert.IsFalse(env.HasOverrides,
+                 'Reset must clear the override flag even after prior mutations');
+end;
+
+procedure TEnvironmentTests.HasOverrides_PropagatesThroughClone;
+var
+  src, dst : IEnvironmentBuilder;
+begin
+  src := MakeBuilder;
+  Assert.IsFalse(src.HasOverrides, 'Sanity: fresh src has no overrides');
+  dst := src.Clone;
+  Assert.IsFalse(dst.HasOverrides,
+                 'Cloning an unmodified builder must preserve HasOverrides=False');
+
+  src.AddOrSet('VSOFT_CLONE_OV', '1');
+  Assert.IsTrue(src.HasOverrides);
+  dst := src.Clone;
+  Assert.IsTrue(dst.HasOverrides,
+                'Cloning a modified builder must preserve HasOverrides=True');
+end;
+
+procedure TEnvironmentTests.Remove_AbsentName_DoesNotChangeCount;
+var
+  env : IEnvironmentBuilder;
+  before : integer;
+begin
+  env := MakeBuilder;
+  before := env.Count;
+  env.Remove('VSOFT_DEFINITELY_NOT_SET_' + IntToStr(TTestHelpers.TickMs));
+  Assert.AreEqual(before, env.Count,
+                  'Removing a missing var must leave Count unchanged');
+end;
+
+procedure TEnvironmentTests.AddOrSetValues_AddsAllPairs;
+var
+  env : IEnvironmentBuilder;
+  list : TStringList;
+  before : integer;
+begin
+  list := TStringList.Create;
+  try
+    list.Add('VSOFT_BULK_A=valueA');
+    list.Add('VSOFT_BULK_B=valueB');
+    list.Add('VSOFT_BULK_C=valueC');
+
+    env := MakeBuilder;
+    before := env.Count;
+    env.AddOrSetValues(list);
+    Assert.AreEqual(before + 3, env.Count,
+                    'AddOrSetValues must add every pair that contains "="');
+    Assert.IsTrue(env.HasOverrides,
+                  'AddOrSetValues should flag the builder as modified');
+  finally
+    list.Free;
+  end;
+end;
+
+procedure TEnvironmentTests.ToString_ContainsAddedVariable;
+var
+  env : IEnvironmentBuilder;
+  s : string;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_TO_STRING_TEST', 'distinctive-marker-12345');
+  s := env.ToString;
+  Assert.Contains(s, 'VSOFT_TO_STRING_TEST');
+  Assert.Contains(s, 'distinctive-marker-12345');
+end;
+
+procedure TEnvironmentTests.AddOrSet_InvalidName_Raises;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  Assert.WillRaise(
+    procedure
+    begin
+      env.AddOrSet('', 'x');
+    end,
+    EArgumentException);
+  Assert.WillRaise(
+    procedure
+    begin
+      env.AddOrSet('A=B', 'x');
+    end,
+    EArgumentException);
+end;
+
+procedure TEnvironmentTests.AddOrSet_NameCaseFollowsPlatform;
+var
+  env : IEnvironmentBuilder;
+  before : integer;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_CASE_TEST', 'upper');
+  before := env.Count;
+  env.AddOrSet('vsoft_case_test', 'lower');
+  {$IFDEF MSWINDOWS}
+  Assert.AreEqual(before, env.Count, 'Windows names are case insensitive - must update, not add');
+  {$ELSE}
+  Assert.AreEqual(before + 1, env.Count, 'POSIX names are case sensitive - must add a second variable');
+  {$ENDIF}
+end;
+
+{$IFDEF MSWINDOWS}
+procedure TEnvironmentTests.ToEnvironmentBlock_SortedByName;
+var
+  env : IEnvironmentBuilder;
+  walker : PWideChar;
+  entry : string;
+  name : string;
+  previous : string;
+  idx : integer;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('ZZZ_VSOFT_LAST', '1');
+  env.AddOrSet('aaa_vsoft_first', '2');
+  walker := PWideChar(env.ToEnvironmentBlock);
+  previous := '';
+  while walker^ <> #0 do
+  begin
+    entry := walker;
+    Inc(walker, Length(entry) + 1);
+    idx := Pos('=', Copy(entry, 2, MaxInt));
+    name := UpperCase(Copy(entry, 1, idx));
+    Assert.IsTrue(CompareStr(previous, name) <= 0,
+                  'Block out of order: "' + previous + '" before "' + name + '"');
+    previous := name;
+  end;
+end;
+{$ENDIF}
+
+procedure TEnvironmentTests.Clear_RemovesEveryVariable;
+var
+  env : IEnvironmentBuilder;
+  value : string;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_CLEAR_TEST', 'x');
+  Assert.IsTrue(env.Count > 1);
+  env.Clear;
+  Assert.AreEqual(0, env.Count);
+  Assert.IsFalse(env.TryGetValue('PATH', value), 'PATH must be gone after Clear');
+  Assert.IsFalse(env.TryGetValue('VSOFT_CLEAR_TEST', value));
+end;
+
+procedure TEnvironmentTests.Clear_SetsHasOverrides;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  Assert.IsFalse(env.HasOverrides);
+  env.Clear;
+  Assert.IsTrue(env.HasOverrides, 'An emptied environment differs from the parent''s');
+end;
+
+procedure TEnvironmentTests.Clear_IsFluent;
+var
+  env : IEnvironmentBuilder;
+  value : string;
+begin
+  env := MakeBuilder;
+  env.Clear.AddOrSet('ONLY_ONE', '1');
+  Assert.AreEqual(1, env.Count);
+  Assert.IsTrue(env.TryGetValue('ONLY_ONE', value));
+  Assert.AreEqual('1', value);
+end;
+
+procedure TEnvironmentTests.Clear_ThenClone_StaysCleared;
+var
+  env : IEnvironmentBuilder;
+  cloned : IEnvironmentBuilder;
+  value : string;
+begin
+  env := MakeBuilder;
+  env.Clear.AddOrSet('ONLY_ONE', '1');
+  cloned := env.Clone;
+  Assert.AreEqual(1, cloned.Count);
+  Assert.IsTrue(cloned.HasOverrides);
+  Assert.IsTrue(cloned.TryGetValue('ONLY_ONE', value));
+  Assert.IsFalse(cloned.TryGetValue('PATH', value), 'the clone must not reload the parent''s variables');
+
+  env := MakeBuilder;
+  env.Clear;
+  cloned := env.Clone;
+  Assert.AreEqual(0, cloned.Count, 'a cleared, empty builder clones empty');
+  Assert.IsTrue(cloned.HasOverrides, 'an empty clone still overrides the parent''s environment');
+end;
+
+procedure TEnvironmentTests.Clear_ThenReset_ReloadsCurrent;
+var
+  env : IEnvironmentBuilder;
+  value : string;
+begin
+  env := MakeBuilder;
+  env.Clear;
+  env.Reset;
+  Assert.IsFalse(env.HasOverrides);
+  Assert.AreEqual(MakeBuilder.Count, env.Count);
+  Assert.IsTrue(env.TryGetValue('PATH', value), 'Reset takes a new snapshot of the process environment');
+end;
+
+{$IFDEF MSWINDOWS}
+procedure TEnvironmentTests.Clear_EmptyBlock_IsTwoNulls;
+var
+  env : IEnvironmentBuilder;
+  block : PWideChar;
+begin
+  env := MakeBuilder;
+  env.Clear;
+  block := PWideChar(env.ToEnvironmentBlock);
+  Assert.IsTrue(block <> nil);
+  Assert.AreEqual(0, Ord(block[0]));
+  Assert.AreEqual(0, Ord(block[1]));
+end;
+{$ENDIF}
+
+procedure TEnvironmentTests.Clear_EmptyEnvironArray_IsOnlyTheTerminator;
+var
+  env : IEnvironmentBuilder;
+  envArray : TArray<PAnsiChar>;
+begin
+  env := MakeBuilder;
+  env.Clear;
+  envArray := env.ToEnvironArray;
+  Assert.AreEqual(1, Integer(Length(envArray)));
+  Assert.IsTrue(envArray[0] = nil);
+end;
+
+initialization
+  TDUnitX.RegisterTestFixture(TEnvironmentTests);
+
+end.
