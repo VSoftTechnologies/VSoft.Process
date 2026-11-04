@@ -54,6 +54,7 @@ type
     function AddOrSetValues(const list : TStrings) : IEnvironmentBuilder;
     function Remove(const name : string) : IEnvironmentBuilder;
     function TryGetValue(const name : string; out value : string) : boolean;
+    function Exists(const name : string) : boolean;
     function Clear : IEnvironmentBuilder;
     function ToEnvironmentBlock : Pointer;
     function ToEnvironArray : TArray<PAnsiChar>;
@@ -95,7 +96,8 @@ begin
   result := Self;
   idx := FVariables.IndexOfName(name);
   if idx <> -1 then
-    FVariables.ValueFromIndex[idx] := value
+    // Not ValueFromIndex: assigning '' to it deletes the line.
+    FVariables[idx] := FVariables.Names[idx] + '=' + value
   else
     FVariables.Add(name +'=' + value);
   FChanged := True;
@@ -356,6 +358,12 @@ begin
     value := FVariables.ValueFromIndex[idx]
   else
     value := '';
+end;
+
+function TEnvironmentBuilder.Exists(const name : string) : boolean;
+begin
+  // An empty name would match Windows drive entries such as "=C:=C:\dir".
+  result := (name <> '') and (FVariables.IndexOfName(name) <> -1);
 end;
 
 function TEnvironmentBuilder.ToString: string;

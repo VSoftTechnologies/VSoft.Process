@@ -99,11 +99,37 @@ type
     // An empty environ array holds only the terminating nil.
     [Test]
     procedure Clear_EmptyEnvironArray_IsOnlyTheTerminator;
+
+    [Test]
+    procedure Exists_AddedVariable_ReturnsTrue;
+    [Test]
+    procedure Exists_MissingVariable_ReturnsFalse;
+    [Test]
+    procedure Exists_AfterRemove_ReturnsFalse;
+    [Test]
+    procedure Exists_ProcessVariable_TrueUntilClear;
+    [Test]
+    procedure Exists_MatchesWholeNameOnly;
+    [Test]
+    procedure Exists_NameCaseFollowsPlatform;
+    [Test]
+    procedure Exists_SeesClonedVariables;
+    // A variable set to an empty value still exists, whether it is new or
+    // already present.
+    [Test]
+    procedure Exists_EmptyValue_ReturnsTrue;
+    // An empty name is never a variable, even when the process environment
+    // holds Windows drive-directory entries such as "=C:=C:\dir".
+    [Test]
+    procedure Exists_EmptyName_ReturnsFalse;
   end;
 
 implementation
 
 uses
+  {$IFDEF MSWINDOWS}
+  WinApi.Windows,
+  {$ENDIF}
   System.SysUtils,
   VSoft.Process.Tests.Common;
 
@@ -490,6 +516,121 @@ begin
   envArray := env.ToEnvironArray;
   Assert.AreEqual(1, Integer(Length(envArray)));
   Assert.IsTrue(envArray[0] = nil);
+end;
+
+procedure TEnvironmentTests.Exists_AddedVariable_ReturnsTrue;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_EXISTS_TEST', 'x');
+  Assert.IsTrue(env.Exists('VSOFT_EXISTS_TEST'));
+end;
+
+procedure TEnvironmentTests.Exists_MissingVariable_ReturnsFalse;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  Assert.IsFalse(env.Exists('VSOFT_DEFINITELY_NOT_SET_' + IntToStr(TTestHelpers.TickMs)));
+end;
+
+procedure TEnvironmentTests.Exists_AfterRemove_ReturnsFalse;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_EXISTS_REMOVE', 'x');
+  env.Remove('VSOFT_EXISTS_REMOVE');
+  Assert.IsFalse(env.Exists('VSOFT_EXISTS_REMOVE'));
+end;
+
+procedure TEnvironmentTests.Exists_ProcessVariable_TrueUntilClear;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  Assert.IsTrue(env.Exists('PATH'), 'PATH comes from the process environment');
+  env.Clear;
+  Assert.IsFalse(env.Exists('PATH'), 'PATH must be gone after Clear');
+  env.Reset;
+  Assert.IsTrue(env.Exists('PATH'), 'Reset reloads the process environment');
+end;
+
+procedure TEnvironmentTests.Exists_MatchesWholeNameOnly;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_EXISTS_PREFIX_LONG', 'VSOFT_EXISTS_VALUE_ONLY');
+  Assert.IsTrue(env.Exists('VSOFT_EXISTS_PREFIX_LONG'));
+  Assert.IsFalse(env.Exists('VSOFT_EXISTS_PREFIX'), 'a prefix of a name is not a match');
+  Assert.IsFalse(env.Exists('VSOFT_EXISTS_PREFIX_LONG='), 'the separator is not part of the name');
+  Assert.IsFalse(env.Exists('VSOFT_EXISTS_PREFIX_LONG=VSOFT_EXISTS_VALUE_ONLY'), 'a NAME=VALUE pair is not a name');
+  Assert.IsFalse(env.Exists('VSOFT_EXISTS_VALUE_ONLY'), 'a value is not a name');
+end;
+
+procedure TEnvironmentTests.Exists_NameCaseFollowsPlatform;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_EXISTS_CASE', 'x');
+  {$IFDEF MSWINDOWS}
+  Assert.IsTrue(env.Exists('vsoft_exists_case'), 'Windows names are case insensitive');
+  {$ELSE}
+  Assert.IsFalse(env.Exists('vsoft_exists_case'), 'POSIX names are case sensitive');
+  {$ENDIF}
+end;
+
+procedure TEnvironmentTests.Exists_SeesClonedVariables;
+var
+  src : IEnvironmentBuilder;
+  dst : IEnvironmentBuilder;
+begin
+  src := MakeBuilder;
+  src.AddOrSet('VSOFT_EXISTS_CLONE', 'x');
+  dst := src.Clone;
+  Assert.IsTrue(dst.Exists('VSOFT_EXISTS_CLONE'));
+  dst.Remove('VSOFT_EXISTS_CLONE');
+  Assert.IsFalse(dst.Exists('VSOFT_EXISTS_CLONE'));
+  Assert.IsTrue(src.Exists('VSOFT_EXISTS_CLONE'), 'removing from the clone must not touch the source');
+end;
+
+procedure TEnvironmentTests.Exists_EmptyValue_ReturnsTrue;
+var
+  env : IEnvironmentBuilder;
+  value : string;
+begin
+  env := MakeBuilder;
+  env.AddOrSet('VSOFT_EXISTS_EMPTY_NEW', '');
+  Assert.IsTrue(env.Exists('VSOFT_EXISTS_EMPTY_NEW'), 'a new variable with an empty value');
+
+  env.AddOrSet('VSOFT_EXISTS_EMPTY_SET', 'x');
+  env.AddOrSet('VSOFT_EXISTS_EMPTY_SET', '');
+  Assert.IsTrue(env.Exists('VSOFT_EXISTS_EMPTY_SET'), 'setting an existing variable to empty must not remove it');
+  Assert.IsTrue(env.TryGetValue('VSOFT_EXISTS_EMPTY_SET', value));
+  Assert.AreEqual('', value);
+end;
+
+procedure TEnvironmentTests.Exists_EmptyName_ReturnsFalse;
+var
+  env : IEnvironmentBuilder;
+begin
+  {$IFDEF MSWINDOWS}
+  // cmd.exe keeps the current directory of each drive as "=X:=X:\dir"; the
+  // part before the first '=' is empty.
+  SetEnvironmentVariable('=Z:', 'Z:\');
+  try
+    env := MakeBuilder;
+  finally
+    SetEnvironmentVariable('=Z:', nil);
+  end;
+  Assert.Contains(env.ToString, '=Z:=Z:\', 'sanity: the drive entry must be in the builder');
+  {$ELSE}
+  env := MakeBuilder;
+  {$ENDIF}
+  Assert.IsFalse(env.Exists(''));
 end;
 
 initialization

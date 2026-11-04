@@ -202,6 +202,9 @@ type
     function Remove(const name : string) : IEnvironmentBuilder;
     // Value of a variable in the builder; False when it is not present.
     function TryGetValue(const name : string; out value : string) : boolean;
+    // True when the variable is in the builder, including one with an empty
+    // value. Names are case insensitive on Windows, case sensitive on POSIX.
+    function Exists(const name : string) : boolean;
     // Removes every variable, so the child gets exactly the ones added
     // afterwards (possibly none). Sets HasOverrides; Clone keeps the cleared
     // state and Reset takes a new snapshot of the process environment. Most

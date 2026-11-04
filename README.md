@@ -781,7 +781,7 @@ To run the tests, open the test dproj in the IDE and build/run. The console runn
 
 **`ICommandLineBuilder`** - `Add` / `AddSensitive` (name-only or name + value, `qtDouble` by default), `Remove`, `Clear`, `Count`, `Arguments[]`, `ArgumentsByName[]`, `DefaultValueSeparator` (initially a space) / `WithDefaultValueSeparator`, `DefaultArgumentSeparator` / `WithDefaultArgumentSeparator`, `ToString`, `ToLogString`, `Clone`. `Arguments[]` returns `IArgument`: `Name`, `Value`, `Quoted`, `NameValueSeparator`, `QuoteName`. `DefaultArgumentSeparator`, `Quoted` and `QuoteName` only affect the Windows command line; POSIX passes argv slots verbatim.
 
-**`IEnvironmentBuilder`** - `AddOrSet`, `AddOrSetValues`, `Remove`, `Clear`, `TryGetValue`, `Reset`, `Count`, `HasOverrides`, `ToEnvironmentBlock` (Windows), `ToEnvironArray` (POSIX), `ToString`, `Clone`. Names are case-insensitive on Windows and case-sensitive on POSIX; empty names and names containing `=` raise `EArgumentException`.
+**`IEnvironmentBuilder`** - `AddOrSet`, `AddOrSetValues`, `Remove`, `Clear`, `TryGetValue`, `Exists`, `Reset`, `Count`, `HasOverrides`, `ToEnvironmentBlock` (Windows), `ToEnvironArray` (POSIX), `ToString`, `Clone`. Names are case-insensitive on Windows and case-sensitive on POSIX; empty names and names containing `=` raise `EArgumentException`.
 
 **`ICredentialsBuilder`** (Windows-only) - `UserName`, `Domain`, `Password`, `LoadUserProfile`, `NetCredentialsOnly`, plus `WithUser` / `WithDomain` / `WithPassword` / `WithUserProfile` / `WithNetCredentialsOnly`, `Validate`, `Clone`.
 
