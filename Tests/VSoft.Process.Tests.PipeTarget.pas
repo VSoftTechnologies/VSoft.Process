@@ -224,6 +224,14 @@ type
     // does not add an empty line.
     [Test]
     procedure LineTarget_LineFeedAfterCap_NoEmptyLine;
+    // A multi-byte character split exactly at the cap stays whole: its first
+    // byte waits for the rest instead of being decoded as U+FFFD.
+    [Test]
+    procedure LineTarget_Utf8CharacterSplitAtCap_StaysWhole;
+    // A CR arriving as the last byte at the cap stays pending, so a LF that
+    // follows still ends the line as CRLF, with no extra empty line.
+    [Test]
+    procedure LineTarget_CarriageReturnAtCap_PairsWithFollowingLineFeed;
 
     // A target created without an encoding and used without Start decodes
     // with TEncoding.Default instead of a nil encoding.
@@ -1361,6 +1369,62 @@ begin
 
     Assert.AreEqual(2, capture.Lines.Count, 'The LF ends the capped piece; it should not add an empty line');
     Assert.AreEqual(cMaxPendingLineBytes, Length(capture.Lines[0]));
+    Assert.AreEqual('y', capture.Lines[1], false);
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.LineTarget_Utf8CharacterSplitAtCap_StaysWhole;
+var
+  target  : IPipeTarget;
+  capture : TLineCapture;
+  chunk   : TBytes;
+  tail    : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8);
+    target.Start;
+    // The cap is reached with the first byte of e-acute (C3 A9) as the last.
+    SetLength(chunk, cMaxPendingLineBytes);
+    FillChar(chunk[0], cMaxPendingLineBytes - 1, Ord('x'));
+    chunk[cMaxPendingLineBytes - 1] := $C3;
+    target.HandleData(chunk, cMaxPendingLineBytes);
+    tail := TBytes.Create($A9, 10);
+    target.HandleData(tail, Length(tail));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual(cMaxPendingLineBytes - 1, Length(capture.Lines[0]), 'The incomplete character must not be in the forced piece');
+    Assert.AreEqual(0, Pos(#$FFFD, capture.Lines[0]), 'No replacement character in the forced piece');
+    Assert.AreEqual(#$E9, capture.Lines[1], 'The character is completed by its second byte');
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.LineTarget_CarriageReturnAtCap_PairsWithFollowingLineFeed;
+var
+  target  : IPipeTarget;
+  capture : TLineCapture;
+  chunk   : TBytes;
+  tail    : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8);
+    target.Start;
+    SetLength(chunk, cMaxPendingLineBytes);
+    FillChar(chunk[0], cMaxPendingLineBytes - 1, Ord('x'));
+    chunk[cMaxPendingLineBytes - 1] := 13;
+    target.HandleData(chunk, cMaxPendingLineBytes);
+    tail := TBytes.Create(10, Ord('y'), 10);
+    target.HandleData(tail, Length(tail));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count, 'CR + LF is one line end; it should not add an empty line');
+    Assert.AreEqual(cMaxPendingLineBytes - 1, Length(capture.Lines[0]), 'The CR must wait for its LF');
     Assert.AreEqual('y', capture.Lines[1], false);
   finally
     capture.Free;
