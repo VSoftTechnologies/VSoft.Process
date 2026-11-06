@@ -358,11 +358,17 @@ type
     procedure HandleData(const data : TBytes; length : NativeUInt);override;
   public
     Bytes : NativeUInt;
+    OutText : string;
+    ErrText : string;
   end;
 
 procedure TCountingTarget.HandleData(const data : TBytes; length : NativeUInt);
 begin
   Inc(Bytes, length);
+  if DispatchingStdErr then
+    ErrText := ErrText + TEncoding.ANSI.GetString(data, 0, length)
+  else
+    OutText := OutText + TEncoding.ANSI.GetString(data, 0, length);
   inherited HandleData(data, length);
 end;
 
@@ -390,6 +396,10 @@ begin
     Assert.IsTrue(counting.Bytes >= 14, 'the HandleData override was bypassed, bytes seen: ' + IntToStr(counting.Bytes));
     Assert.Contains(sb.ToString, 'OUTLINE', 'stdout text');
     Assert.Contains(sb.ToString, 'ERRLINE', 'stderr text');
+    Assert.Contains(counting.OutText, 'OUTLINE', 'stdout bytes in the stdout bucket');
+    Assert.IsFalse(Pos('ERRLINE', counting.OutText) > 0, 'stderr bytes leaked into the stdout bucket: ' + counting.OutText);
+    Assert.Contains(counting.ErrText, 'ERRLINE', 'stderr bytes in the stderr bucket');
+    Assert.IsFalse(Pos('OUTLINE', counting.ErrText) > 0, 'stdout bytes leaked into the stderr bucket: ' + counting.ErrText);
   finally
     sb.Free;
   end;

@@ -79,6 +79,9 @@ type
 
     function HasExplicitEncoding : boolean;
     procedure SetDefaultEncoding(const value : TEncoding);
+    // True while HandleStreamData is delivering stderr, so a HandleData
+    // override can tell which stream its bytes belong to.
+    property DispatchingStdErr : boolean read FDispatchStdErr;
   public
     constructor Create(const encoding : TEncoding);
   end;
@@ -159,6 +162,9 @@ type
 
     function HasExplicitEncoding : boolean;
     procedure SetDefaultEncoding(const value : TEncoding);
+    // True while HandleStreamData is delivering stderr, so a HandleData
+    // override can tell which stream its bytes belong to.
+    property DispatchingStdErr : boolean read FDispatchStdErr;
   public
     constructor Create(const stringBuilder : TStringBuilder; const encoding : TEncoding);
   end;
