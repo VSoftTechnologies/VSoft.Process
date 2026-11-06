@@ -55,6 +55,12 @@ type
     [Test]
     procedure StdInSourceNeverReturns_RunStillCompletes;
 
+    // A synchronous Execute on another thread: releasing the last reference
+    // while its OnExit handler runs must wait for the handler to return
+    // (the completion event is set before OnExit fires).
+    [Test]
+    procedure SyncExecuteOnOtherThread_DestroyWaitsForOnExit;
+
     // M11 - one target attached to stdout and stderr receives every byte.
     [Test]
     procedure SharedTargetOnBothStreams_ReceivesEveryByte;
@@ -240,6 +246,18 @@ type
     procedure Start;
     procedure HandleData(const data : TBytes; dataLength : NativeUInt);
     procedure Done;
+  end;
+
+  // An OnExit handler that signals it has been entered, holds the thread for
+  // HoldMs and then records that it returned.
+  TExitHoldProbe = class
+  public
+    Entered : TEvent;
+    HoldMs : Cardinal;
+    Returned : integer;
+    constructor Create;
+    destructor Destroy; override;
+    procedure HandleExit(const process : IProcess; exitCode : Cardinal);
   end;
 
   // A stdin source whose GetData blocks until Release is called.
@@ -854,6 +872,66 @@ begin
     // Lets the writer thread finish (and the run, if it is still waiting).
     source.Release;
     proc := nil;
+  end;
+end;
+
+{ TExitHoldProbe }
+
+constructor TExitHoldProbe.Create;
+begin
+  inherited Create;
+  Entered := TEvent.Create(nil, true, false, '');
+end;
+
+destructor TExitHoldProbe.Destroy;
+begin
+  Entered.Free;
+  inherited;
+end;
+
+procedure TExitHoldProbe.HandleExit(const process : IProcess; exitCode : Cardinal);
+begin
+  Entered.SetEvent;
+  Sleep(HoldMs);
+  TInterlocked.Exchange(Returned, 1);
+end;
+
+procedure TProcessLifecycleTests.SyncExecuteOnOtherThread_DestroyWaitsForOnExit;
+var
+  proc : IProcess;
+  rawProc : Pointer;
+  probe : TExitHoldProbe;
+  runner : TThread;
+begin
+  probe := TExitHoldProbe.Create;
+  try
+    probe.HoldMs := 1500;
+    proc := TProcess.Create;
+    TTestHelpers.SetupInlineCommand(proc, 'exit 0', 'exit 0');
+    proc.OnExit := probe.HandleExit;
+    // The runner calls through a raw pointer, so this test's reference is the
+    // only one: releasing it destroys the process while Execute is still on
+    // the runner's stack.
+    rawProc := Pointer(proc);
+    runner := TThread.CreateAnonymousThread(
+      procedure
+      begin
+        IProcess(rawProc).Execute;
+      end);
+    runner.FreeOnTerminate := false;
+    runner.Start;
+    try
+      Assert.AreEqual(wrSignaled, probe.Entered.WaitFor(15000), 'OnExit was never fired');
+      // The run has completed (the completion event is set before OnExit).
+      proc := nil;
+      Assert.AreEqual(1, TInterlocked.CompareExchange(probe.Returned, 0, 0),
+                      'the process was destroyed while its OnExit handler was still running');
+    finally
+      runner.WaitFor;
+      runner.Free;
+    end;
+  finally
+    probe.Free;
   end;
 end;
 

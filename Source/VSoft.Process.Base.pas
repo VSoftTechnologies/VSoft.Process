@@ -30,10 +30,21 @@ type
 
   TProcessBase = class;
 
+  // Shared between a process and its runs, and reference counted, so a run
+  // whose OnExit handler releases the last reference to the process can
+  // still finish with it after the process is gone.
+  TProcessRunState = class(TInterfacedObject)
+  public
+    // Runs that have started and not yet returned from OnExit. Destroy
+    // waits for it to reach 0.
+    ActiveRuns : integer;
+  end;
+
   // The stdin writer for one run. Its thread works only on this object
   // (reference counted, shared with the process), so a writer still blocked
   // in the source's GetData when the run ends can be left to finish on its
-  // own without touching the next run. It keeps the process alive until then.
+  // own without touching the next run. It keeps the process alive until then,
+  // unless the run detaches it.
   IStdInWriter = interface
     // Runs on the writer thread.
     procedure Execute;
@@ -43,12 +54,18 @@ type
     // Why the source failed; read it once WaitFor has returned True.
     function Error : string;
     procedure SetThreadId(value : TThreadID);
+    // Cuts a writer that is being left behind loose from its process, so it
+    // no longer keeps the process alive. Returns the writer's reference to
+    // the process for the run to release once it no longer touches it.
+    function Detach : IInterface;
   end;
 
   TStdInWriter = class(TInterfacedObject, IStdInWriter)
   private
     FOwner : TProcessBase;
     FOwnerRef : IInterface;
+    // Guards FOwner / FOwnerRef between Execute's end and Detach.
+    FOwnerLock : TCriticalSection;
     FSource : IPipeSource;
     FAbort : Integer;
     FError : string;
@@ -68,6 +85,7 @@ type
     function WaitFor(timeoutMs : Cardinal) : boolean;
     function Error : string;
     procedure SetThreadId(value : TThreadID);
+    function Detach : IInterface;
   end;
 
   TProcessBase = class(TInterfacedObject, IProcess)
@@ -107,6 +125,11 @@ type
     FWorkerThreadId : TThreadID;
     FDeliveringThreadId : TThreadID;
 
+    // The completion event is set before OnExit fires, so it cannot tell
+    // Destroy that a run has finished with this object; FRunState can.
+    FRunState : TProcessRunState;
+    FRunStateRef : IInterface;
+
     function StartRun(const cancellationToken : ICancellationToken; const cancellationEvent : TEvent; mode : TProcessStartMode) : boolean;
     procedure RunWorker;
     procedure CompleteRun(const outcome : TProcessOutcome);
@@ -116,6 +139,10 @@ type
     // Called by a stdin writer as it finishes.
     procedure StdInWriterFinished(threadId : TThreadID);
   protected
+    // The process reference handed back by a stdin writer that was detached
+    // (left blocked in its source's GetData). Released by the run as its
+    // very last action, so the process is never freed in the middle of it.
+    FDetachedOwnerRef : IInterface;
     // stdin source for the current run (snapshot of WithStdInPipe).
     FRunStdIn : IPipeSource;
     // Full path of the program being launched, set by the platform's
@@ -280,6 +307,34 @@ begin
   {$ENDIF}
 end;
 
+type
+  // One OnExit call in progress on this thread, chained to any it is nested
+  // in (an OnExit handler may run another process synchronously).
+  PExitFrame = ^TExitFrame;
+  TExitFrame = record
+    RunState : TProcessRunState;
+    Previous : PExitFrame;
+  end;
+
+threadvar
+  GExitFrames : PExitFrame;
+
+// True when this thread is inside an OnExit handler of a run of the process
+// that owns runState: Destroy called from there must not wait for that run.
+function IsInsideOnExit(runState : TProcessRunState) : boolean;
+var
+  frame : PExitFrame;
+begin
+  frame := GExitFrames;
+  while frame <> nil do
+  begin
+    if frame.RunState = runState then
+      Exit(true);
+    frame := frame.Previous;
+  end;
+  result := false;
+end;
+
 { TStdInWriter }
 
 constructor TStdInWriter.Create(owner : TProcessBase; const source : IPipeSource);
@@ -289,15 +344,19 @@ begin
   FOwnerRef := owner;
   FSource := source;
   FFinished := TEvent.Create(nil, true, false, '');
+  FOwnerLock := TCriticalSection.Create;
 end;
 
 destructor TStdInWriter.Destroy;
 begin
   FFinished.Free;
+  FOwnerLock.Free;
   inherited;
 end;
 
 procedure TStdInWriter.Execute;
+var
+  ownerRef : IInterface;
 begin
   try
     try
@@ -307,12 +366,33 @@ begin
         FError := 'Stdin pipe source raised ' + E.ClassName + ' - ' + E.Message;
     end;
   finally
-    FOwner.StdInWriterFinished(FThreadId);
-    FOwner := nil;
+    // Under the lock: a detached writer's process may already be gone.
+    FOwnerLock.Enter;
+    try
+      if FOwner <> nil then
+        FOwner.StdInWriterFinished(FThreadId);
+      FOwner := nil;
+      ownerRef := FOwnerRef;
+      FOwnerRef := nil;
+    finally
+      FOwnerLock.Leave;
+    end;
     FSource := nil;
     FFinished.SetEvent;
     // Last: it can be the final reference to the process.
+    ownerRef := nil;
+  end;
+end;
+
+function TStdInWriter.Detach : IInterface;
+begin
+  FOwnerLock.Enter;
+  try
+    FOwner := nil;
+    result := FOwnerRef;
     FOwnerRef := nil;
+  finally
+    FOwnerLock.Leave;
   end;
 end;
 
@@ -371,6 +451,8 @@ begin
   SetStatusAtomic(TProcessStatus.Idle);
   FTimedOut := false;
   FStartMode := TProcessStartMode.Sync;
+  FRunState := TProcessRunState.Create;
+  FRunStateRef := FRunState;
 
   FStdOutTargets := TList<IPipeTarget>.Create;
   FStdErrTargets := TList<IPipeTarget>.Create;
@@ -397,11 +479,24 @@ begin
   begin
     // A run is still active (only possible for a synchronous Execute on
     // another thread). Ask it to stop and wait until it has released
-    // everything we are about to free. Every wait inside the worker is
-    // bounded, so this terminates.
+    // everything we are about to free. Every library wait inside the worker
+    // is bounded; only user code (a target, a source's Done, OnExit) can
+    // hold it longer, and freeing early would be a use-after-free.
     FTerminateEvent.SetEvent;
     FCompletionEvent.WaitFor(INFINITE);
   end;
+  // The completion event is set before OnExit fires, so a run's tail may
+  // still be using this object on another thread: wait for it to finish.
+  // After its decrement it touches only its own reference to FRunState.
+  // Not from the OnExit handler itself, which would wait for ever. On the
+  // main thread, keep serving Synchronize: the tail's OnExit may be waiting
+  // for it.
+  if (FRunState <> nil) and (not IsInsideOnExit(FRunState)) then
+    while TInterlocked.CompareExchange(FRunState.ActiveRuns, 0, 0) <> 0 do
+      if CurrentThreadId = MainThreadID then
+        CheckSynchronize(1)
+      else
+        Sleep(1);
 
   FTerminateEvent.Free;
   FCompletionEvent.Free;
@@ -469,8 +564,9 @@ begin
       else
         result := InternalStartAsync;
     finally
-      // A run that started owns the references until CompleteRun clears them.
-      if not result then
+      // Once handed over, CompleteRun or AbortStart clears them, and after
+      // that this object may already be freed (Destroy on another thread).
+      if not handedOver then
       begin
         FCancellationToken := nil;
         FCancellationEvent := nil;
@@ -609,11 +705,15 @@ begin
 end;
 
 function TProcessBase.InternalStart: boolean;
+var
+  keepAlive : IInterface;
 begin
   result := false;
   FStartThreadId := CurrentThreadId;
   // The calling thread is the worker for a synchronous run.
   FWorkerThreadId := FStartThreadId;
+  // Ended by RunWorker after OnExit, or by AbortStart.
+  TInterlocked.Increment(FRunState.ActiveRuns);
   FTerminateEvent.ResetEvent;
   FCompletionEvent.ResetEvent;
   // From here the completion event marks the run as in progress.
@@ -623,7 +723,13 @@ begin
     result := DoCreateProcess;
   finally
     if not result then
+    begin
+      // Taken before AbortStart publishes the end of the run; released when
+      // this method returns.
+      keepAlive := FDetachedOwnerRef;
+      FDetachedOwnerRef := nil;
       AbortStart;
+    end;
   end;
   if not result then
     exit;
@@ -636,10 +742,13 @@ function TProcessBase.InternalStartAsync: boolean;
 var
   selfRef : IProcess;
   worker : TThread;
+  keepAlive : IInterface;
 begin
   result := false;
   FStartThreadId := CurrentThreadId;
   FWorkerThreadId := 0;
+  // Ended by RunWorker after OnExit, or by AbortStart.
+  TInterlocked.Increment(FRunState.ActiveRuns);
   FTerminateEvent.ResetEvent;
   FCompletionEvent.ResetEvent;
   // From here the completion event marks the run as in progress.
@@ -649,7 +758,13 @@ begin
     result := DoCreateProcess;
   finally
     if not result then
+    begin
+      // Taken before AbortStart publishes the end of the run; released when
+      // this method returns.
+      keepAlive := FDetachedOwnerRef;
+      FDetachedOwnerRef := nil;
       AbortStart;
+    end;
   end;
   if not result then
     exit;
@@ -684,22 +799,54 @@ end;
 procedure TProcessBase.RunWorker;
 var
   outcome : TProcessOutcome;
+  keepAlive : IInterface;
+  runState : TProcessRunState;
+  runStateRef : IInterface;
+  exitFrame : TExitFrame;
 begin
+  // The run's own reference: its tail must outlive this object when OnExit
+  // releases the last reference to it.
+  runState := FRunState;
+  runStateRef := runState;
   outcome.Status := TProcessStatus.Terminated;
   outcome.ExitCode := FStartInfoBuilder.TerminateExitCode;
   outcome.TimedOut := false;
   try
     try
-      DoWaitForCompletion(outcome);
-    except
-      on E : Exception do
-        LogError('Error while waiting for the process: ' + E.ClassName + ' - ' + E.Message);
+      try
+        DoWaitForCompletion(outcome);
+      except
+        on E : Exception do
+          LogError('Error while waiting for the process: ' + E.ClassName + ' - ' + E.Message);
+      end;
+    finally
+      StopPipeTargets;
+      // A reference a left-behind stdin writer handed back: taken before the
+      // run is published (the next run may detach its own writer) and
+      // released as the very last action, once nothing here touches this
+      // object.
+      keepAlive := FDetachedOwnerRef;
+      FDetachedOwnerRef := nil;
+      CompleteRun(outcome);
+    end;
+    // Marks this thread as inside OnExit for this process, per thread and
+    // nested, so runs on other threads or started from the handler cannot
+    // clear or confuse the mark.
+    exitFrame.RunState := runState;
+    exitFrame.Previous := GExitFrames;
+    GExitFrames := @exitFrame;
+    try
+      // May release the last reference: nothing below touches Self.
+      DoOnExited(outcome.ExitCode);
+    finally
+      GExitFrames := exitFrame.Previous;
     end;
   finally
-    StopPipeTargets;
-    CompleteRun(outcome);
+    // From here Destroy on another thread may free this object; only the
+    // run's own state is touched.
+    TInterlocked.Decrement(runState.ActiveRuns);
+    keepAlive := nil;
   end;
-  DoOnExited(outcome.ExitCode);
 end;
 
 procedure TProcessBase.CompleteRun(const outcome : TProcessOutcome);
@@ -722,6 +869,8 @@ begin
   FCancellationEvent := nil;
   FWorkerThreadId := 0;
   FCompletionEvent.SetEvent;
+  // Last: from here Destroy on another thread may free this object.
+  TInterlocked.Decrement(FRunState.ActiveRuns);
 end;
 
 function TProcessBase.IsCancelled: boolean;
