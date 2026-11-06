@@ -8,6 +8,7 @@ metadata:
     - Vincent Parrett
   projectUrl: https://github.com/VSoftTechnologies/VSoft.Process
   repositoryUrl: https://github.com/VSoftTechnologies/VSoft.Process
+  repositoryCommit: "#HASH#"
   license: Apache-2.0
   copyright: Vincent Parrett and contributors
   readme: README.md
