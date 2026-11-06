@@ -432,9 +432,15 @@ destructor TProcessBase.Destroy;
 begin
   // A run holds its own reference to this object until it has finished with
   // it (OnExit included), so when used through IProcess this object is never
-  // destroyed during a run. What follows covers an object used without an
-  // interface reference (RefCount 0 when the run started) and freed while a
-  // synchronous Execute is in progress on another thread.
+  // destroyed during a run. What follows covers a synchronous Execute still in
+  // progress on another thread when the object is freed. It does NOT make use
+  // without an interface reference safe: the completion event is set before
+  // OnExit fires, so Destroy can return and free the object before the run's
+  // tail has finished with it. Such use is unsupported (an OnStarted/OnExit
+  // handler already frees a RefCount 0 object through the temporary reference
+  // that handler(Self) takes). The caller must also hold a reference until
+  // Execute has started: the RefCount check that takes the run's own reference
+  // is not atomic against a concurrent last release.
   if (FCompletionEvent <> nil) and (FCompletionEvent.WaitFor(0) <> wrSignaled) then
   begin
     // Ask it to stop and wait until it has released everything we are about

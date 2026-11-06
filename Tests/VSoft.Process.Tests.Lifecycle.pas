@@ -59,8 +59,11 @@ type
     // reference while its OnExit handler runs must not destroy the process
     // until the handler has returned (the completion event is set before
     // OnExit fires; the run holds its own reference until it has finished).
+    // Destroy does not wait for the handler: the run's reference defers the
+    // free. Use of a plain object without an interface reference stays
+    // unprotected by design.
     [Test]
-    procedure SyncExecuteOnOtherThread_DestroyWaitsForOnExit;
+    procedure SyncExecuteOnOtherThread_ReleaseDuringOnExit_FreedAfterHandler;
 
     // A synchronous Execute on another thread whose OnExit handler releases,
     // through TThread.Synchronize, the only reference the caller holds: the
@@ -982,7 +985,7 @@ begin
   proc.WithStdOutPipe(target);
 end;
 
-procedure TProcessLifecycleTests.SyncExecuteOnOtherThread_DestroyWaitsForOnExit;
+procedure TProcessLifecycleTests.SyncExecuteOnOtherThread_ReleaseDuringOnExit_FreedAfterHandler;
 var
   proc : IProcess;
   rawProc : Pointer;
