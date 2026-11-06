@@ -182,6 +182,12 @@ type
     // Re-use: the next ExecuteAsync resets it and that run sets it again.
     [Test]
     procedure CompletionHandle_SecondExecuteAsync_ResetsThenSetsAgain;
+
+    // A target raises and logging that fails (out of memory), so an exception
+    // leaves the pipe-target isolation and reaches the read callback. The
+    // stream stops; that must be logged, not swallowed.
+    [Test]
+    procedure ReadCallbackException_StopsStreamAndIsLogged;
     {$ENDIF}
 
     {$IFNDEF MSWINDOWS}
@@ -320,6 +326,16 @@ type
     destructor Destroy; override;
     procedure HandleExit(const process : IProcess; exitCode : Cardinal);
     property Exited : TEvent read FExited;
+  end;
+
+  // Raises from HandleData after arranging for the next memory allocation on
+  // its thread to fail, so the process's attempt to log the failure raises
+  // EOutOfMemory from inside its own exception handler.
+  TOutOfMemoryOnLogTarget = class(TInterfacedObject, IPipeTarget)
+  public
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
   end;
   {$ENDIF}
 
@@ -1649,6 +1665,89 @@ begin
     Assert.AreEqual<Cardinal>(0, proc.ExitCode);
     Assert.AreEqual<THandle>(handle, proc.CompletionHandle, 'The same handle is used for every run');
   end;
+end;
+
+// A memory manager that passes everything to the real one, except that the
+// first allocation made on thread GFailAllocThreadId fails (once).
+var
+  GRealMemoryManager : TMemoryManagerEx;
+  GFailAllocThreadId : Cardinal;
+
+function TakeFailure : boolean;
+begin
+  result := (GFailAllocThreadId <> 0) and (GFailAllocThreadId = GetCurrentThreadId);
+  if result then
+    GFailAllocThreadId := 0;
+end;
+
+function FailingGetMem(size : NativeInt) : Pointer;
+begin
+  if TakeFailure then
+    result := nil
+  else
+    result := GRealMemoryManager.GetMem(size);
+end;
+
+function FailingAllocMem(size : NativeInt) : Pointer;
+begin
+  if TakeFailure then
+    result := nil
+  else
+    result := GRealMemoryManager.AllocMem(size);
+end;
+
+function FailingReallocMem(p : Pointer; size : NativeInt) : Pointer;
+begin
+  if TakeFailure then
+    result := nil
+  else
+    result := GRealMemoryManager.ReallocMem(p, size);
+end;
+
+{ TOutOfMemoryOnLogTarget }
+
+procedure TOutOfMemoryOnLogTarget.Start;
+begin
+end;
+
+procedure TOutOfMemoryOnLogTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+var
+  error : Exception;
+begin
+  error := Exception.Create('target failure for test');
+  GFailAllocThreadId := GetCurrentThreadId;
+  raise error;
+end;
+
+procedure TOutOfMemoryOnLogTarget.Done;
+begin
+end;
+
+procedure TProcessLifecycleTests.ReadCallbackException_StopsStreamAndIsLogged;
+var
+  proc : IProcess;
+  failing : TMemoryManagerEx;
+begin
+  proc := TProcess.Create;
+  proc.StartInfo.TimeoutInMSec := 30000;
+  TTestHelpers.SetupInlineCommand(proc, 'echo hello', 'echo hello');
+  proc.WithStdOutPipe(TOutOfMemoryOnLogTarget.Create);
+  GFailAllocThreadId := 0;
+  GetMemoryManager(GRealMemoryManager);
+  failing := GRealMemoryManager;
+  failing.GetMem := FailingGetMem;
+  failing.AllocMem := FailingAllocMem;
+  failing.ReallocMem := FailingReallocMem;
+  SetMemoryManager(failing);
+  try
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+  finally
+    SetMemoryManager(GRealMemoryManager);
+    GFailAllocThreadId := 0;
+  end;
+  Assert.AreEqual(TProcessStatus.Exited, proc.Status);
+  Assert.Contains(proc.Errors.Text, 'stdout reading stopped', 'the exception that stopped stdout must be logged');
+  Assert.Contains(proc.Errors.Text, 'EOutOfMemory');
 end;
 {$ENDIF}
 

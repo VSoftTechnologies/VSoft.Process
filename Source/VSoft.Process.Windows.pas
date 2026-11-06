@@ -251,13 +251,14 @@ function QueueAsyncPipeRead(info : PIOInfo) : boolean;
 var
   error : DWORD;
   attempt : integer;
+  retry : boolean;
 begin
-  result := false;
-  EnterCriticalSection(info.Lock);
-  try
-    attempt := 0;
-    while not info.Closing do
-    begin
+  attempt := 0;
+  repeat
+    EnterCriticalSection(info.Lock);
+    try
+      if info.Closing then
+        Exit(false);
       FillChar(info.Overlapped, SizeOf(info.Overlapped), 0);
       info.ReadCounted := info.CountReads;
       StartThreadpoolIo(info.IO);
@@ -269,20 +270,21 @@ begin
       if error = ERROR_IO_PENDING then
         Exit(true);
       CancelThreadpoolIo(info.IO);
-      if ((error = ERROR_NOT_ENOUGH_MEMORY) or (error = ERROR_INVALID_USER_BUFFER) or (error = ERROR_NOT_ENOUGH_QUOTA)) and
-         (attempt < cMaxReadRetries) then
-      begin
-        Inc(attempt);
-        Sleep(5);
-        continue;
-      end;
-      if (error <> ERROR_BROKEN_PIPE) and (error <> ERROR_HANDLE_EOF) and (error <> ERROR_OPERATION_ABORTED) then
-        info.Owner.LogError('Pipe read failed: ' + SysErrorMessage(error));
-      Exit(false);
+      retry := ((error = ERROR_NOT_ENOUGH_MEMORY) or (error = ERROR_INVALID_USER_BUFFER) or (error = ERROR_NOT_ENOUGH_QUOTA)) and
+               (attempt < cMaxReadRetries);
+    finally
+      LeaveCriticalSection(info.Lock);
     end;
-  finally
-    LeaveCriticalSection(info.Lock);
-  end;
+    // Outside the lock, so CloseIO is not held up by the back-off.
+    if retry then
+    begin
+      Inc(attempt);
+      Sleep(5);
+    end;
+  until not retry;
+  if (error <> ERROR_BROKEN_PIPE) and (error <> ERROR_HANDLE_EOF) and (error <> ERROR_OPERATION_ABORTED) then
+    info.Owner.LogError('Pipe read failed: ' + SysErrorMessage(error));
+  result := false;
 end;
 
 //called when the overlapped read completes
@@ -290,6 +292,7 @@ procedure IoCompletionCallback(instance : PTP_CALLBACK_INSTANCE; context : Point
 var
   info : PIOInfo;
   readMore : boolean;
+  streamName : string;
 begin
   info := PIOInfo(context);
   readMore := false;
@@ -308,8 +311,25 @@ begin
       info.Owner.LogError('Pipe read failed: ' + SysErrorMessage(ioResult));
   except
     // Target exceptions are already isolated by DeliverOutput; anything else
-    // stops this stream rather than taking down a threadpool thread.
-    readMore := false;
+    // stops this stream rather than taking down a threadpool thread, and is
+    // logged so the lost output is explained.
+    on E : Exception do
+    begin
+      readMore := false;
+      if info.IsStdErr then
+        streamName := 'stderr'
+      else
+        streamName := 'stdout';
+      try
+        info.Owner.LogError(streamName + ' reading stopped: ' + E.ClassName + ' - ' + E.Message);
+      except
+        // Logging itself failed (out of memory): the stream still stops.
+        on Exception do
+          readMore := false;
+      end;
+    end;
+    else
+      readMore := false;
   end;
   if not readMore then
     SetEvent(info.DoneEvent);
@@ -804,6 +824,7 @@ var
   created : boolean;
   threadId : TThreadID;
   writer : IStdInWriter;
+  pipeEnd : THandle;
 
   procedure AddInheritable(handle : THandle);
   var
@@ -812,7 +833,9 @@ var
     for i := 0 to inheritCount - 1 do
       if inheritList[i] = handle then
         Exit;
-    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    // A std handle the child cannot inherit would be invalid in the child.
+    if not SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) then
+      RaiseLastOSError;
     inheritList[inheritCount] := handle;
     Inc(inheritCount);
   end;
@@ -908,9 +931,11 @@ begin
         GetMem(attrList, attrSize);
         if not VProcInitializeProcThreadAttributeList(attrList, 1, 0, attrSize) then
         begin
+          // Read before FreeMem, which may change it.
+          error := Winapi.Windows.GetLastError;
           FreeMem(attrList);
           attrList := nil;
-          RaiseLastOSError;
+          RaiseLastOSError(error);
         end;
         if not VProcUpdateProcThreadAttribute(attrList, 0, VPROC_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, @inheritList[0],
                                               NativeUInt(inheritCount) * SizeOf(THandle), nil, nil) then
@@ -968,20 +993,27 @@ begin
         LogError('Failed to set processor affinity: ' + SysErrorMessage(Winapi.Windows.GetLastError));
     end;
 
+    // Each read end is handed over (and our copy zeroed) before InitIOInfo
+    // runs: InitIOInfo stores it in the IO info first, so if it then fails
+    // the handle is closed once, by CloseIO, not again as outRead / errRead.
+    // Its first read is queued at once, so from then on the done event is
+    // set or a read is pending.
     if redirectOut then
     begin
-      InitIOInfo(@FStdOutIO, outRead, false);
+      pipeEnd := outRead;
       outRead := 0;
+      InitIOInfo(@FStdOutIO, pipeEnd, false);
+      if not QueueAsyncPipeRead(@FStdOutIO) then
+        SetEvent(FStdOutIO.DoneEvent);
     end;
     if redirectErr then
     begin
-      InitIOInfo(@FStdErrIO, errRead, true);
+      pipeEnd := errRead;
       errRead := 0;
+      InitIOInfo(@FStdErrIO, pipeEnd, true);
+      if not QueueAsyncPipeRead(@FStdErrIO) then
+        SetEvent(FStdErrIO.DoneEvent);
     end;
-    if redirectOut and (not QueueAsyncPipeRead(@FStdOutIO)) then
-      SetEvent(FStdOutIO.DoneEvent);
-    if redirectErr and (not QueueAsyncPipeRead(@FStdErrIO)) then
-      SetEvent(FStdErrIO.DoneEvent);
     if redirectIn then
     begin
       writer := TWindowsStdInWriter.Create(Self, FRunStdIn, FStdInWriteHandle);
@@ -1029,9 +1061,19 @@ begin
 end;
 
 function TWindowsProcess.ReadExitCode : Cardinal;
+var
+  error : DWORD;
 begin
+  // The Windows error code is not reported as the exit code: a caller could
+  // not tell the two apart.
   if not GetExitCodeProcess(FProcessInfo.hProcess, result) then
-    result := Winapi.Windows.GetLastError;
+  begin
+    error := Winapi.Windows.GetLastError;
+    FLastError := error;
+    LogError('Could not read the exit code (' + SysErrorMessage(error) + '); reporting TerminateExitCode ' +
+             IntToStr(StartInfo.TerminateExitCode) + ' instead');
+    result := StartInfo.TerminateExitCode;
+  end;
 end;
 
 function TWindowsProcess.KillChild(exitCode : Cardinal) : boolean;
@@ -1209,6 +1251,7 @@ var
   killed : boolean;
   abandoned : boolean;
   resolved : boolean;
+  error : DWORD;
 begin
   killed := false;
   abandoned := false;
@@ -1278,7 +1321,9 @@ begin
         end;
     else // WAIT_FAILED etc - we can no longer monitor the child, so stop it.
       begin
-        LogError('Unexpected wait result ' + IntToStr(waitRes) + ': ' + SysErrorMessage(Winapi.Windows.GetLastError));
+        // Read before IntToStr, which allocates and may change it.
+        error := Winapi.Windows.GetLastError;
+        LogError('Unexpected wait result ' + IntToStr(waitRes) + ': ' + SysErrorMessage(error));
         killed := KillChild(StartInfo.TerminateExitCode);
         outcome.Status := TProcessStatus.Terminated;
         outcome.ExitCode := StartInfo.TerminateExitCode;
