@@ -87,13 +87,22 @@ type
     // H10 - ids that must never be tree-killed (0, our own pid, System / init).
     [Test]
     procedure CanTerminateTree_RejectsUnsafeIds;
+
+    {$IFDEF MSWINDOWS}
+    // A child we may not terminate must not stop the walk: its own
+    // children (our grandchildren) are still killed.
+    [Test]
+    procedure TerminateProcessTree_UnopenableChild_StillKillsGrandchild;
+    {$ENDIF}
   end;
 
 implementation
 
 uses
   {$IFDEF MSWINDOWS}
-  Winapi.Windows;
+  System.SysUtils,
+  Winapi.Windows,
+  VSoft.Process.WinAPI;
   {$ELSE}
   Posix.Unistd;
   {$ENDIF}
@@ -251,6 +260,112 @@ begin
   {$ENDIF}
   Assert.IsTrue(TSystemUtils.CanTerminateTree(12345));
 end;
+
+{$IFDEF MSWINDOWS}
+function TestConvertSddl(StringSecurityDescriptor : PWideChar; StringSDRevision : DWORD; var SecurityDescriptor : Pointer;
+                         SecurityDescriptorSize : PULONG) : BOOL; stdcall;
+  external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
+
+const
+  cProcThreadAttributeParentProcess = $00020000;
+
+// Starts a suspended cmd.exe, optionally under another parent process and
+// with a security descriptor given in SDDL.
+function StartSuspended(hParent : THandle; const sddl : string) : TProcessInformation;
+var
+  exe, command : string;
+  security : TSecurityAttributes;
+  pSecurity : PSecurityAttributes;
+  descriptor : Pointer;
+  startup : TVProcStartupInfoExW;
+  attrList : Pointer;
+  parentCopy : THandle;
+  size : NativeUInt;
+begin
+  exe := IncludeTrailingPathDelimiter(GetEnvironmentVariable('SystemRoot')) + 'System32\cmd.exe';
+  command := '"' + exe + '"';
+  UniqueString(command);
+  pSecurity := nil;
+  descriptor := nil;
+  attrList := nil;
+  parentCopy := hParent;
+  FillChar(security, SizeOf(security), 0);
+  FillChar(startup, SizeOf(startup), 0);
+  FillChar(result, SizeOf(result), 0);
+  startup.StartupInfo.cb := SizeOf(startup);
+  try
+    if sddl <> '' then
+    begin
+      Assert.IsTrue(TestConvertSddl(PWideChar(sddl), 1, descriptor, nil), 'SDDL: ' + SysErrorMessage(GetLastError));
+      security.nLength := SizeOf(security);
+      security.lpSecurityDescriptor := descriptor;
+      pSecurity := @security;
+    end;
+    if hParent <> 0 then
+    begin
+      size := 0;
+      VProcInitializeProcThreadAttributeList(nil, 1, 0, size);
+      GetMem(attrList, size);
+      Assert.IsTrue(VProcInitializeProcThreadAttributeList(attrList, 1, 0, size), 'attribute list');
+      Assert.IsTrue(VProcUpdateProcThreadAttribute(attrList, 0, cProcThreadAttributeParentProcess, @parentCopy, SizeOf(THandle), nil, nil),
+                    'parent attribute: ' + SysErrorMessage(GetLastError));
+      startup.lpAttributeList := attrList;
+    end;
+    Assert.IsTrue(VProcCreateProcessW(PWideChar(exe), PWideChar(command), pSecurity, nil, False,
+                                      CREATE_SUSPENDED or CREATE_NO_WINDOW or VPROC_EXTENDED_STARTUPINFO_PRESENT, nil, nil,
+                                      @startup, result), 'CreateProcess: ' + SysErrorMessage(GetLastError));
+  finally
+    if attrList <> nil then
+    begin
+      VProcDeleteProcThreadAttributeList(attrList);
+      FreeMem(attrList);
+    end;
+    if descriptor <> nil then
+      LocalFree(HLOCAL(descriptor));
+  end;
+end;
+
+procedure DisposeProcess(const info : TProcessInformation);
+begin
+  if info.hProcess = 0 then
+    exit;
+  TerminateProcess(info.hProcess, 1);
+  CloseHandle(info.hThread);
+  CloseHandle(info.hProcess);
+end;
+
+procedure TStringUtilsTests.TerminateProcessTree_UnopenableChild_StillKillsGrandchild;
+var
+  root, child, grandchild : TProcessInformation;
+  probe : THandle;
+begin
+  FillChar(root, SizeOf(root), 0);
+  FillChar(child, SizeOf(child), 0);
+  FillChar(grandchild, SizeOf(grandchild), 0);
+  try
+    root := StartSuspended(0, '');
+    // Everyone may read the creation time; nobody may terminate it.
+    child := StartSuspended(root.hProcess, 'D:(A;;0x1000;;;WD)');
+    grandchild := StartSuspended(child.hProcess, '');
+
+    probe := OpenProcess(PROCESS_TERMINATE, False, child.dwProcessId);
+    if probe <> 0 then
+    begin
+      CloseHandle(probe);
+      Assert.Fail('sanity: the middle process must not be openable for PROCESS_TERMINATE');
+    end;
+    TSystemUtils.TerminateProcessTree(root.dwProcessId, 7);
+    Assert.AreEqual(Cardinal(WAIT_OBJECT_0), WaitForSingleObject(grandchild.hProcess, 5000),
+                    'the grandchild below an unopenable child must be killed');
+    Assert.AreEqual(Cardinal(WAIT_OBJECT_0), WaitForSingleObject(root.hProcess, 5000), 'the root must be killed');
+    Assert.AreEqual(Cardinal(WAIT_TIMEOUT), WaitForSingleObject(child.hProcess, 0), 'the protected child cannot be killed');
+  finally
+    DisposeProcess(grandchild);
+    DisposeProcess(child);
+    DisposeProcess(root);
+  end;
+end;
+{$ENDIF}
 
 initialization
   TDUnitX.RegisterTestFixture(TStringUtilsTests);
