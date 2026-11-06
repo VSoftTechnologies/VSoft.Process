@@ -7,6 +7,12 @@ uses
   System.SysUtils,
   VSoft.Process;
 
+const
+  // A line target holding this many bytes with no LF emits the text so far
+  // as a line, so output that never ends a line (a progress meter redrawn
+  // with lone CRs) cannot grow the buffer without limit.
+  cMaxPendingLineBytes = 1024 * 1024;
+
 type
   TPipeTargetBase = class(TInterfacedObject, IPipeTarget)
   protected
@@ -51,10 +57,17 @@ type
     // (0x0A never occurs inside a UTF-8 or DBCS character). For UTF-16 the LF
     // is the code unit $000A at an even offset.
     FPendingBytes : TBytes;
-    // Set by Start from the encoding: 1 for byte encodings, 2 for UTF-16.
+    // True after a forced break at cMaxPendingLineBytes until the next line
+    // end, so a line end arriving straight after it does not add an empty
+    // line.
+    FLineBroken : boolean;
+    // Set with the encoding: 1 for byte encodings, 2 for UTF-16.
     FUnitSize : integer;
     FBigEndian : boolean;
+    procedure ResolveEncoding;
     function LastLineFeedEnd(fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
+    function TrailingCRBytes(len : integer) : integer;
+    procedure ForceLineBreak;
     procedure ProcessText(var text : string);
   protected
     procedure OutputLine(const line : string);virtual;abstract;
@@ -560,6 +573,9 @@ var
 begin
   if length = 0 then
     exit;
+  // Used without Start: decode as Start would.
+  if FEncoding = nil then
+    FEncoding := TEncoding.Default;
   tailLen := System.Length(FPendingBytes);
   totalLen := tailLen + Integer(length);
   SetLength(bytes, totalLen);
@@ -648,6 +664,16 @@ var
     len := 0;
   end;
 
+  procedure EndLine;
+  begin
+    // A line end straight after a forced break ends the piece already
+    // emitted; it is not an empty line of its own.
+    if (FCurrentLine <> '') or (not FLineBroken) then
+      OutputLine(FCurrentLine);
+    FCurrentLine := '';
+    FLineBroken := false;
+  end;
+
 begin
   // This is a line-oriented target intended for plain-text output (logs,
   // CLI tool stdout). It rewrites/strips low ASCII control characters so
@@ -681,8 +707,7 @@ begin
       #10:
         begin
           FlushSpan;
-          OutputLine(FCurrentLine);
-          FCurrentLine := '';
+          EndLine;
           start := i + 1;
         end;
       #13:
@@ -693,8 +718,7 @@ begin
           if (j < textLen) and (text[j + 1] = #10) then
           begin
             FlushSpan;
-            OutputLine(FCurrentLine);
-            FCurrentLine := '';
+            EndLine;
             i := j + 1; // the LF
             start := i + 1;
           end
@@ -734,6 +758,7 @@ begin
   if FCurrentLine <> '' then
     OutputLine(FCurrentLine);
   FCurrentLine := '';
+  FLineBroken := false;
 end;
 
 function TLinePipeTargetBase.LastLineFeedEnd(fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
@@ -782,6 +807,9 @@ var
 begin
   if dataLength = 0 then
     Exit;
+  // Used without Start: settle the encoding as Start would.
+  if (FEncoding = nil) or (FUnitSize = 0) then
+    ResolveEncoding;
 
   // Append the new bytes to whatever tail was left from the previous call.
   tailLen := Length(FPendingBytes);
@@ -792,25 +820,83 @@ begin
   // Find the last LF. The previous tail never contains one, so only the
   // newly appended bytes need scanning.
   lineEnd := LastLineFeedEnd(tailLen, totalLen);
-  if lineEnd < 0 then
-    // No newline yet - keep the entire buffer for the next call.
-    Exit;
-
-  // Decode everything up to and including the last LF and keep the rest.
-  decodeLen := NativeUInt(lineEnd);
-  decoded := DecodeLenient(FEncoding, FPendingBytes, 0, decodeLen);
-  if decodeLen < totalLen then
+  if lineEnd >= 0 then
   begin
-    Move(FPendingBytes[decodeLen], FPendingBytes[0], totalLen - decodeLen);
-    SetLength(FPendingBytes, totalLen - decodeLen);
-  end
-  else
-    SetLength(FPendingBytes, 0);
+    // Decode everything up to and including the last LF and keep the rest.
+    decodeLen := NativeUInt(lineEnd);
+    decoded := DecodeLenient(FEncoding, FPendingBytes, 0, decodeLen);
+    if decodeLen < totalLen then
+    begin
+      Move(FPendingBytes[decodeLen], FPendingBytes[0], totalLen - decodeLen);
+      SetLength(FPendingBytes, totalLen - decodeLen);
+    end
+    else
+      SetLength(FPendingBytes, 0);
 
-  ProcessText(decoded);
+    ProcessText(decoded);
+  end;
+
+  // No newline for too long - emit what there is rather than keep growing.
+  if Length(FPendingBytes) >= cMaxPendingLineBytes then
+    ForceLineBreak;
 end;
 
-procedure TLinePipeTargetBase.Start;
+function TLinePipeTargetBase.TrailingCRBytes(len : integer) : integer;
+var
+  pos : integer;
+begin
+  // Number of bytes taken by the CRs that end FPendingBytes[0..len-1].
+  pos := len;
+  if FUnitSize = 1 then
+  begin
+    while (pos > 0) and (FPendingBytes[pos - 1] = $0D) do
+      Dec(pos);
+  end
+  else if FBigEndian then
+  begin
+    while (pos > 1) and (FPendingBytes[pos - 2] = 0) and (FPendingBytes[pos - 1] = $0D) do
+      Dec(pos, 2);
+  end
+  else
+  begin
+    while (pos > 1) and (FPendingBytes[pos - 2] = $0D) and (FPendingBytes[pos - 1] = 0) do
+      Dec(pos, 2);
+  end;
+  result := len - pos;
+end;
+
+procedure TLinePipeTargetBase.ForceLineBreak;
+var
+  totalLen : integer;
+  decodeLen : integer;
+  keepCR : integer;
+  decoded : string;
+begin
+  // The pending text is emitted as a line, so nothing is lost and line
+  // splitting is otherwise unchanged. An incomplete character and trailing
+  // CRs (which a following LF would turn into a line end) stay pending.
+  totalLen := Length(FPendingBytes);
+  decodeLen := CompleteCharLength(FEncoding, FPendingBytes, totalLen);
+  if FUnitSize = 2 then
+    decodeLen := decodeLen and not 1;
+  keepCR := TrailingCRBytes(decodeLen);
+  if keepCR < decodeLen then
+    Dec(decodeLen, keepCR);
+  if decodeLen <= 0 then
+    exit;
+  decoded := DecodeLenient(FEncoding, FPendingBytes, 0, decodeLen);
+  Move(FPendingBytes[decodeLen], FPendingBytes[0], totalLen - decodeLen);
+  SetLength(FPendingBytes, totalLen - decodeLen);
+  ProcessText(decoded);
+  if FCurrentLine <> '' then
+  begin
+    OutputLine(FCurrentLine);
+    FLineBroken := true;
+  end;
+  FCurrentLine := '';
+end;
+
+procedure TLinePipeTargetBase.ResolveEncoding;
 begin
   if FEncoding = nil then
     FEncoding := TEncoding.Default;
@@ -818,7 +904,13 @@ begin
   FBigEndian := FEncoding.CodePage = CP_UTF16BE;
   if FBigEndian or (FEncoding.CodePage = CP_UTF16LE) then
     FUnitSize := 2;
+end;
+
+procedure TLinePipeTargetBase.Start;
+begin
+  ResolveEncoding;
   FCurrentLine := '';
+  FLineBroken := false;
   SetLength(FPendingBytes, 0);
 end;
 
