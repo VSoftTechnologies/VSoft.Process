@@ -47,6 +47,11 @@ type
     [Test]
     procedure SharedLineTarget_BothStreams_PartialLinesKeptApart;
 
+    // A subclass overriding the protected HandleData still sees the bytes of
+    // both streams when attached to stdout and stderr.
+    [Test]
+    procedure SharedTarget_HandleDataOverride_SeesBothStreams;
+
     [Test]
     procedure StdIn_FromStringSource_SentToChild;
 
@@ -206,6 +211,7 @@ implementation
 
 uses
   System.IOUtils,
+  VSoft.Process.PipeTarget.Classes,
   {$IFNDEF MSWINDOWS}
   Posix.Unistd,
   {$ENDIF}
@@ -343,6 +349,49 @@ begin
     Assert.AreEqual(0, Pos('abcERR', lines.Text), 'the streams were joined in one buffer: ' + lines.CommaText);
   finally
     lines.Free;
+  end;
+end;
+
+type
+  TCountingTarget = class(TStringBuilderPipeTarget)
+  protected
+    procedure HandleData(const data : TBytes; length : NativeUInt);override;
+  public
+    Bytes : NativeUInt;
+  end;
+
+procedure TCountingTarget.HandleData(const data : TBytes; length : NativeUInt);
+begin
+  Inc(Bytes, length);
+  inherited HandleData(data, length);
+end;
+
+procedure TProcessE2ETests.SharedTarget_HandleDataOverride_SeesBothStreams;
+var
+  proc : IProcess;
+  sb : TStringBuilder;
+  counting : TCountingTarget;
+  target : IPipeTarget;
+begin
+  sb := TStringBuilder.Create;
+  try
+    counting := TCountingTarget.Create(sb, TEncoding.Default);
+    target := counting;
+    proc := TProcess.Create;
+    proc.StartInfo.HideWindow := True;
+    TTestHelpers.SetupInlineCommand(proc,
+      'echo OUTLINE& echo ERRLINE 1>&2',
+      'echo OUTLINE; echo ERRLINE 1>&2');
+    proc.WithStdOutPipe(target);
+    proc.WithStdErrPipe(target);
+    proc.Execute(nil);
+
+    Assert.AreEqual<Cardinal>(0, proc.ExitCode);
+    Assert.IsTrue(counting.Bytes >= 14, 'the HandleData override was bypassed, bytes seen: ' + IntToStr(counting.Bytes));
+    Assert.Contains(sb.ToString, 'OUTLINE', 'stdout text');
+    Assert.Contains(sb.ToString, 'ERRLINE', 'stderr text');
+  finally
+    sb.Free;
   end;
 end;
 

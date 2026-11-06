@@ -62,6 +62,10 @@ type
       // Set by Start from the encoding: 1 for byte encodings, 2 for UTF-16.
       FUnitSize : integer;
       FBigEndian : boolean;
+      // The stream HandleStreamData is delivering, so the default HandleData
+      // (and an override that calls inherited) files the bytes under it.
+      FDispatchStdErr : boolean;
+    procedure ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     function LastLineFeedEnd(const bytes : TBytes; fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
     procedure ProcessText(var state : TStreamState; var text : string);
     procedure FlushStream(var state : TStreamState);
@@ -143,6 +147,9 @@ type
     // Indexed by isStdErr, so one stream's character is never completed by
     // the other's bytes; HandleData counts as stdout.
     FPendingBytes : array[boolean] of TBytes;
+    // The stream HandleStreamData is delivering (see TLinePipeTargetBase).
+    FDispatchStdErr : boolean;
+    procedure ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     procedure AppendText(const s : string);
   protected
     procedure Start;override;
@@ -573,10 +580,20 @@ end;
 
 procedure TStringBuilderPipeTarget.HandleData(const data: TBytes; length: NativeUInt);
 begin
-  HandleStreamData(false, data, length);
+  ProcessStreamData(FDispatchStdErr, data, length);
 end;
 
 procedure TStringBuilderPipeTarget.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+begin
+  FDispatchStdErr := isStdErr;
+  try
+    HandleData(data, dataLength);
+  finally
+    FDispatchStdErr := false;
+  end;
+end;
+
+procedure TStringBuilderPipeTarget.ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
 var
   tailLen : integer;
   totalLen : integer;
@@ -806,10 +823,22 @@ end;
 
 procedure TLinePipeTargetBase.HandleData(const data: TBytes; dataLength: NativeUInt);
 begin
-  HandleStreamData(false, data, dataLength);
+  ProcessStreamData(FDispatchStdErr, data, dataLength);
 end;
 
 procedure TLinePipeTargetBase.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+begin
+  // Through the virtual HandleData, so a subclass overriding it still sees
+  // the bytes of both streams.
+  FDispatchStdErr := isStdErr;
+  try
+    HandleData(data, dataLength);
+  finally
+    FDispatchStdErr := false;
+  end;
+end;
+
+procedure TLinePipeTargetBase.ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
 var
   tailLen : NativeUInt;
   totalLen : NativeUInt;

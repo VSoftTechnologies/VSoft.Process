@@ -111,7 +111,7 @@ type
     procedure RunWorker;
     procedure CompleteRun(const outcome : TProcessOutcome);
     procedure AbortStart;
-    procedure DeliverTo(const slots : TArray<TPipeTargetSlot>; const streamName : string; const buffer : TBytes; count : NativeUInt);
+    procedure DeliverTo(const slots : TArray<TPipeTargetSlot>; isStdErr : boolean; const buffer : TBytes; count : NativeUInt);
     function CanWaitForCompletion : boolean;
     // Called by a stdin writer as it finishes.
     procedure StdInWriterFinished(threadId : TThreadID);
@@ -812,11 +812,16 @@ begin
   end;
 end;
 
-procedure TProcessBase.DeliverTo(const slots : TArray<TPipeTargetSlot>; const streamName : string; const buffer : TBytes; count : NativeUInt);
+procedure TProcessBase.DeliverTo(const slots : TArray<TPipeTargetSlot>; isStdErr : boolean; const buffer : TBytes; count : NativeUInt);
 var
   i : integer;
   streamAware : IStreamAwarePipeTarget;
+  streamName : string;
 begin
+  if isStdErr then
+    streamName := 'stderr'
+  else
+    streamName := 'stdout';
   for i := 0 to High(slots) do
   begin
     if slots[i].Faulted then
@@ -825,7 +830,7 @@ begin
       // A target attached to both streams keeps each stream's partial line
       // apart when it is told which one this is.
       if Supports(slots[i].Target, IStreamAwarePipeTarget, streamAware) then
-        streamAware.HandleStreamData(streamName = 'stderr', buffer, count)
+        streamAware.HandleStreamData(isStdErr, buffer, count)
       else
         slots[i].Target.HandleData(buffer, count);
     except
@@ -848,7 +853,7 @@ begin
   FDeliveryLock.Enter;
   try
     FDeliveringThreadId := CurrentThreadId;
-    DeliverTo(FRunStdErr, 'stderr', buffer, count);
+    DeliverTo(FRunStdErr, True, buffer, count);
   finally
     FDeliveringThreadId := 0;
     FDeliveryLock.Leave;
@@ -860,7 +865,7 @@ begin
   FDeliveryLock.Enter;
   try
     FDeliveringThreadId := CurrentThreadId;
-    DeliverTo(FRunStdOut, 'stdout', buffer, count);
+    DeliverTo(FRunStdOut, False, buffer, count);
   finally
     FDeliveringThreadId := 0;
     FDeliveryLock.Leave;
