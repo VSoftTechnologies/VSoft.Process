@@ -32,22 +32,24 @@ begin
   WriteLn(line);
 end;
 
+// The console Ctrl handler must be a plain top-level routine: a nested one
+// takes a hidden parent-frame parameter, so Windows' single argument would
+// not arrive as CtrlType.
+function ConProc(CtrlType : DWORD) : BOOL; stdcall;
+begin
+ Result := True;
+ case CtrlType of
+   CTRL_C_EVENT        : process.Terminate ;
+   CTRL_BREAK_EVENT    : ;
+   CTRL_CLOSE_EVENT    : ;
+   CTRL_SHUTDOWN_EVENT : ;
+ end;
+end;
+
 procedure RunTest;
 var
   stopwatch : TStopWatch;
   sBuilder : TStringBuilder;
-
-  function ConProc(CtrlType : Cardinal) : Bool; stdcall;
-  begin
-   Result := True;
-   case CtrlType of
-     CTRL_C_EVENT        : process.Terminate ;
-     CTRL_BREAK_EVENT    : ;
-     CTRL_CLOSE_EVENT    : ;
-     CTRL_SHUTDOWN_EVENT : ;
-   end;
-  end;
-
 begin
   SetConsoleCtrlHandler(@ConProc, True);
   stopwatch := TStopWatch.Create;

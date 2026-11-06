@@ -40,6 +40,11 @@ uses
 
 // --- Demo plumbing ----------------------------------------------------------
 
+var
+  // cmd.exe writes to a pipe in the console's OEM code page, which is not
+  // TEncoding.Default (the ANSI code page) - e.g. 850 against 1252.
+  GConsoleEncoding : TEncoding;
+
 function CmdExePath : string;
 begin
   result := IncludeTrailingPathDelimiter(GetEnvironmentVariable('SystemRoot')) +
@@ -56,6 +61,7 @@ procedure RunCmd(const tail : string;
 var
   proc : IProcess;
   sw   : TStopwatch;
+  i    : Integer;
 begin
   proc := TProcess.Create;
   proc.StartInfo.Executable := CmdExePath;
@@ -66,8 +72,13 @@ begin
   if Assigned(configure) then
     configure(proc);
   sw := TStopwatch.StartNew;
-  proc.Execute(nil);
+  if not proc.Execute(nil) then
+    WriteLn('  ! cmd.exe could not be started');
   sw.Stop;
+  if proc.TimedOut then
+    WriteLn('  ! timed out after 5 seconds: the output is partial');
+  for i := 0 to proc.Errors.Count - 1 do
+    WriteLn('  ! ' + proc.Errors[i]);
   exitCode := proc.ExitCode;
   elapsedMs := sw.ElapsedMilliseconds;
 end;
@@ -117,11 +128,11 @@ begin
     RunCmd('set',
       procedure(const proc : IProcess)
       begin
-        // TEncoding.Default matches the host console code page. Passing nil
-        // would also work (the library injects StartInfo.OutputEncoding or
-        // falls back to TEncoding.Default).
+        // GConsoleEncoding is the console's OEM code page, which cmd.exe
+        // writes. Passing nil would decode with StartInfo.OutputEncoding
+        // or, when that is not set, TEncoding.Default (the ANSI code page).
         proc.WithStdOutPipe(
-          TPipeTarget.ToStringBuilder(sb, TEncoding.Default));
+          TPipeTarget.ToStringBuilder(sb, GConsoleEncoding));
       end, exitCode, elapsedMs);
 
     lines := TStringList.Create;
@@ -223,7 +234,7 @@ begin
       // Plain procedure pointer - no `of object`, no closure capture. The
       // library handles UTF-8 / CRLF / partial-line buffering for you.
       proc.WithStdOutPipe(
-        TPipeTarget.ToLineProcedure(CountLine, TEncoding.Default));
+        TPipeTarget.ToLineProcedure(CountLine, GConsoleEncoding));
     end, exitCode, elapsedMs);
   PrintResult(Format('counted %d lines via plain procedure callback',
                      [GLineCounter]),
@@ -254,7 +265,7 @@ begin
       begin
         captured.Add(line);
       end,
-      TEncoding.Default);
+      GConsoleEncoding);
     RunCmd('set',
       procedure(const proc : IProcess)
       begin
@@ -327,7 +338,7 @@ begin
     // show in UI" patterns.
     fan := TPipeTarget.ToAll([
       TPipeTarget.ToFile(tempFile, False),
-      TPipeTarget.ToStringBuilder(sb, TEncoding.Default)
+      TPipeTarget.ToStringBuilder(sb, GConsoleEncoding)
     ]);
     RunCmd('set',
       procedure(const proc : IProcess)
@@ -339,8 +350,8 @@ begin
       fileSize := SizeOfFile(tempFile)
     else
       fileSize := -1;
-    // sb.Length is a char count under TEncoding.Default - on Windows that's
-    // a single-byte code page so it should match fileSize byte-for-byte.
+    // sb.Length is a char count; the OEM code page is usually a single-byte
+    // one, so it should match fileSize byte-for-byte.
     PrintResult(Format('file=%d bytes, builder=%d chars (match? %s)',
                        [fileSize, sb.Length,
                         BoolToStr(fileSize = sb.Length, True)]),
@@ -385,8 +396,8 @@ begin
     procedure(const proc : IProcess)
     begin
       proc
-        .WithStdOutPipe(TPipeTarget.ToLineProcedure(RecordOut, TEncoding.Default))
-        .WithStdErrPipe(TPipeTarget.ToLineProcedure(RecordErr, TEncoding.Default));
+        .WithStdOutPipe(TPipeTarget.ToLineProcedure(RecordOut, GConsoleEncoding))
+        .WithStdErrPipe(TPipeTarget.ToLineProcedure(RecordErr, GConsoleEncoding));
     end, exitCode, elapsedMs);
   PrintResult(Format('stdout=%d lines, stderr=%d lines', [GOutLines, GErrLines]),
               exitCode, elapsedMs);
@@ -395,6 +406,7 @@ end;
 // --- Main -------------------------------------------------------------------
 
 begin
+  GConsoleEncoding := TEncoding.GetEncoding(Integer(GetOEMCP));
   try
     WriteLn('VSoft.Process - Pipe Targets demo');
     Demo_ToStringBuilder;
@@ -415,4 +427,5 @@ begin
       ReadLn;
     end;
   end;
+  GConsoleEncoding.Free;
 end.
