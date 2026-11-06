@@ -1,4 +1,4 @@
-unit VSoft.Process.PipeTarget.Classes;
+﻿unit VSoft.Process.PipeTarget.Classes;
 
 interface
 
@@ -178,6 +178,9 @@ type
     // The first exception a contained target raised in HandleData, raised
     // again from Done once every target has been served.
     FFirstDataError : TObject;
+    // Delivers one block to every contained target, each in its own frame
+    // (shared by HandleData and HandleStreamData).
+    procedure Fan(streamed, isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
   protected
     procedure Start;override;
     procedure HandleData(const data : TBytes; dataLength : NativeUInt);override;
@@ -998,9 +1001,10 @@ begin
     FTargets[i].Start;
 end;
 
-procedure TMultiPipeTarget.HandleData(const data: TBytes; dataLength: NativeUInt);
+procedure TMultiPipeTarget.Fan(streamed, isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
 var
-  i: Integer;
+  i : integer;
+  streamAware : IStreamAwarePipeTarget;
 begin
   // Each target in its own frame: one that raises must not starve its
   // siblings. Its exception is kept and raised from Done.
@@ -1009,7 +1013,10 @@ begin
     if FFaulted[i] then
       continue;
     try
-      FTargets[i].HandleData(data, dataLength);
+      if streamed and Supports(FTargets[i], IStreamAwarePipeTarget, streamAware) then
+        streamAware.HandleStreamData(isStdErr, data, dataLength)
+      else
+        FTargets[i].HandleData(data, dataLength);
     except
       FFaulted[i] := true;
       if FFirstDataError = nil then
@@ -1018,18 +1025,14 @@ begin
   end;
 end;
 
-procedure TMultiPipeTarget.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
-var
-  i : integer;
-  streamAware : IStreamAwarePipeTarget;
+procedure TMultiPipeTarget.HandleData(const data: TBytes; dataLength: NativeUInt);
 begin
-  for i := 0 to Length(FTargets) - 1 do
-  begin
-    if Supports(FTargets[i], IStreamAwarePipeTarget, streamAware) then
-      streamAware.HandleStreamData(isStdErr, data, dataLength)
-    else
-      FTargets[i].HandleData(data, dataLength);
-  end;
+  Fan(false, false, data, dataLength);
+end;
+
+procedure TMultiPipeTarget.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+begin
+  Fan(true, isStdErr, data, dataLength);
 end;
 
 function TMultiPipeTarget.HasExplicitEncoding: boolean;

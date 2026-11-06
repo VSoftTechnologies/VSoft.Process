@@ -1,4 +1,4 @@
-unit VSoft.Process.Tests.ProcessE2E;
+﻿unit VSoft.Process.Tests.ProcessE2E;
 
 interface
 
@@ -51,6 +51,11 @@ type
     // both streams when attached to stdout and stderr.
     [Test]
     procedure SharedTarget_HandleDataOverride_SeesBothStreams;
+
+    // A ToAll target attached to stdout and stderr: a child that raises on
+    // its first data must not starve a sibling on either stream.
+    [Test]
+    procedure SharedToAll_RaisingChild_SiblingStillSeesBothStreams;
 
     [Test]
     procedure StdIn_FromStringSource_SentToChild;
@@ -370,6 +375,42 @@ begin
   else
     OutText := OutText + TEncoding.ANSI.GetString(data, 0, length);
   inherited HandleData(data, length);
+end;
+
+procedure TProcessE2ETests.SharedToAll_RaisingChild_SiblingStillSeesBothStreams;
+var
+  proc : IProcess;
+  sb : TStringBuilder;
+  multi : IPipeTarget;
+  text : string;
+begin
+  sb := TStringBuilder.Create;
+  try
+    multi := TPipeTarget.ToAll([
+      TPipeTarget.ToDelegate(
+        procedure(const data : TBytes; length : NativeUInt)
+        begin
+          raise EInvalidOpException.Create('boom');
+        end),
+      TPipeTarget.ToStringBuilder(sb, TEncoding.Default)]);
+    proc := TProcess.Create;
+    proc.StartInfo.HideWindow := True;
+    TTestHelpers.SetupShellCommand(proc, 'print-stderr', []);
+    proc.WithStdOutPipe(multi);
+    proc.WithStdErrPipe(multi);
+    try
+      proc.Execute(nil);
+    except
+      on EInvalidOpException do; // the raising child's exception, reported from Done
+    end;
+    text := sb.ToString;
+    Assert.Contains(text, 'this-is-stdout', 'The sibling must receive stdout');
+    Assert.Contains(text, 'this-is-stderr', 'The sibling must receive stderr');
+  finally
+    multi := nil;
+    proc := nil;
+    sb.Free;
+  end;
 end;
 
 procedure TProcessE2ETests.SharedTarget_HandleDataOverride_SeesBothStreams;
