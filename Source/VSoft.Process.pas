@@ -628,11 +628,28 @@ type
     property Status : TProcessStatus read GetStatus;
     property TimedOut : boolean read GetTimedOut;
     property StartMode :  TProcessStartMode read GetStartMode;
-    // OS error code when the child could not be created, otherwise 0.
+    // Why the OS refused to start the child: the CreateProcess /
+    // CreateProcessWithLogonW error code on Windows, the errno from fork /
+    // chdir / dup2 / execve on POSIX (the numbering differs per platform).
+    // 0 in every other case, including when Execute* returns False because
+    // validation failed (a missing executable among them) or cancellation
+    // was already requested. Reset by every Execute*; the same failure is
+    // also logged to Errors as text.
     property LastError : Cardinal read GetLastError;
     // Diagnostics for the last run. Appended to from worker threads while a
     // run is in progress, so only read it once Status has left Running.
     property Errors : TStrings read GetErrors;
+
+    {$IFDEF MSWINDOWS}
+    function GetCompletionHandle : THandle;
+    // Signalled while no run is in progress. Reset when Execute / ExecuteAsync starts a run;
+    // set once the run has fully completed - output delivered, every target's Done called,
+    // handles closed, i.e. the moment Status leaves Running (before OnExit fires). Stays
+    // signalled for ExecuteDetached and when validation fails. Wait on it alongside your own
+    // handles (WaitForMultipleObjects / MsgWaitForMultipleObjects); never close or signal it.
+    // Windows only - a POSIX TEvent has no handle.
+    property CompletionHandle : THandle read GetCompletionHandle;
+    {$ENDIF}
 
     //events
     property OnStarted : TProcessStartedEvent read GetOnStarted write SetOnStarted;

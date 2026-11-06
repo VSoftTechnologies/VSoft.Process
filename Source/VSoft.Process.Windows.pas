@@ -502,7 +502,7 @@ begin
                                 1, bufSize, bufSize, 0, nil);
   if (readHandle = INVALID_HANDLE_VALUE) then
   begin
-    error := GetLastError;
+    error := Winapi.Windows.GetLastError;
     readHandle := 0;
     writeHandle := 0;
     raise EOSError.Create('Failed to create named pipe ' + pipeName + ': ' + SysErrorMessage(error));
@@ -512,7 +512,7 @@ begin
   writeHandle := CreateFileW(PChar(pipeName), GENERIC_WRITE, 0, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
   if (writeHandle = INVALID_HANDLE_VALUE) then
   begin
-    error := GetLastError;
+    error := Winapi.Windows.GetLastError;
     writeHandle := 0;
     SafeCloseHandle(readHandle);
     raise EOSError.Create('Failed to open write handle to pipe: ' + SysErrorMessage(error));
@@ -554,7 +554,7 @@ begin
   info.IO := CreateThreadpoolIo(handle, @IoCompletionCallback, info, nil);
   if info.IO = nil then
   begin
-    error := GetLastError();
+    error := Winapi.Windows.GetLastError();
     SafeCloseHandle(info.DoneEvent);
     raise EOSError.Create('CreateThreadpoolIo failed: ' + SysErrorMessage(error));
   end;
@@ -925,7 +925,7 @@ begin
         success := VProcCreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, False,
                                        creationFlags, pEnvironment, pWorkingDir, @startupInfoEx, FProcessInfo);
       if not success then
-        error := GetLastError;
+        error := Winapi.Windows.GetLastError;
     finally
       // The child has its own copies now. Closing ours inside the lock means
       // no other spawn can ever see them inheritable.
@@ -957,7 +957,7 @@ begin
       ConfigureJobObject;
       if not AssignProcessToJobObject(FJobHandle, FProcessInfo.hProcess) then
       begin
-        LogError('Failed to assign process to job object (' + SysErrorMessage(GetLastError) + '); terminate will use the process tree instead');
+        LogError('Failed to assign process to job object (' + SysErrorMessage(Winapi.Windows.GetLastError) + '); terminate will use the process tree instead');
         CloseJobObject;
       end;
     end;
@@ -965,7 +965,7 @@ begin
     if StartInfo.ProcessorAffinity <> 0 then
     begin
       if not SetProcessAffinityMask(FProcessInfo.hProcess, StartInfo.ProcessorAffinity) then
-        LogError('Failed to set processor affinity: ' + SysErrorMessage(GetLastError));
+        LogError('Failed to set processor affinity: ' + SysErrorMessage(Winapi.Windows.GetLastError));
     end;
 
     if redirectOut then
@@ -991,7 +991,7 @@ begin
       FStdInWriteThread := BeginThread(nil, 0, @WriteStdInThreadProc, Pointer(writer), CREATE_SUSPENDED, threadId);
       if FStdInWriteThread = 0 then
       begin
-        error := GetLastError;
+        error := Winapi.Windows.GetLastError;
         writer._Release;
         RaiseLastOSError(error);
       end;
@@ -1031,7 +1031,7 @@ end;
 function TWindowsProcess.ReadExitCode : Cardinal;
 begin
   if not GetExitCodeProcess(FProcessInfo.hProcess, result) then
-    result := GetLastError;
+    result := Winapi.Windows.GetLastError;
 end;
 
 function TWindowsProcess.KillChild(exitCode : Cardinal) : boolean;
@@ -1278,7 +1278,7 @@ begin
         end;
     else // WAIT_FAILED etc - we can no longer monitor the child, so stop it.
       begin
-        LogError('Unexpected wait result ' + IntToStr(waitRes) + ': ' + SysErrorMessage(GetLastError));
+        LogError('Unexpected wait result ' + IntToStr(waitRes) + ': ' + SysErrorMessage(Winapi.Windows.GetLastError));
         killed := KillChild(StartInfo.TerminateExitCode);
         outcome.Status := TProcessStatus.Terminated;
         outcome.ExitCode := StartInfo.TerminateExitCode;
@@ -1339,7 +1339,7 @@ begin
     result := CreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, FALSE,
                              creationFlags or VPROCESS_CREATE_BREAKAWAY_FROM_JOB,
                              pEnvironment, pWorkingDir, startupInfo, processInfo);
-    if (not result) and (GetLastError = ERROR_ACCESS_DENIED) then
+    if (not result) and (Winapi.Windows.GetLastError = ERROR_ACCESS_DENIED) then
     begin
       UniqueString(command);
       result := CreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, FALSE, creationFlags,
@@ -1353,7 +1353,7 @@ begin
     if StartInfo.ProcessorAffinity <> 0 then
     begin
       if not SetProcessAffinityMask(processInfo.hProcess, StartInfo.ProcessorAffinity) then
-        LogError('Failed to set processor affinity on detached child: ' + SysErrorMessage(GetLastError));
+        LogError('Failed to set processor affinity on detached child: ' + SysErrorMessage(Winapi.Windows.GetLastError));
     end;
     // Keep the process id for reference but drop the handles: we don't wait
     // for or control a detached process.
@@ -1364,7 +1364,7 @@ begin
   end
   else
   begin
-    error := GetLastError;
+    error := Winapi.Windows.GetLastError;
     FLastError := error;
     LogError(SysErrorMessage(error));
   end;
@@ -1380,7 +1380,7 @@ begin
   FJobHandle := CreateJobObjectW(nil, nil);
   if FJobHandle = 0 then
   begin
-    LogError('Failed to create job object: ' + SysErrorMessage(GetLastError));
+    LogError('Failed to create job object: ' + SysErrorMessage(Winapi.Windows.GetLastError));
     result := False;
   end
   else
@@ -1401,7 +1401,7 @@ begin
   if StartInfo.JobMode = TProcessJobMode.KillOnRelease then
     jobInfo.BasicLimitInformation.LimitFlags := jobInfo.BasicLimitInformation.LimitFlags or JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
   if not SetInformationJobObject(FJobHandle, JobObjectExtendedLimitInformation, @jobInfo, SizeOf(jobInfo)) then
-    LogError('Failed to configure job object: ' + SysErrorMessage(GetLastError));
+    LogError('Failed to configure job object: ' + SysErrorMessage(Winapi.Windows.GetLastError));
 end;
 
 procedure TWindowsProcess.CloseJobObject;

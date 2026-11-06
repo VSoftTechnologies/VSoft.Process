@@ -3,6 +3,10 @@ unit VSoft.Process.Tests.Lifecycle;
 interface
 
 uses
+  {$IFDEF MSWINDOWS}
+  // First, so System.SysUtils.DeleteFile etc. win over the Winapi versions.
+  Winapi.Windows,
+  {$ENDIF}
   DUnitX.TestFramework,
   System.SysUtils,
   System.Classes,
@@ -135,6 +139,49 @@ type
     // M16 - arguments to a .cmd are quoted for cmd.exe and unsafe ones rejected.
     [Test]
     procedure BatchFile_MetaCharsQuoted_UnsafeRejected;
+
+    // A launch that passes validation but that CreateProcess rejects reports
+    // the OS error in LastError and Errors, for every Execute* call.
+    [Test]
+    procedure LaunchFails_LastErrorIsTheOsError;
+
+    // IProcess.CompletionHandle: no run in progress, so it is signalled.
+    [Test]
+    procedure CompletionHandle_NewProcess_IsSignalled;
+
+    // ExecuteAsync resets it before returning; it stays reset while the
+    // child runs.
+    [Test]
+    procedure CompletionHandle_WhileRunning_IsNotSignalled;
+
+    // When a wait on it returns, the run has fully completed: Status has
+    // left Running, ExitCode is published and all output was delivered.
+    [Test]
+    procedure CompletionHandle_WaitReturns_RunHasCompleted;
+
+    // A failed validation, a failed launch and ExecuteDetached leave it
+    // signalled.
+    [Test]
+    procedure CompletionHandle_ValidationFails_StaysSignalled;
+
+    [Test]
+    procedure CompletionHandle_LaunchFails_StaysSignalled;
+
+    [Test]
+    procedure CompletionHandle_ExecuteDetached_StaysSignalled;
+
+    // Waited on with the caller's own event (bWaitAll = False), either one
+    // wakes the wait.
+    [Test]
+    procedure CompletionHandle_WaitForMultipleObjects_WakesForEither;
+
+    // A run that completed before the caller starts waiting is not missed.
+    [Test]
+    procedure CompletionHandle_RunCompletedBeforeWait_AlreadySignalled;
+
+    // Re-use: the next ExecuteAsync resets it and that run sets it again.
+    [Test]
+    procedure CompletionHandle_SecondExecuteAsync_ResetsThenSetsAgain;
     {$ENDIF}
 
     {$IFNDEF MSWINDOWS}
@@ -262,6 +309,19 @@ type
     procedure TerminateOnStarted(const process : IProcess);
     procedure RestartOnFirstExit(const process : IProcess; exitCode : Cardinal);
   end;
+
+  {$IFDEF MSWINDOWS}
+  // Sets Exited from OnExit, which fires only after the run has completed.
+  TExitSignal = class
+  private
+    FExited : TEvent;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure HandleExit(const process : IProcess; exitCode : Cardinal);
+    property Exited : TEvent read FExited;
+  end;
+  {$ENDIF}
 
 { TLines }
 
@@ -480,6 +540,27 @@ begin
   if ExitCount = 1 then
     RestartResult := process.ExecuteAsync;
 end;
+
+{$IFDEF MSWINDOWS}
+{ TExitSignal }
+
+constructor TExitSignal.Create;
+begin
+  inherited Create;
+  FExited := TEvent.Create(nil, true, false, '');
+end;
+
+destructor TExitSignal.Destroy;
+begin
+  FExited.Free;
+  inherited;
+end;
+
+procedure TExitSignal.HandleExit(const process : IProcess; exitCode : Cardinal);
+begin
+  FExited.SetEvent;
+end;
+{$ENDIF}
 
 { TProcessLifecycleTests }
 
@@ -1321,6 +1402,252 @@ begin
     Assert.Contains(proc.Errors.Text, 'cannot be passed safely');
   finally
     output.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.LaunchFails_LastErrorIsTheOsError;
+var
+  proc : IProcess;
+  expectedMessage : string;
+begin
+  // The file exists, so validation passes, but it is not a program.
+  expectedMessage := SysErrorMessage(ERROR_BAD_EXE_FORMAT);
+  proc := TProcess.Create;
+  proc.StartInfo.Executable := TTestHelpers.ScriptsDir + 'invalid-utf8.bin';
+
+  Assert.IsFalse(proc.Execute, 'Execute');
+  Assert.AreEqual<Cardinal>(ERROR_BAD_EXE_FORMAT, proc.LastError, 'Execute: ' + proc.Errors.Text);
+  Assert.Contains(proc.Errors.Text, expectedMessage, 'Execute');
+
+  Assert.IsFalse(proc.ExecuteAsync, 'ExecuteAsync');
+  Assert.AreEqual<Cardinal>(ERROR_BAD_EXE_FORMAT, proc.LastError, 'ExecuteAsync: ' + proc.Errors.Text);
+  Assert.Contains(proc.Errors.Text, expectedMessage, 'ExecuteAsync');
+
+  Assert.IsFalse(proc.ExecuteDetached, 'ExecuteDetached');
+  Assert.AreEqual<Cardinal>(ERROR_BAD_EXE_FORMAT, proc.LastError, 'ExecuteDetached: ' + proc.Errors.Text);
+  Assert.Contains(proc.Errors.Text, expectedMessage, 'ExecuteDetached');
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_NewProcess_IsSignalled;
+var
+  proc : IProcess;
+begin
+  proc := TProcess.Create;
+  Assert.AreNotEqual<THandle>(0, proc.CompletionHandle);
+  Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0));
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_WhileRunning_IsNotSignalled;
+var
+  proc : IProcess;
+begin
+  proc := TProcess.Create;
+  proc.StartInfo.TimeoutInMSec := 30000;
+  TTestHelpers.SetupShellCommand(proc, 'sleep', ['10']);
+  Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+  try
+    Assert.AreEqual(TProcessStatus.Running, proc.Status);
+    Assert.AreEqual<Cardinal>(WAIT_TIMEOUT, WaitForSingleObject(proc.CompletionHandle, 0),
+                              'ExecuteAsync must reset the handle before it returns');
+    Assert.AreEqual<Cardinal>(WAIT_TIMEOUT, WaitForSingleObject(proc.CompletionHandle, 300),
+                              'The handle must stay reset while the child runs');
+    Assert.AreEqual(TProcessStatus.Running, proc.Status);
+  finally
+    proc.Terminate;
+  end;
+  Assert.AreEqual(TProcessStatus.Terminated, proc.Status);
+  Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0),
+                            'The handle must be set once the terminated run has completed');
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_WaitReturns_RunHasCompleted;
+const
+  cLines = 500;
+  cExitCode = 7;
+var
+  proc : IProcess;
+  counter : TCountingTarget;
+  counterIntf : IPipeTarget;
+  errLines : TLines;
+begin
+  errLines := TLines.Create;
+  try
+    counter := TCountingTarget.Create;
+    counterIntf := counter;
+    proc := TProcess.Create;
+    proc.StartInfo.TimeoutInMSec := 30000;
+    // print-both, then a non-zero exit code so ExitCode shows the result was
+    // published ($FFFFFFFF until then).
+    TTestHelpers.SetupInlineCommand(proc,
+      'call "' + TTestHelpers.ScriptPath('print-both') + '" ' + IntToStr(cLines) + ' & exit ' + IntToStr(cExitCode), '');
+    proc.WithStdOutPipe(counterIntf);
+    proc.WithStdErrPipe(TPipeTarget.ToLineMethod(errLines.OnLine));
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 30000));
+    // No extra waiting: the run is complete the moment the handle is set.
+    Assert.AreNotEqual<TProcessStatus>(TProcessStatus.Running, proc.Status);
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.AreEqual<Cardinal>(cExitCode, proc.ExitCode);
+    Assert.AreEqual(cLines, counter.LineCount, 'All stdout must be delivered before the handle is set');
+    Assert.AreEqual(1, counter.DoneCount, 'Done must be called before the handle is set');
+    Assert.AreEqual(cLines, errLines.Count, 'All stderr must be delivered before the handle is set');
+    proc := nil;
+  finally
+    errLines.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_ValidationFails_StaysSignalled;
+var
+  proc : IProcess;
+begin
+  proc := TProcess.Create;
+  proc.StartInfo.Executable := 'C:\vsoft\definitely\not\here.exe';
+  Assert.IsFalse(proc.ExecuteAsync);
+  Assert.Contains(proc.Errors.Text, 'does not exist');
+  Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0), 'after ExecuteAsync');
+  Assert.IsFalse(proc.Execute);
+  Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0), 'after Execute');
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_LaunchFails_StaysSignalled;
+var
+  proc : IProcess;
+  counter : TCountingTarget;
+  counterIntf : IPipeTarget;
+begin
+  // The file exists, so validation passes, but it is not a program, so
+  // CreateProcess fails after the run was marked as in progress.
+  counter := TCountingTarget.Create;
+  counterIntf := counter;
+  proc := TProcess.Create;
+  proc.StartInfo.Executable := TTestHelpers.ScriptsDir + 'invalid-utf8.bin';
+  proc.WithStdOutPipe(counterIntf);
+  Assert.IsFalse(proc.ExecuteAsync, 'A file that is not a program must not start');
+  // Targets are only started once validation has passed; Done comes from
+  // the failed launch being abandoned.
+  Assert.AreEqual(1, counter.DoneCount, 'The launch should have got past validation: ' + proc.Errors.Text);
+  Assert.AreEqual(TProcessStatus.Idle, proc.Status);
+  Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0));
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_ExecuteDetached_StaysSignalled;
+var
+  proc : IProcess;
+begin
+  proc := TProcess.Create;
+  TTestHelpers.SetupShellCommand(proc, 'exit-with', ['0']);
+  Assert.IsTrue(proc.ExecuteDetached, proc.Errors.Text);
+  // Status stays Running for a detached launch, but no run is in progress.
+  Assert.AreEqual(TProcessStatus.Running, proc.Status);
+  Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0));
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_WaitForMultipleObjects_WakesForEither;
+var
+  proc : IProcess;
+  other : TEvent;
+  setter : TThread;
+  handles : array[0..1] of THandle;
+begin
+  other := TEvent.Create(nil, true, false, '');
+  setter := nil;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.TimeoutInMSec := 30000;
+    // About 3 seconds, so the child is still running when the other event
+    // is set.
+    TTestHelpers.SetupShellCommand(proc, 'sleep', ['4']);
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    handles[0] := proc.CompletionHandle;
+    handles[1] := other.Handle;
+    Assert.AreEqual<Cardinal>(WAIT_TIMEOUT, WaitForMultipleObjects(2, @handles[0], False, 0));
+
+    // The other event is set from another thread while this one waits.
+    setter := TThread.CreateAnonymousThread(
+      procedure
+      begin
+        Sleep(200);
+        other.SetEvent;
+      end);
+    setter.FreeOnTerminate := False;
+    setter.Start;
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0 + 1, WaitForMultipleObjects(2, @handles[0], False, 5000),
+                              'The other event must wake the wait while the child runs');
+    Assert.AreEqual(TProcessStatus.Running, proc.Status);
+
+    // With the other event reset, only the run's completion can wake it.
+    other.ResetEvent;
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForMultipleObjects(2, @handles[0], False, 30000),
+                              'Completion must wake the wait');
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status);
+    Assert.AreEqual<Cardinal>(0, proc.ExitCode);
+  finally
+    if setter <> nil then
+    begin
+      setter.WaitFor;
+      setter.Free;
+    end;
+    other.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_RunCompletedBeforeWait_AlreadySignalled;
+var
+  proc : IProcess;
+  signal : TExitSignal;
+  other : TEvent;
+  handles : array[0..1] of THandle;
+begin
+  signal := TExitSignal.Create;
+  other := TEvent.Create(nil, true, false, '');
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.TimeoutInMSec := 30000;
+    TTestHelpers.SetupShellCommand(proc, 'exit-with', ['5']);
+    proc.OnExit := signal.HandleExit;
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    // OnExit fires after the handle is set, so the run has completed before
+    // the waits below start.
+    Assert.IsTrue(signal.Exited.WaitFor(30000) = wrSignaled, 'OnExit did not fire');
+    handles[0] := proc.CompletionHandle;
+    handles[1] := other.Handle;
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForMultipleObjects(2, @handles[0], False, 0),
+                              'A wait started after completion must return at once');
+    // Manual reset: a satisfied wait does not consume the signal.
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(proc.CompletionHandle, 0));
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status);
+    Assert.AreEqual<Cardinal>(5, proc.ExitCode);
+  finally
+    if proc <> nil then
+      proc.OnExit := nil;
+    other.Free;
+    signal.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.CompletionHandle_SecondExecuteAsync_ResetsThenSetsAgain;
+var
+  proc : IProcess;
+  handle : THandle;
+  run : integer;
+begin
+  proc := TProcess.Create;
+  proc.StartInfo.TimeoutInMSec := 30000;
+  TTestHelpers.SetupShellCommand(proc, 'sleep', ['3']);
+  handle := proc.CompletionHandle;
+  for run := 1 to 2 do
+  begin
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(handle, 0),
+                              'run ' + IntToStr(run) + ': signalled before the run');
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    Assert.AreEqual<Cardinal>(WAIT_TIMEOUT, WaitForSingleObject(handle, 0),
+                              'run ' + IntToStr(run) + ': ExecuteAsync must reset the handle');
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(handle, 30000),
+                              'run ' + IntToStr(run) + ': the handle must be set when the run completes');
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status);
+    Assert.AreEqual<Cardinal>(0, proc.ExitCode);
+    Assert.AreEqual<THandle>(handle, proc.CompletionHandle, 'The same handle is used for every run');
   end;
 end;
 {$ENDIF}

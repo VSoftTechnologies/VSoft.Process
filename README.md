@@ -127,7 +127,9 @@ You can either drive these directly with property assignments or use the fluent 
 
 A process object runs one child at a time: calling any `Execute*` while a run is still in progress raises `EInvalidOpException`. That includes two threads calling `Execute*` on the same object at once: one starts the run and the other raises.
 
-Every `Execute*` first resets the object: `Status` becomes `Idle`, `ExitCode` `$FFFFFFFF`, and `Errors` and `ResolvedExecutable` are cleared. When the configuration is invalid (missing executable or working directory, invalid credentials, unsafe batch-file arguments) or the cancellation token / event is already signalled, `Execute*` returns `False` with the reason in `Errors`; `Status` stays `Idle`, no pipe target is started and no event fires. Some failures raise instead of returning `False`: a pipe target or source whose `Start` fails (a `ToFile` that can't create its file, `FromFile` with a missing file) and OS errors creating the pipes.
+Every `Execute*` first resets the object: `Status` becomes `Idle`, `ExitCode` `$FFFFFFFF`, `LastError` 0, and `Errors` and `ResolvedExecutable` are cleared. When the configuration is invalid (missing executable or working directory, invalid credentials, unsafe batch-file arguments) or the cancellation token / event is already signalled, `Execute*` returns `False` with the reason in `Errors`; `Status` stays `Idle`, no pipe target is started and no event fires. Some failures raise instead of returning `False`: a pipe target or source whose `Start` fails (a `ToFile` that can't create its file, `FromFile` with a missing file) and OS errors creating the pipes.
+
+When the configuration is valid but the operating system refuses to start the program (not a valid executable, access denied, elevation required, a wrong password with credentials), `Execute*` also returns `False` with the message in `Errors`, and `Status` stays `Idle`. `OnStarted` doesn't fire; for `Execute` / `ExecuteAsync` the pipe targets have already been started, so their `Done` is called. `LastError` then holds the OS error code: a Win32 error code on Windows (`ERROR_BAD_EXE_FORMAT`, `ERROR_ELEVATION_REQUIRED`, `ERROR_LOGON_FAILURE`, ...) and an `errno` value on POSIX (`EACCES`, ...), so compare it with the platform's own constants. `LastError` is 0 in every other case, so after `False` it tells you whether the OS refused the launch (non-zero) or validation or cancellation stopped it (0). A missing executable is a validation error, so it leaves `LastError` at 0.
 
 ### Status
 
@@ -490,6 +492,36 @@ proc.StartInfo.Executable := 'long-task.exe';
 
 The `ExecuteAsync` worker holds a reference to the process, so dropping your local `proc := nil` while it is still running does NOT free the underlying object out from under the worker - it continues to completion safely.
 
+**Waiting on a handle (Windows only).** Instead of polling `Status`, you can wait on `proc.CompletionHandle` together with your own handles, using `WaitForMultipleObjects` or `MsgWaitForMultipleObjects`. It is a manual-reset event that is signalled while no run is in progress. `Execute` / `ExecuteAsync` reset it before the child is created, so it is already reset when `ExecuteAsync` returns `True`. It is set once the run has fully completed: `Status` has left `Running`, all output has been delivered and `ExitCode` is final (`OnExit` fires after that). A run that fails validation or fails to launch leaves it signalled, and so does `ExecuteDetached`. The handle belongs to the `IProcess`: never close or signal it, and keep your `IProcess` reference until the wait is over. The property doesn't exist on POSIX, where `TEvent` has no handle.
+
+This waits for the run on the main thread, keeps the UI responsive, and wakes whenever a worker has queued output lines for you to log:
+
+```delphi
+var
+  handles : array[0..1] of THandle;
+  waitResult : DWORD;
+begin
+  if not proc.ExecuteAsync then
+    raise Exception.Create(proc.Errors.Text);
+  handles[0] := proc.CompletionHandle;
+  handles[1] := FLinesQueued.Handle; // your own auto-reset TEvent, set when lines are queued
+  repeat
+    waitResult := MsgWaitForMultipleObjects(2, handles, False, INFINITE, QS_ALLINPUT);
+    case waitResult of
+      WAIT_OBJECT_0     : ;                            // the run has completed
+      WAIT_OBJECT_0 + 1 : FlushQueuedLines;            // your event
+      WAIT_OBJECT_0 + 2 : Application.ProcessMessages; // a message arrived
+    else
+      RaiseLastOSError;
+    end;
+  until waitResult = WAIT_OBJECT_0;
+  FlushQueuedLines;
+  // proc.Status, proc.ExitCode and all captured output are final here.
+end;
+```
+
+Without a message loop, `WaitForMultipleObjects(2, @handles, False, timeoutMs)` works the same way.
+
 ### 7. Interactive stdin
 
 ```delphi
@@ -774,7 +806,7 @@ To run the tests, open the test dproj in the IDE and build/run. The console runn
 **`IProcess`** - the central interface returned by `TProcess.Create`.
 - Execution: `Execute(cancellationToken|cancellationEvent)`, `ExecuteAsync(cancellationToken|cancellationEvent)`, `ExecuteDetached`, `Terminate`, `Clone`.
 - Configuration: `WithStartInfo`, `WithCommandLine`, `WithEnvironment`, `WithCredentials`, `WithStdOutPipe`, `WithStdErrPipe`, `WithStdInPipe`.
-- State: `Status`, `ExitCode`, `TimedOut`, `ProcessId`, `ResolvedExecutable`, `StartMode`, `LastError`, `Errors`.
+- State: `Status`, `ExitCode`, `TimedOut`, `ProcessId`, `ResolvedExecutable`, `StartMode`, `LastError` (the OS error code when the OS refused to start the child, otherwise 0; see [Execution modes](#execution-modes)), `Errors`, `CompletionHandle` (Windows only; see [Async execution and status](#6-async-execution-and-status)).
 - Events: `OnStarted`, `OnExit`.
 
 **`IStartInfoBuilder`** - `Executable`, `ArgvZero` (POSIX), `WorkingDirectory`, `HideWindow` (default `True`, Windows), `TimeoutInMSec` (default 0 = no timeout), `TimedOutExitCode`, `TerminateExitCode`, `Priority`, `ProcessorAffinity`, `InputEncoding`, `OutputEncoding`, `PipeBufferSize` (0 = 64KB), `PipeDrainTimeoutMS` (default 2000), `JobMode` (default `KillOnRelease`), `TerminateOnTimeout` (default `True`), `MarshallEventsToMainThread` (queue events on the main thread), `Clone`, and `With*` fluent equivalents (named after the property, except `WithTimeout` for `TimeoutInMSec` and `WithPipeDrainTimeout` for `PipeDrainTimeoutMS`). See the [Platform Support](#platform-support) matrix for per-platform behaviour.

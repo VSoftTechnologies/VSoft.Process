@@ -223,6 +223,9 @@ type
     function GetProcessId : Cardinal;virtual;abstract;
     function GetErrors : TStrings;
     function GetResolvedExecutable : string;
+    {$IFDEF MSWINDOWS}
+    function GetCompletionHandle : THandle;
+    {$ENDIF}
     //fluent configuration
     function WithStartInfo(const proc : TConstProc<IStartInfoBuilder>) : IProcess;
     function WithCommandLine(const proc : TConstProc<ICommandLineBuilder>) : IProcess;
@@ -526,6 +529,13 @@ function TProcessBase.GetCommandLine: ICommandLineBuilder;
 begin
   result := FCmdLineBuilder;
 end;
+
+{$IFDEF MSWINDOWS}
+function TProcessBase.GetCompletionHandle : THandle;
+begin
+  result := FCompletionEvent.Handle;
+end;
+{$ENDIF}
 
 function TProcessBase.GetCredentials: ICredentialsBuilder;
 begin
