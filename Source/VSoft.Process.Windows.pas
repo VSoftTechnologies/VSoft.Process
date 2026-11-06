@@ -605,10 +605,14 @@ begin
       LogError(FStdInWriter.Error);
   end
   else
+  begin
     // Blocked in the source's GetData, which can't be cancelled. The writer
-    // holds everything it uses and finishes whenever GetData returns.
+    // holds everything it uses and finishes whenever GetData returns; it is
+    // detached so it no longer keeps this process (and its job) alive.
+    FDetachedOwnerRef := FStdInWriter.Detach;
     LogError('The stdin pipe source did not return from GetData within ' + IntToStr(cCancelWaitMS) +
              'ms of being stopped; its writer thread was left to finish on its own');
+  end;
   CloseHandle(FStdInWriteThread);
   FStdInWriteThread := 0;
   FStdInWriterThreadId := 0;
@@ -1010,7 +1014,20 @@ begin
       writer.SetThreadId(threadId);
       FStdInWriterThreadId := threadId;
       FStdInWriter := writer;
-      ResumeThread(FStdInWriteThread);
+      if ResumeThread(FStdInWriteThread) = $FFFFFFFF then
+      begin
+        error := Winapi.Windows.GetLastError;
+        // The thread never ran, so it never took over its reference and
+        // nothing waits on it: end it and drop the reference here.
+        TerminateThread(FStdInWriteThread, 0);
+        WaitForSingleObject(FStdInWriteThread, cCancelWaitMS);
+        CloseHandle(FStdInWriteThread);
+        FStdInWriteThread := 0;
+        FStdInWriterThreadId := 0;
+        FStdInWriter := nil;
+        writer._Release;
+        RaiseLastOSError(error);
+      end;
     end;
 
     if ResumeThread(FProcessInfo.hThread) = $FFFFFFFF then
