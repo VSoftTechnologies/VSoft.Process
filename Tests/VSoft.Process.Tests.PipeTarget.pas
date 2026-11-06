@@ -827,6 +827,7 @@ var
   target  : IPipeTarget;
   capture : TLineCapture;
   enc     : IEncodingAwarePipeTarget;
+  payload : TBytes;
 begin
   capture := TLineCapture.Create;
   try
@@ -838,8 +839,13 @@ begin
     // Injecting a different default must NOT clobber the explicit choice.
     enc.SetDefaultEncoding(TEncoding.ASCII);
     target.Start;
-    // (no further assertions needed - HasExplicitEncoding == True is the contract)
+    payload := TEncoding.UTF8.GetBytes('caf' + #$00E9 + #10);
+    target.HandleData(payload, Length(payload));
     target.Done;
+
+    Assert.AreEqual(1, capture.Lines.Count);
+    Assert.AreEqual('caf' + #$00E9, capture.Lines[0], False,
+                    'The explicit UTF-8 encoding must decode the line, not the injected ASCII default');
   finally
     capture.Free;
   end;

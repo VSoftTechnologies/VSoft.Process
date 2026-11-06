@@ -614,7 +614,9 @@ begin
                       'The StringBuilder target is cleared and refilled every run');
       Assert.Contains(outSB.ToString, 'this-is-stdout');
       Assert.AreEqual(run, errLines.Count, 'One stderr line per run');
-      Assert.Contains(TEncoding.Default.GetString(TTestHelpers.ReadFileBytes(outFile)), 'this-is-stdout');
+      // The file target is rewritten every run, so it holds the output once.
+      Assert.AreEqual('this-is-stdout' + sLineBreak, TEncoding.Default.GetString(TTestHelpers.ReadFileBytes(outFile)), False,
+                      'The file target must hold this run''s output only');
     end;
     proc := nil;
   finally
@@ -685,6 +687,7 @@ var
   proc : IProcess;
   counter : TCountingTarget;
   counterIntf : IPipeTarget;
+  deadline : Int64;
 begin
   counter := TCountingTarget.Create;
   counterIntf := counter;
@@ -693,8 +696,10 @@ begin
   TTestHelpers.SetupShellCommand(proc, 'print-large', [IntToStr(cLines)]);
   proc.WithStdOutPipe(counterIntf);
   Assert.IsTrue(proc.ExecuteAsync);
-  while proc.Status = TProcessStatus.Running do
+  deadline := TTestHelpers.TickMs + 30000;
+  while (proc.Status = TProcessStatus.Running) and (TTestHelpers.TickMs < deadline) do
     Sleep(1);
+  Assert.AreNotEqual(TProcessStatus.Running, proc.Status, 'The run did not complete within 30 seconds');
   // No extra waiting: the moment Status changes the run is complete.
   Assert.AreEqual(cLines, counter.LineCount, 'All output must be delivered before Status leaves Running');
   Assert.AreEqual(1, counter.DoneCount, 'Done must have been called before Status leaves Running');
