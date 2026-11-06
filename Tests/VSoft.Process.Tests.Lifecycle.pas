@@ -1178,16 +1178,24 @@ var
   output : TStringBuilder;
   expected : string;
   text : string;
+  fileName : string;
 begin
   // The leading 'x' puts every 2-byte character at an odd offset, so reads
   // of 4096 bytes always end in the middle of one.
   expected := 'x' + StringOfChar(#$00E9, cChars);
+  fileName := '';
   output := TStringBuilder.Create;
   try
     proc := TProcess.Create;
     proc.StartInfo.TimeoutInMSec := 30000;
     proc.StartInfo.PipeBufferSize := 4096;
-    TTestHelpers.SetupInlineCommand(proc, 'chcp 65001 > nul && echo ' + expected, 'printf ''' + expected + '\n''');
+    {$IFDEF MSWINDOWS}
+    // The child prints the exact UTF-8 bytes from a file: chcp 65001 on the
+    // same cmd /c line does not change the code page of that line's echo.
+    fileName := TTestHelpers.SetupPrintUtf8(proc, expected);
+    {$ELSE}
+    TTestHelpers.SetupInlineCommand(proc, '', 'printf ''' + expected + '\n''');
+    {$ENDIF}
     proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output, TEncoding.UTF8));
     Assert.IsTrue(proc.Execute);
     text := output.ToString;
@@ -1195,6 +1203,8 @@ begin
     Assert.Contains(text, expected);
   finally
     output.Free;
+    if fileName <> '' then
+      DeleteFile(fileName);
   end;
 end;
 

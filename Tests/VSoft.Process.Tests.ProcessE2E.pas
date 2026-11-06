@@ -1004,23 +1004,24 @@ var
   hadNonAscii : Boolean;
   i : Integer;
   s : string;
+  fileName : string;
 begin
+  fileName := '';
   collector := TLineCollector.Create;
   try
     proc := TProcess.Create;
-    proc.StartInfo.Executable := TTestHelpers.ShellExePath;
     proc.StartInfo.HideWindow := True;
     // The whole point of this test: set the encoding ON StartInfo and use a
     // line target WITHOUT an explicit encoding. Previously this was a silent
     // no-op (the line target fell back to TEncoding.Default).
     proc.StartInfo.OutputEncoding := TEncoding.UTF8;
     {$IFDEF MSWINDOWS}
-    proc.CommandLine.Add('/c');
-    // chcp 65001 switches the cmd code page to UTF-8 for the rest of the
-    // session, then echo the non-ASCII char. > nul on chcp suppresses the
-    // "Active code page: 65001" line so we can easily find our target line.
-    proc.CommandLine.Add('chcp 65001 > nul && echo caf' + #$00E9);
+    // The child prints the UTF-8 bytes of "caf" + e-acute from a file, so
+    // they do not depend on the console code page (chcp 65001 on the same
+    // cmd /c line does not change the code page of that line's echo).
+    fileName := TTestHelpers.SetupPrintUtf8(proc, 'caf' + #$00E9);
     {$ELSE}
+    proc.StartInfo.Executable := TTestHelpers.ShellExePath;
     // POSIX shells default to UTF-8 in modern locales. printf emits the byte
     // sequence verbatim so the UTF-8 encoding of e-acute (#$C3 #$A9) reaches
     // the pipe and the implicit StartInfo.OutputEncoding decodes it back.
@@ -1051,6 +1052,8 @@ begin
                   'Line target should have decoded e-acute via the injected UTF-8 default');
   finally
     collector.Free;
+    if fileName <> '' then
+      DeleteFile(fileName);
   end;
 end;
 
