@@ -55,6 +55,30 @@ type
     [Test]
     procedure StdInSourceNeverReturns_RunStillCompletes;
 
+    // A synchronous Execute on another thread: releasing the last caller
+    // reference while its OnExit handler runs must not destroy the process
+    // until the handler has returned (the completion event is set before
+    // OnExit fires; the run holds its own reference until it has finished).
+    // Destroy does not wait for the handler: the run's reference defers the
+    // free. Use of a plain object without an interface reference stays
+    // unprotected by design.
+    [Test]
+    procedure SyncExecuteOnOtherThread_ReleaseDuringOnExit_FreedAfterHandler;
+
+    // A synchronous Execute on another thread whose OnExit handler releases,
+    // through TThread.Synchronize, the only reference the caller holds: the
+    // process must not be destroyed on the main thread, where it would wait
+    // for the run while the run waits for the main thread. The deadlock is
+    // on the main thread, so a regression hangs this test rather than
+    // failing it.
+    [Test]
+    procedure SyncExecuteOnOtherThread_OnExitSynchronizesLastRelease_NoDeadlock;
+
+    // As above, with the handler handing the release to a thread of its own
+    // and waiting for it: a regression fails on the timeout instead.
+    [Test]
+    procedure SyncExecuteOnOtherThread_OnExitReleasesOnAnotherThread_NoDeadlock;
+
     // M11 - one target attached to stdout and stderr receives every byte.
     [Test]
     procedure SharedTargetOnBothStreams_ReceivesEveryByte;
@@ -240,6 +264,52 @@ type
     procedure Start;
     procedure HandleData(const data : TBytes; dataLength : NativeUInt);
     procedure Done;
+  end;
+
+  // A pipe target that records when it is released. The process keeps its
+  // targets until it is destroyed, so with no other reference its release
+  // marks the destruction of the process.
+  TLifetimeTarget = class(TInterfacedObject, IPipeTarget)
+  private
+    FReleased : PInteger;
+  public
+    constructor Create(released : PInteger);
+    destructor Destroy; override;
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
+  end;
+
+  // An OnExit handler that signals it has been entered, holds the thread for
+  // HoldMs and then records that it returned, and whether the process had
+  // been destroyed by then (TargetReleased, set by a TLifetimeTarget).
+  TExitHoldProbe = class
+  public
+    Entered : TEvent;
+    HoldMs : Cardinal;
+    Returned : integer;
+    TargetReleased : integer;
+    ReleasedBeforeReturn : integer;
+    constructor Create;
+    destructor Destroy; override;
+    procedure HandleExit(const process : IProcess; exitCode : Cardinal);
+  end;
+
+  // An OnExit handler that releases Holder, the only reference the test
+  // keeps to the process, on another thread and waits for that release:
+  // through TThread.Synchronize (the main thread), or on a thread of its own.
+  TLastReleaseProbe = class
+  public
+    Holder : IProcess;
+    UseSynchronize : boolean;
+    // Set by a TLifetimeTarget when the process is destroyed.
+    Released : integer;
+    // Set by the runner once Execute has returned.
+    Done : TEvent;
+    Dropped : TEvent;
+    constructor Create;
+    destructor Destroy; override;
+    procedure HandleExit(const process : IProcess; exitCode : Cardinal);
   end;
 
   // A stdin source whose GetData blocks until Release is called.
@@ -855,6 +925,202 @@ begin
     source.Release;
     proc := nil;
   end;
+end;
+
+{ TExitHoldProbe }
+
+constructor TExitHoldProbe.Create;
+begin
+  inherited Create;
+  Entered := TEvent.Create(nil, true, false, '');
+end;
+
+destructor TExitHoldProbe.Destroy;
+begin
+  Entered.Free;
+  inherited;
+end;
+
+procedure TExitHoldProbe.HandleExit(const process : IProcess; exitCode : Cardinal);
+begin
+  Entered.SetEvent;
+  Sleep(HoldMs);
+  TInterlocked.Exchange(ReleasedBeforeReturn, TInterlocked.CompareExchange(TargetReleased, 0, 0));
+  TInterlocked.Exchange(Returned, 1);
+end;
+
+{ TLifetimeTarget }
+
+constructor TLifetimeTarget.Create(released : PInteger);
+begin
+  inherited Create;
+  FReleased := released;
+end;
+
+destructor TLifetimeTarget.Destroy;
+begin
+  TInterlocked.Exchange(FReleased^, 1);
+  inherited;
+end;
+
+procedure TLifetimeTarget.Start;
+begin
+end;
+
+procedure TLifetimeTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+begin
+end;
+
+procedure TLifetimeTarget.Done;
+begin
+end;
+
+// In a routine of its own so the IProcess that WithStdOutPipe returns is
+// released here, not held by the caller until it returns.
+procedure AttachLifetimeTarget(const proc : IProcess; released : PInteger);
+var
+  target : IPipeTarget;
+begin
+  target := TLifetimeTarget.Create(released);
+  proc.WithStdOutPipe(target);
+end;
+
+procedure TProcessLifecycleTests.SyncExecuteOnOtherThread_ReleaseDuringOnExit_FreedAfterHandler;
+var
+  proc : IProcess;
+  rawProc : Pointer;
+  probe : TExitHoldProbe;
+  runner : TThread;
+begin
+  probe := TExitHoldProbe.Create;
+  try
+    probe.HoldMs := 1500;
+    proc := TProcess.Create;
+    TTestHelpers.SetupInlineCommand(proc, 'exit 0', 'exit 0');
+    AttachLifetimeTarget(proc, @probe.TargetReleased);
+    proc.OnExit := probe.HandleExit;
+    // The runner calls through a raw pointer, so this test's reference is the
+    // only one the caller holds: releasing it while Execute is still on the
+    // runner's stack.
+    rawProc := Pointer(proc);
+    runner := TThread.CreateAnonymousThread(
+      procedure
+      begin
+        IProcess(rawProc).Execute;
+      end);
+    runner.FreeOnTerminate := false;
+    runner.Start;
+    try
+      Assert.AreEqual(wrSignaled, probe.Entered.WaitFor(15000), 'OnExit was never fired');
+      // The run has completed (the completion event is set before OnExit).
+      proc := nil;
+    finally
+      runner.WaitFor;
+      runner.Free;
+    end;
+    Assert.AreEqual(1, probe.Returned, 'OnExit never returned');
+    Assert.AreEqual(0, probe.ReleasedBeforeReturn,
+                    'the process was destroyed while its OnExit handler was still running');
+    Assert.AreEqual(1, probe.TargetReleased, 'the process was never destroyed');
+  finally
+    probe.Free;
+  end;
+end;
+
+{ TLastReleaseProbe }
+
+constructor TLastReleaseProbe.Create;
+begin
+  inherited Create;
+  Done := TEvent.Create(nil, true, false, '');
+  Dropped := TEvent.Create(nil, true, false, '');
+end;
+
+destructor TLastReleaseProbe.Destroy;
+begin
+  Done.Free;
+  Dropped.Free;
+  inherited;
+end;
+
+procedure TLastReleaseProbe.HandleExit(const process : IProcess; exitCode : Cardinal);
+begin
+  if UseSynchronize then
+    TThread.Synchronize(nil,
+      procedure
+      begin
+        Holder := nil;
+      end)
+  else
+  begin
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        Holder := nil;
+        Dropped.SetEvent;
+      end).Start;
+    Dropped.WaitFor(INFINITE);
+  end;
+end;
+
+// Runs a synchronous Execute on another thread whose OnExit handler releases
+// the only reference the caller holds on a third thread (the main thread
+// with Synchronize). On a deadlock the runner and the probe are left behind
+// rather than hang the suite.
+procedure RunLastReleaseFromOnExit(useSynchronize : boolean);
+var
+  probe : TLastReleaseProbe;
+  proc : IProcess;
+  rawProc : Pointer;
+  runner : TThread;
+  deadline : UInt64;
+begin
+  probe := TLastReleaseProbe.Create;
+  probe.UseSynchronize := useSynchronize;
+  // Through a local: a function result assigned to a field goes through a
+  // hidden temporary that would hold a second reference until this returns.
+  proc := TProcess.Create;
+  probe.Holder := proc;
+  proc := nil;
+  TTestHelpers.SetupInlineCommand(probe.Holder, 'exit 0', 'exit 0');
+  AttachLifetimeTarget(probe.Holder, @probe.Released);
+  probe.Holder.OnExit := probe.HandleExit;
+  rawProc := Pointer(probe.Holder);
+  runner := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      try
+        IProcess(rawProc).Execute;
+      finally
+        probe.Done.SetEvent;
+      end;
+    end);
+  runner.FreeOnTerminate := false;
+  runner.Start;
+  // Serves the handler's Synchronize while waiting.
+  deadline := TThread.GetTickCount64 + 15000;
+  while (probe.Done.WaitFor(0) <> wrSignaled) and (TThread.GetTickCount64 < deadline) do
+    CheckSynchronize(10);
+  Assert.AreEqual(wrSignaled, probe.Done.WaitFor(0),
+                  'deadlock: Execute did not return after OnExit released the last reference');
+  runner.WaitFor;
+  runner.Free;
+  try
+    Assert.IsTrue(probe.Holder = nil, 'OnExit did not release the reference');
+    Assert.AreEqual(1, probe.Released, 'the process was never destroyed');
+  finally
+    probe.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.SyncExecuteOnOtherThread_OnExitSynchronizesLastRelease_NoDeadlock;
+begin
+  RunLastReleaseFromOnExit(true);
+end;
+
+procedure TProcessLifecycleTests.SyncExecuteOnOtherThread_OnExitReleasesOnAnotherThread_NoDeadlock;
+begin
+  RunLastReleaseFromOnExit(false);
 end;
 
 procedure TProcessLifecycleTests.SharedTargetOnBothStreams_ReceivesEveryByte;

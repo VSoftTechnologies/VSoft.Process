@@ -605,10 +605,14 @@ begin
       LogError(FStdInWriter.Error);
   end
   else
+  begin
     // Blocked in the source's GetData, which can't be cancelled. The writer
-    // holds everything it uses and finishes whenever GetData returns.
+    // holds everything it uses and finishes whenever GetData returns; it is
+    // detached so it no longer keeps this process (and its job) alive.
+    FDetachedOwnerRef := FStdInWriter.Detach;
     LogError('The stdin pipe source did not return from GetData within ' + IntToStr(cCancelWaitMS) +
              'ms of being stopped; its writer thread was left to finish on its own');
+  end;
   CloseHandle(FStdInWriteThread);
   FStdInWriteThread := 0;
   FStdInWriterThreadId := 0;
