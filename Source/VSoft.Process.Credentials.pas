@@ -67,32 +67,49 @@ type
     destructor Destroy;override;
   end;
 
+// Wipes a string holding a secret: when s alone references its buffer the
+// buffer is zeroed in place, then s is cleared. A buffer still shared with
+// another string, or a constant, is only released, never written to.
+procedure ScrubString(var s : string);
+
 implementation
 
 uses
   System.SysUtils;
 
-{ TCredentialsBuilder }
-
-procedure ZeroAndClearString(var s : string);
+procedure ScrubString(var s : string);
 begin
-  if Length(s) > 0 then
-  begin
-    // Make the string unique so we are zeroing our copy only, not a shared
-    // reference still in use by another owner.
-    UniqueString(s);
+  // StringRefCount is -1 for a constant and above 1 when shared.
+  if (Length(s) > 0) and (StringRefCount(s) = 1) then
     FillChar(Pointer(s)^, Length(s) * SizeOf(Char), 0);
-  end;
   s := '';
 end;
 
+// Zeroes a buffer made by PrivateCopy, whatever else references it (it is
+// always on the heap, so never read-only), then clears s.
+procedure WipePrivate(var s : string);
+begin
+  if Length(s) > 0 then
+    FillChar(Pointer(s)^, Length(s) * SizeOf(Char), 0);
+  s := '';
+end;
+
+// Copies value into a new heap buffer, so the copy is never shared with the
+// caller's string (or a constant) and can be zeroed in place.
+function PrivateCopy(const value : string) : string;
+begin
+  SetString(result, PChar(value), Length(value));
+end;
+
+{ TCredentialsBuilder }
+
 destructor TCredentialsBuilder.Destroy;
 begin
-  // Best-effort secure scrub of the password before the heap reclaims it.
-  // Reference counting will free the underlying buffer, but only after we
-  // overwrite it with zeros. UniqueString is used to avoid scrubbing a
-  // string still aliased elsewhere.
-  ZeroAndClearString(FPassword);
+  // Scrub the password before the heap reclaims it. FPassword is a buffer
+  // only this builder owns (copied in when set), so zeroing it reaches the
+  // only copy this object holds. Copies handed out by GetPassword are the
+  // caller's to scrub (ScrubString).
+  WipePrivate(FPassword);
   inherited;
 end;
 
@@ -106,7 +123,7 @@ begin
   inherited Create;
   FUserName := source.FUserName;
   FDomain := source.FDomain;
-  FPassword := source.FPassword;
+  FPassword := PrivateCopy(source.FPassword);
   FLoadProfile := source.FLoadProfile;
   FNetCredOnly := source.FNetCredOnly;
 end;
@@ -128,7 +145,8 @@ end;
 
 function TCredentialsBuilder.GetPassword: string;
 begin
-  result := FPassword;
+  // A copy the caller owns, so our own buffer is never shared.
+  result := PrivateCopy(FPassword);
 end;
 
 function TCredentialsBuilder.GetUserName: string;
@@ -152,8 +170,13 @@ begin
 end;
 
 procedure TCredentialsBuilder.SetPassword(const value: string);
+var
+  copied : string;
 begin
-  FPassword := value;
+  // Copied before the wipe, in case value is the current password.
+  copied := PrivateCopy(value);
+  WipePrivate(FPassword);
+  FPassword := copied;
 end;
 
 procedure TCredentialsBuilder.SetUserName(const value: string);
@@ -184,6 +207,13 @@ begin
     errorProc('A UserName is required when a Domain or Password is specified');
     result := false;
   end;
+  // CreateProcessWithLogonW takes LOGON_WITH_PROFILE or
+  // LOGON_NETCREDENTIALS_ONLY, not both.
+  if FLoadProfile and FNetCredOnly then
+  begin
+    errorProc('LoadUserProfile and NetCredentialsOnly cannot both be set: the logon takes one of them or neither');
+    result := false;
+  end;
 end;
 
 function TCredentialsBuilder.WithDomain(const value: string): ICredentialsBuilder;
@@ -200,7 +230,7 @@ end;
 
 function TCredentialsBuilder.WithPassword(const value: string): ICredentialsBuilder;
 begin
-  FPassword := value;
+  SetPassword(value);
   result := Self;
 end;
 

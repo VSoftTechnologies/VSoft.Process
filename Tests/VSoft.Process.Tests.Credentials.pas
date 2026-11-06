@@ -17,16 +17,19 @@ type
     [Test]
     procedure Clone_CopiesAllFields;
 
-    // C6 - Password should be zeroed out when the builder is destroyed.
-    // We can prove this on Win32 only because heap pages may be reused
-    // immediately on 64-bit. On Win32 we keep a captured pointer (via
-    // UniqueString) and check after destroy that the bytes are zeroed.
-    // The test is best-effort; we only fail if we can demonstrate the
-    // password is still readable verbatim.
+    // C6 - the builder keeps the password in a buffer of its own (not shared
+    // with the caller's string) and zeroes that buffer when it is destroyed.
+    // The test holds an extra reference to the builder's buffer (read through
+    // RTTI) so it outlives the builder and can be inspected afterwards.
     {$IFDEF MSWINDOWS}
     [Test]
     procedure Password_ZeroedOnDestroy;
     {$ENDIF}
+
+    // CreateProcessWithLogonW takes LOGON_WITH_PROFILE or
+    // LOGON_NETCREDENTIALS_ONLY, not both, so Validate must refuse the pair.
+    [Test]
+    procedure Validate_RejectsProfileWithNetCredentialsOnly;
 
     // W3 - Validate must reject a UPN-format username paired with a Domain.
     // CreateProcessWithLogonW rejects this combo with an opaque error; we
@@ -60,6 +63,10 @@ type
 implementation
 
 uses
+  {$IFDEF MSWINDOWS}
+  Winapi.Windows,
+  System.Rtti,
+  {$ENDIF}
   System.SysUtils,
   VSoft.Process.Tests.Common;
 
@@ -100,49 +107,31 @@ end;
 
 {$IFDEF MSWINDOWS}
 procedure TCredentialsTests.Password_ZeroedOnDestroy;
-const
-  cSecret = 'super-secret-password-12345';
 var
+  builder : TCredentialsBuilder;
   creds : ICredentialsBuilder;
-  buffer : array[0..255] of WideChar;
-  pwdCopy : string;
-  rawPtr : PWideChar;
+  secret : string;
+  held : string;
+  ctx : TRttiContext;
+  field : TRttiField;
   i : integer;
-  allZero : Boolean;
 begin
-  creds := MakeBuilder;
-  creds.WithPassword(cSecret);
-
-  // Force a unique heap allocation we control, then capture the raw pointer.
-  // After we drop the credentials reference, the heap manager may overwrite
-  // or zero the buffer. We assert that the bytes we captured no longer match
-  // the original secret. (The destructor should zero them out as a defence.)
-  pwdCopy := creds.Password;
-  UniqueString(pwdCopy);
-  rawPtr := PWideChar(pwdCopy);
-  Move(rawPtr^, buffer[0], Length(cSecret) * SizeOf(WideChar));
-
-  creds := nil; // refcount destroy
-
-  // Inspect what is left at the captured location. We're not testing the
-  // builder's internal pointer (that's gone) - we're testing that, when the
-  // fix lands, the builder's destructor zeroes its own internal buffer.
-  // The best signal we have here is the LIVE password string we copied:
-  // if the destructor zeroed the original, the copy we made before destroy
-  // still holds the value (we copied bytes). Real proof would require
-  // touching the original heap region, which is not portable.
-  //
-  // Without a real proof harness we at minimum check that we are still able
-  // to free the builder without crashing and that the captured copy is intact
-  // (sanity check the test itself).
-  allZero := True;
-  for i := 0 to Length(cSecret) - 1 do
-    if buffer[i] <> #0 then
-    begin
-      allZero := False;
-      Break;
-    end;
-  Assert.IsFalse(allZero, 'Captured copy should not be all zero (sanity)');
+  // A heap string of the caller's own, as a password usually is.
+  secret := 'super-secret-' + IntToStr(GetTickCount mod 1000) + '-password';
+  builder := TCredentialsBuilder.Create;
+  creds := builder;
+  creds.Password := secret; // not WithPassword: its result would hold a hidden reference
+  field := ctx.GetType(TCredentialsBuilder).GetField('FPassword');
+  Assert.IsNotNull(field, 'FPassword field not found through RTTI');
+  // An extra reference to the builder's own buffer keeps it alive after the
+  // builder is destroyed, so what the destructor did to it can be seen.
+  held := PString(PByte(builder) + field.Offset)^;
+  Assert.AreEqual(secret, held, false, 'sanity: the builder holds the password');
+  Assert.IsTrue(Pointer(held) <> Pointer(secret), 'the builder shares the caller''s buffer instead of keeping its own');
+  creds := nil; // the only reference: destroys the builder
+  for i := 1 to Length(held) do
+    if held[i] <> #0 then
+      Assert.Fail('the builder''s password buffer was not zeroed when it was destroyed');
 end;
 {$ENDIF}
 
@@ -175,6 +164,28 @@ begin
     Assert.IsFalse(ok, 'UPN-format user + non-empty Domain must fail Validate');
     Assert.IsTrue(Pos('UPN', sink.Last) > 0,
                   'Error message should mention UPN format');
+  finally
+    sink.Free;
+  end;
+end;
+
+procedure TCredentialsTests.Validate_RejectsProfileWithNetCredentialsOnly;
+var
+  creds : ICredentialsBuilder;
+  sink  : TValidateErrorSink;
+  ok    : boolean;
+begin
+  sink := TValidateErrorSink.Create;
+  try
+    creds := MakeBuilder;
+    creds.WithUser('alice')
+         .WithPassword('hunter2')
+         .WithUserProfile(true)
+         .WithNetCredentialsOnly(true);
+    ok := creds.Validate(sink.Capture);
+    Assert.IsFalse(ok, 'LoadUserProfile with NetCredentialsOnly must fail Validate');
+    Assert.IsTrue(Pos('NetCredentialsOnly', sink.Last) > 0,
+                  'Error message should mention NetCredentialsOnly');
   finally
     sink.Free;
   end;
