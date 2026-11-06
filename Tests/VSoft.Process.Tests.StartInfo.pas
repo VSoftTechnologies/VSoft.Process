@@ -36,6 +36,11 @@ type
 
     [Test]
     procedure JobModeAndTerminateOnTimeout_DefaultsFluentAndClone;
+
+    // SetProcessAffinityMask takes a DWORD_PTR, so on Win64 a mask can name
+    // CPUs 32-63. The property must not truncate it.
+    [Test]
+    procedure ProcessorAffinity_HoldsHighCpuBits;
   end;
 
 implementation
@@ -176,6 +181,22 @@ begin
   src.JobMode := TProcessJobMode.NoJob;
   Assert.AreEqual(TProcessJobMode.NoJob, src.JobMode);
   Assert.AreEqual(TProcessJobMode.KillOnTerminate, dst.JobMode, 'the clone is independent');
+end;
+
+procedure TStartInfoTests.ProcessorAffinity_HoldsHighCpuBits;
+var
+  info : IStartInfoBuilder;
+  mask : NativeUInt;
+  shift : integer;
+begin
+  shift := (SizeOf(NativeUInt) * 8) - 24; // CPU 40 on Win64, CPU 8 on Win32
+  mask := NativeUInt(1) shl shift;
+  info := MakeBuilder;
+  info.ProcessorAffinity := mask;
+  Assert.AreEqual<NativeUInt>(mask, info.ProcessorAffinity, 'property');
+  info := MakeBuilder;
+  Assert.AreEqual<NativeUInt>(mask, info.WithProcessorAffinity(mask).ProcessorAffinity, 'fluent setter');
+  Assert.AreEqual<NativeUInt>(mask, info.Clone.ProcessorAffinity, 'Clone');
 end;
 
 initialization

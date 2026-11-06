@@ -797,8 +797,8 @@ begin
   setup.ApplyAffinity := StartInfo.ProcessorAffinity <> 0;
   FillChar(setup.CpuSet, SizeOf(cpu_set_t), 0);
   if setup.ApplyAffinity then
-    for cpuIndex := 0 to 31 do
-      if (StartInfo.ProcessorAffinity and (Cardinal(1) shl cpuIndex)) <> 0 then
+    for cpuIndex := 0 to (SizeOf(NativeUInt) * 8) - 1 do
+      if (StartInfo.ProcessorAffinity and (NativeUInt(1) shl cpuIndex)) <> 0 then
         setup.CpuSet.__bits[cpuIndex div 64] := setup.CpuSet.__bits[cpuIndex div 64] or (UInt64(1) shl (cpuIndex mod 64));
   {$ENDIF}
 end;
