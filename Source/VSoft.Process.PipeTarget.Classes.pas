@@ -549,6 +549,10 @@ begin
     AppendText(DecodeLenient(FEncoding, FPendingBytes, 0, Length(FPendingBytes)));
     SetLength(FPendingBytes, 0);
   end;
+  // An injected default belongs to this run only: the next run may inject a
+  // different one, or none, and this one may since have been freed.
+  if not FEncodingExplicit then
+    FEncoding := nil;
 end;
 
 procedure TStringBuilderPipeTarget.HandleData(const data: TBytes; length: NativeUInt);
@@ -734,6 +738,10 @@ begin
   if FCurrentLine <> '' then
     OutputLine(FCurrentLine);
   FCurrentLine := '';
+  // An injected default belongs to this run only: the next run may inject a
+  // different one, or none, and this one may since have been freed.
+  if not FEncodingExplicit then
+    FEncoding := nil;
 end;
 
 function TLinePipeTargetBase.LastLineFeedEnd(fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;

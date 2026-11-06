@@ -33,6 +33,7 @@ type
   protected
     procedure Start;override;
     function GetData(var data : TBytes; out dataLength: NativeUInt) : boolean;override;
+    procedure Done;override;
 
     function HasExplicitEncoding : boolean;
     procedure SetDefaultEncoding(const value : TEncoding);
@@ -64,6 +65,7 @@ type
     FDataReadyEvent : TEvent;
   protected
     function GetData(var data : TBytes; out dataLength: NativeUInt) : boolean;override;
+    procedure Done;override;
   public
     constructor Create;
     destructor Destroy;override;
@@ -149,6 +151,14 @@ begin
   if FEncoding = nil then
     FEncoding := TEncoding.Default;
   FBytes := FEncoding.GetBytes(FValue);
+end;
+
+procedure TStringPipeSource.Done;
+begin
+  // An injected default belongs to this run only: the next run may inject a
+  // different one, or none, and this one may since have been freed.
+  if not FEncodingExplicit then
+    FEncoding := nil;
 end;
 
 function TStringPipeSource.HasExplicitEncoding: boolean;
@@ -356,6 +366,18 @@ end;
 procedure TInteractivePipeSource.SetDefaultEncoding(const value: TEncoding);
 begin
   FDefaultEncoding := value;
+end;
+
+procedure TInteractivePipeSource.Done;
+begin
+  // An injected default belongs to this run only: the next run may inject a
+  // different one, or none, and this one may since have been freed.
+  FLock.Enter;
+  try
+    FDefaultEncoding := nil;
+  finally
+    FLock.Leave;
+  end;
 end;
 
 function TInteractivePipeSource.IsClosed: Boolean;

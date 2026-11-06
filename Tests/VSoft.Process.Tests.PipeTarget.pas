@@ -214,6 +214,13 @@ type
     procedure LineTarget_Utf16BE_EverySplitPoint;
     [Test]
     procedure LineTarget_Utf16LE_OneByteAtATime;
+
+    // An injected OutputEncoding belongs to one run: a later run with no
+    // injection must not reuse it (it may have been freed since).
+    [Test]
+    procedure LineTarget_InjectedDefault_ForgottenAfterDone;
+    [Test]
+    procedure StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
   end;
 
 implementation
@@ -1292,6 +1299,67 @@ begin
   for i := 0 to High(full) do
     chunks[i] := TBytes.Create(full[i]);
   Assert.AreEqual(cUtf16Lines, FeedLines(TEncoding.Unicode, chunks));
+end;
+
+procedure TPipeTargetTests.LineTarget_InjectedDefault_ForgottenAfterDone;
+var
+  target  : IPipeTarget;
+  enc     : IEncodingAwarePipeTarget;
+  capture : TLineCapture;
+  payload : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine);
+    Assert.IsTrue(Supports(target, IEncodingAwarePipeTarget, enc));
+    // Run 1: the process injects UTF-16.
+    enc.SetDefaultEncoding(TEncoding.Unicode);
+    target.Start;
+    payload := TEncoding.Unicode.GetBytes('one'#10);
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    // Run 2: no injection, so TEncoding.Default applies.
+    target.Start;
+    payload := TBytes.Create(Ord('a'), Ord('b'), 10);
+    target.HandleData(payload, Length(payload));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('one', capture.Lines[0], false);
+    Assert.AreEqual('ab', capture.Lines[1], false, 'Run 2 must not reuse run 1''s injected UTF-16');
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
+var
+  target  : IPipeTarget;
+  enc     : IEncodingAwarePipeTarget;
+  sb      : TStringBuilder;
+  payload : TBytes;
+begin
+  sb := TStringBuilder.Create;
+  try
+    target := TPipeTarget.ToStringBuilder(sb);
+    Assert.IsTrue(Supports(target, IEncodingAwarePipeTarget, enc));
+    // Run 1: the process injects UTF-16.
+    enc.SetDefaultEncoding(TEncoding.Unicode);
+    target.Start;
+    payload := TEncoding.Unicode.GetBytes('one');
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    Assert.AreEqual('one', sb.ToString, false);
+
+    // Run 2: no injection, so TEncoding.Default applies.
+    target.Start;
+    payload := TBytes.Create(Ord('a'), Ord('b'));
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    Assert.AreEqual('ab', sb.ToString, false, 'Run 2 must not reuse run 1''s injected UTF-16');
+  finally
+    sb.Free;
+  end;
 end;
 
 initialization
