@@ -59,7 +59,7 @@ type
 
     function ToLogString: string; virtual; // Overriden to hide passwords from the log
 
-    function Clone : IArgument;
+    function Clone : IArgument; virtual;
 
     constructor CreateClone(const source : TArgument);
   public
@@ -76,6 +76,8 @@ type
     // appears elsewhere in the line).
     function BuildRendered(const maskValue : boolean) : string;
     function ToLogString: string; override;
+    // A clone must stay sensitive, or the cloned command line logs the secret.
+    function Clone : IArgument; override;
   public
     function ToString : string; override;
   end;
@@ -87,7 +89,8 @@ type
     FDefaultArgumentSeparator : string;
   protected
     function CreateArgument(const name : string; const value : string = ''; const Quoted : TQuoted = TQuoted.qtDouble) : IArgument;
-    function CreateSensitveArgument(const name : string; const value : string; const Quoted : TQuoted) : IArgument;
+    function CreateSensitiveArgument(const name : string; const value : string; const Quoted : TQuoted) : IArgument;
+    function CreateSensitveArgument(const name : string; const value : string; const Quoted : TQuoted) : IArgument; deprecated 'Use CreateSensitiveArgument';
 
 
     function GetDefValueSep : string;
@@ -324,6 +327,11 @@ begin
   end;
 end;
 
+function TSensitiveArgument.Clone : IArgument;
+begin
+  result := TSensitiveArgument.CreateClone(self);
+end;
+
 function TSensitiveArgument.ToString : string;
 begin
   result := BuildRendered(False);
@@ -360,7 +368,7 @@ var
   arg : IArgument;
 begin
   result := Self;
-  arg := CreateSensitveArgument(name,value,Quoted);
+  arg := CreateSensitiveArgument(name,value,Quoted);
   FArgs.Add(arg);
 end;
 
@@ -369,7 +377,7 @@ var
   arg : IArgument;
 begin
   result := Self;
-  arg := CreateSensitveArgument(name,'',Quoted);
+  arg := CreateSensitiveArgument(name,'',Quoted);
   FArgs.Add(arg);
 end;
 
@@ -413,11 +421,16 @@ begin
   end;
 end;
 
-function TArgumentsBuilder.CreateSensitveArgument(const name, value: string; const Quoted: TQuoted): IArgument;
+function TArgumentsBuilder.CreateSensitiveArgument(const name, value: string; const Quoted: TQuoted): IArgument;
 begin
   result := TSensitiveArgument.Create(name,value);
   result.NameValueSeparator := FDefaultValueSeparator;
   result.Quoted := Quoted;
+end;
+
+function TArgumentsBuilder.CreateSensitveArgument(const name, value: string; const Quoted: TQuoted): IArgument;
+begin
+  result := CreateSensitiveArgument(name, value, Quoted);
 end;
 
 destructor TArgumentsBuilder.Destroy;
