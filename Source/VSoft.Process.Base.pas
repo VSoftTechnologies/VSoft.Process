@@ -30,16 +30,6 @@ type
 
   TProcessBase = class;
 
-  // Shared between a process and its runs, and reference counted, so a run
-  // whose OnExit handler releases the last reference to the process can
-  // still finish with it after the process is gone.
-  TProcessRunState = class(TInterfacedObject)
-  public
-    // Runs that have started and not yet returned from OnExit. Destroy
-    // waits for it to reach 0.
-    ActiveRuns : integer;
-  end;
-
   // The stdin writer for one run. Its thread works only on this object
   // (reference counted, shared with the process), so a writer still blocked
   // in the source's GetData when the run ends can be left to finish on its
@@ -124,11 +114,6 @@ type
     //                        (delivery is serialised, so there is at most one).
     FWorkerThreadId : TThreadID;
     FDeliveringThreadId : TThreadID;
-
-    // The completion event is set before OnExit fires, so it cannot tell
-    // Destroy that a run has finished with this object; FRunState can.
-    FRunState : TProcessRunState;
-    FRunStateRef : IInterface;
 
     function StartRun(const cancellationToken : ICancellationToken; const cancellationEvent : TEvent; mode : TProcessStartMode) : boolean;
     procedure RunWorker;
@@ -307,34 +292,6 @@ begin
   {$ENDIF}
 end;
 
-type
-  // One OnExit call in progress on this thread, chained to any it is nested
-  // in (an OnExit handler may run another process synchronously).
-  PExitFrame = ^TExitFrame;
-  TExitFrame = record
-    RunState : TProcessRunState;
-    Previous : PExitFrame;
-  end;
-
-threadvar
-  GExitFrames : PExitFrame;
-
-// True when this thread is inside an OnExit handler of a run of the process
-// that owns runState: Destroy called from there must not wait for that run.
-function IsInsideOnExit(runState : TProcessRunState) : boolean;
-var
-  frame : PExitFrame;
-begin
-  frame := GExitFrames;
-  while frame <> nil do
-  begin
-    if frame.RunState = runState then
-      Exit(true);
-    frame := frame.Previous;
-  end;
-  result := false;
-end;
-
 { TStdInWriter }
 
 constructor TStdInWriter.Create(owner : TProcessBase; const source : IPipeSource);
@@ -451,8 +408,6 @@ begin
   SetStatusAtomic(TProcessStatus.Idle);
   FTimedOut := false;
   FStartMode := TProcessStartMode.Sync;
-  FRunState := TProcessRunState.Create;
-  FRunStateRef := FRunState;
 
   FStdOutTargets := TList<IPipeTarget>.Create;
   FStdErrTargets := TList<IPipeTarget>.Create;
@@ -475,28 +430,20 @@ end;
 
 destructor TProcessBase.Destroy;
 begin
+  // A run holds its own reference to this object until it has finished with
+  // it (OnExit included), so when used through IProcess this object is never
+  // destroyed during a run. What follows covers an object used without an
+  // interface reference (RefCount 0 when the run started) and freed while a
+  // synchronous Execute is in progress on another thread.
   if (FCompletionEvent <> nil) and (FCompletionEvent.WaitFor(0) <> wrSignaled) then
   begin
-    // A run is still active (only possible for a synchronous Execute on
-    // another thread). Ask it to stop and wait until it has released
-    // everything we are about to free. Every library wait inside the worker
-    // is bounded; only user code (a target, a source's Done, OnExit) can
-    // hold it longer, and freeing early would be a use-after-free.
+    // Ask it to stop and wait until it has released everything we are about
+    // to free. Every library wait inside the worker is bounded; only user
+    // code (a target, a source's Done) can hold it longer, and freeing early
+    // would be a use-after-free.
     FTerminateEvent.SetEvent;
     FCompletionEvent.WaitFor(INFINITE);
   end;
-  // The completion event is set before OnExit fires, so a run's tail may
-  // still be using this object on another thread: wait for it to finish.
-  // After its decrement it touches only its own reference to FRunState.
-  // Not from the OnExit handler itself, which would wait for ever. On the
-  // main thread, keep serving Synchronize: the tail's OnExit may be waiting
-  // for it.
-  if (FRunState <> nil) and (not IsInsideOnExit(FRunState)) then
-    while TInterlocked.CompareExchange(FRunState.ActiveRuns, 0, 0) <> 0 do
-      if CurrentThreadId = MainThreadID then
-        CheckSynchronize(1)
-      else
-        Sleep(1);
 
   FTerminateEvent.Free;
   FCompletionEvent.Free;
@@ -707,13 +654,22 @@ end;
 function TProcessBase.InternalStart: boolean;
 var
   keepAlive : IInterface;
+  selfRef : IInterface;
 begin
   result := false;
+  // The run's own reference, as an asynchronous run's worker holds one: the
+  // caller may release the last of theirs while the run is still using this
+  // object (from OnExit, or from another thread), and the object must then
+  // be freed here, on this thread, once the run has finished with it, never
+  // in the middle of it or on a thread that has to wait for this one.
+  // Released when this method returns, after everything else. Only taken
+  // when the object is already reference counted: one used without an
+  // interface reference would be freed by its release.
+  if RefCount > 0 then
+    selfRef := Self;
   FStartThreadId := CurrentThreadId;
   // The calling thread is the worker for a synchronous run.
   FWorkerThreadId := FStartThreadId;
-  // Ended by RunWorker after OnExit, or by AbortStart.
-  TInterlocked.Increment(FRunState.ActiveRuns);
   FTerminateEvent.ResetEvent;
   FCompletionEvent.ResetEvent;
   // From here the completion event marks the run as in progress.
@@ -747,8 +703,6 @@ begin
   result := false;
   FStartThreadId := CurrentThreadId;
   FWorkerThreadId := 0;
-  // Ended by RunWorker after OnExit, or by AbortStart.
-  TInterlocked.Increment(FRunState.ActiveRuns);
   FTerminateEvent.ResetEvent;
   FCompletionEvent.ResetEvent;
   // From here the completion event marks the run as in progress.
@@ -800,14 +754,10 @@ procedure TProcessBase.RunWorker;
 var
   outcome : TProcessOutcome;
   keepAlive : IInterface;
-  runState : TProcessRunState;
-  runStateRef : IInterface;
-  exitFrame : TExitFrame;
 begin
-  // The run's own reference: its tail must outlive this object when OnExit
-  // releases the last reference to it.
-  runState := FRunState;
-  runStateRef := runState;
+  // The caller (InternalStart, or the asynchronous worker) holds a reference
+  // to this object until this method has returned, so OnExit can release
+  // every other reference without this object being freed under it.
   outcome.Status := TProcessStatus.Terminated;
   outcome.ExitCode := FStartInfoBuilder.TerminateExitCode;
   outcome.TimedOut := false;
@@ -829,22 +779,8 @@ begin
       FDetachedOwnerRef := nil;
       CompleteRun(outcome);
     end;
-    // Marks this thread as inside OnExit for this process, per thread and
-    // nested, so runs on other threads or started from the handler cannot
-    // clear or confuse the mark.
-    exitFrame.RunState := runState;
-    exitFrame.Previous := GExitFrames;
-    GExitFrames := @exitFrame;
-    try
-      // May release the last reference: nothing below touches Self.
-      DoOnExited(outcome.ExitCode);
-    finally
-      GExitFrames := exitFrame.Previous;
-    end;
+    DoOnExited(outcome.ExitCode);
   finally
-    // From here Destroy on another thread may free this object; only the
-    // run's own state is touched.
-    TInterlocked.Decrement(runState.ActiveRuns);
     keepAlive := nil;
   end;
 end;
@@ -868,9 +804,9 @@ begin
   FCancellationToken := nil;
   FCancellationEvent := nil;
   FWorkerThreadId := 0;
+  // Last: from here Destroy on another thread may free an object used
+  // without an interface reference.
   FCompletionEvent.SetEvent;
-  // Last: from here Destroy on another thread may free this object.
-  TInterlocked.Decrement(FRunState.ActiveRuns);
 end;
 
 function TProcessBase.IsCancelled: boolean;
