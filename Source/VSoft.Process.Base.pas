@@ -815,13 +815,19 @@ end;
 procedure TProcessBase.DeliverTo(const slots : TArray<TPipeTargetSlot>; const streamName : string; const buffer : TBytes; count : NativeUInt);
 var
   i : integer;
+  streamAware : IStreamAwarePipeTarget;
 begin
   for i := 0 to High(slots) do
   begin
     if slots[i].Faulted then
       continue;
     try
-      slots[i].Target.HandleData(buffer, count);
+      // A target attached to both streams keeps each stream's partial line
+      // apart when it is told which one this is.
+      if Supports(slots[i].Target, IStreamAwarePipeTarget, streamAware) then
+        streamAware.HandleStreamData(streamName = 'stderr', buffer, count)
+      else
+        slots[i].Target.HandleData(buffer, count);
     except
       on E : Exception do
       begin

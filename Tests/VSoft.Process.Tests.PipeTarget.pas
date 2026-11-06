@@ -214,6 +214,15 @@ type
     procedure LineTarget_Utf16BE_EverySplitPoint;
     [Test]
     procedure LineTarget_Utf16LE_OneByteAtATime;
+
+    // One target attached to both streams keeps each stream's partial line,
+    // or split character, apart from the other's.
+    [Test]
+    procedure LineTarget_SharedByBothStreams_KeepsPartialLinesApart;
+    [Test]
+    procedure StringBuilderTarget_SharedByBothStreams_KeepsSplitCharacterApart;
+    [Test]
+    procedure MultiTarget_ForwardsStreamToChildren;
   end;
 
 implementation
@@ -1292,6 +1301,77 @@ begin
   for i := 0 to High(full) do
     chunks[i] := TBytes.Create(full[i]);
   Assert.AreEqual(cUtf16Lines, FeedLines(TEncoding.Unicode, chunks));
+end;
+
+procedure TPipeTargetTests.LineTarget_SharedByBothStreams_KeepsPartialLinesApart;
+var
+  target  : IPipeTarget;
+  streams : IStreamAwarePipeTarget;
+  capture : TLineCapture;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8);
+    Assert.IsTrue(Supports(target, IStreamAwarePipeTarget, streams), 'A line target should keep per-stream state');
+    target.Start;
+    streams.HandleStreamData(false, MakeBytes('out-a'), 5);
+    streams.HandleStreamData(true, MakeBytes('err-1'#10), 6);
+    streams.HandleStreamData(false, MakeBytes('out-b'#10), 6);
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('err-1', capture.Lines[0], false, 'stdout''s partial line must not join stderr''s');
+    Assert.AreEqual('out-aout-b', capture.Lines[1], false, 'stdout''s line is completed by stdout only');
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_SharedByBothStreams_KeepsSplitCharacterApart;
+var
+  target  : IPipeTarget;
+  streams : IStreamAwarePipeTarget;
+  sb      : TStringBuilder;
+begin
+  sb := TStringBuilder.Create;
+  try
+    target := TPipeTarget.ToStringBuilder(sb, TEncoding.UTF8);
+    Assert.IsTrue(Supports(target, IStreamAwarePipeTarget, streams), 'A StringBuilder target should keep per-stream state');
+    target.Start;
+    // U+00E9 is C3 A9 in UTF-8.
+    streams.HandleStreamData(false, TBytes.Create($C3), 1);
+    streams.HandleStreamData(true, TBytes.Create(Ord('x')), 1);
+    streams.HandleStreamData(false, TBytes.Create($A9), 1);
+    target.Done;
+
+    Assert.AreEqual('x' + #$00E9, sb.ToString, false, 'Each stream''s character must be completed by its own bytes');
+  finally
+    sb.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.MultiTarget_ForwardsStreamToChildren;
+var
+  multi   : IPipeTarget;
+  streams : IStreamAwarePipeTarget;
+  capture : TLineCapture;
+begin
+  capture := TLineCapture.Create;
+  try
+    multi := TPipeTarget.ToAll([TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8)]);
+    Assert.IsTrue(Supports(multi, IStreamAwarePipeTarget, streams), 'ToAll should pass the stream on');
+    multi.Start;
+    streams.HandleStreamData(false, MakeBytes('out-a'), 5);
+    streams.HandleStreamData(true, MakeBytes('err-1'#10), 6);
+    streams.HandleStreamData(false, MakeBytes('out-b'#10), 6);
+    multi.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('err-1', capture.Lines[0], false);
+    Assert.AreEqual('out-aout-b', capture.Lines[1], false);
+  finally
+    capture.Free;
+  end;
 end;
 
 initialization

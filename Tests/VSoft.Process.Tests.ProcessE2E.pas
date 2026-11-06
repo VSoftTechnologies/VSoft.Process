@@ -42,6 +42,11 @@ type
     [Test]
     procedure StdErr_CapturedSeparatelyFromStdOut;
 
+    // One line target attached to both stdout and stderr: a partial stdout
+    // line must not be joined to the next stderr line.
+    [Test]
+    procedure SharedLineTarget_BothStreams_PartialLinesKeptApart;
+
     [Test]
     procedure StdIn_FromStringSource_SentToChild;
 
@@ -300,6 +305,44 @@ begin
   finally
     if FileExists(outFile) then
       DeleteFile(outFile);
+  end;
+end;
+
+procedure TProcessE2ETests.SharedLineTarget_BothStreams_PartialLinesKeptApart;
+var
+  proc : IProcess;
+  lines : TStringList;
+  target : IPipeTarget;
+begin
+  lines := TStringList.Create;
+  try
+    target := TPipeTarget.ToLineDelegate(
+      procedure(const line : string)
+      begin
+        TMonitor.Enter(lines);
+        try
+          lines.Add(line);
+        finally
+          TMonitor.Exit(lines);
+        end;
+      end, TEncoding.Default);
+    proc := TProcess.Create;
+    proc.StartInfo.HideWindow := True;
+    // stdout: "abc" with no line end; a pause so it is read first; stderr: a
+    // whole line; then stdout's line end.
+    TTestHelpers.SetupInlineCommand(proc,
+      '<nul set /p =abc& ping -n 2 127.0.0.1 >nul& echo ERR 1>&2& echo.',
+      'printf abc; sleep 1; echo "ERR " 1>&2; echo');
+    proc.WithStdOutPipe(target);
+    proc.WithStdErrPipe(target);
+    proc.Execute(nil);
+
+    Assert.AreEqual<Cardinal>(0, proc.ExitCode);
+    Assert.IsTrue(lines.IndexOf('abc') >= 0, 'stdout''s line should arrive whole: ' + lines.CommaText);
+    Assert.IsTrue(lines.IndexOf('ERR ') >= 0, 'stderr''s line should arrive whole: ' + lines.CommaText);
+    Assert.AreEqual(0, Pos('abcERR', lines.Text), 'the streams were joined in one buffer: ' + lines.CommaText);
+  finally
+    lines.Free;
   end;
 end;
 
