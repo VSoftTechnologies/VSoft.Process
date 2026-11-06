@@ -1,4 +1,4 @@
-unit VSoft.Process.Tests.ProcessE2E;
+﻿unit VSoft.Process.Tests.ProcessE2E;
 
 interface
 
@@ -41,6 +41,21 @@ type
 
     [Test]
     procedure StdErr_CapturedSeparatelyFromStdOut;
+
+    // One line target attached to both stdout and stderr: a partial stdout
+    // line must not be joined to the next stderr line.
+    [Test]
+    procedure SharedLineTarget_BothStreams_PartialLinesKeptApart;
+
+    // A subclass overriding the protected HandleData still sees the bytes of
+    // both streams when attached to stdout and stderr.
+    [Test]
+    procedure SharedTarget_HandleDataOverride_SeesBothStreams;
+
+    // A ToAll target attached to stdout and stderr: a child that raises on
+    // its first data must not starve a sibling on either stream.
+    [Test]
+    procedure SharedToAll_RaisingChild_SiblingStillSeesBothStreams;
 
     [Test]
     procedure StdIn_FromStringSource_SentToChild;
@@ -201,6 +216,7 @@ implementation
 
 uses
   System.IOUtils,
+  VSoft.Process.PipeTarget.Classes,
   {$IFNDEF MSWINDOWS}
   Posix.Unistd,
   {$ENDIF}
@@ -305,6 +321,133 @@ begin
   finally
     if FileExists(outFile) then
       DeleteFile(outFile);
+  end;
+end;
+
+procedure TProcessE2ETests.SharedLineTarget_BothStreams_PartialLinesKeptApart;
+var
+  proc : IProcess;
+  lines : TStringList;
+  target : IPipeTarget;
+begin
+  lines := TStringList.Create;
+  try
+    target := TPipeTarget.ToLineDelegate(
+      procedure(const line : string)
+      begin
+        TMonitor.Enter(lines);
+        try
+          lines.Add(line);
+        finally
+          TMonitor.Exit(lines);
+        end;
+      end, TEncoding.Default);
+    proc := TProcess.Create;
+    proc.StartInfo.HideWindow := True;
+    // stdout: "abc" with no line end; a pause so it is read first; stderr: a
+    // whole line; then stdout's line end.
+    TTestHelpers.SetupInlineCommand(proc,
+      '<nul set /p =abc& ping -n 2 127.0.0.1 >nul& echo ERR 1>&2& echo.',
+      'printf abc; sleep 1; echo "ERR " 1>&2; echo');
+    proc.WithStdOutPipe(target);
+    proc.WithStdErrPipe(target);
+    proc.Execute(nil);
+
+    Assert.AreEqual<Cardinal>(0, proc.ExitCode);
+    Assert.IsTrue(lines.IndexOf('abc') >= 0, 'stdout''s line should arrive whole: ' + lines.CommaText);
+    Assert.IsTrue(lines.IndexOf('ERR ') >= 0, 'stderr''s line should arrive whole: ' + lines.CommaText);
+    Assert.AreEqual(0, Pos('abcERR', lines.Text), 'the streams were joined in one buffer: ' + lines.CommaText);
+  finally
+    lines.Free;
+  end;
+end;
+
+type
+  TCountingTarget = class(TStringBuilderPipeTarget)
+  protected
+    procedure HandleData(const data : TBytes; length : NativeUInt);override;
+  public
+    Bytes : NativeUInt;
+    OutText : string;
+    ErrText : string;
+  end;
+
+procedure TCountingTarget.HandleData(const data : TBytes; length : NativeUInt);
+begin
+  Inc(Bytes, length);
+  if DispatchingStdErr then
+    ErrText := ErrText + TEncoding.ANSI.GetString(data, 0, length)
+  else
+    OutText := OutText + TEncoding.ANSI.GetString(data, 0, length);
+  inherited HandleData(data, length);
+end;
+
+procedure TProcessE2ETests.SharedToAll_RaisingChild_SiblingStillSeesBothStreams;
+var
+  proc : IProcess;
+  sb : TStringBuilder;
+  multi : IPipeTarget;
+  text : string;
+begin
+  sb := TStringBuilder.Create;
+  try
+    multi := TPipeTarget.ToAll([
+      TPipeTarget.ToDelegate(
+        procedure(const data : TBytes; length : NativeUInt)
+        begin
+          raise EInvalidOpException.Create('boom');
+        end),
+      TPipeTarget.ToStringBuilder(sb, TEncoding.Default)]);
+    proc := TProcess.Create;
+    proc.StartInfo.HideWindow := True;
+    TTestHelpers.SetupShellCommand(proc, 'print-stderr', []);
+    proc.WithStdOutPipe(multi);
+    proc.WithStdErrPipe(multi);
+    try
+      proc.Execute(nil);
+    except
+      on EInvalidOpException do; // the raising child's exception, reported from Done
+    end;
+    text := sb.ToString;
+    Assert.Contains(text, 'this-is-stdout', 'The sibling must receive stdout');
+    Assert.Contains(text, 'this-is-stderr', 'The sibling must receive stderr');
+  finally
+    multi := nil;
+    proc := nil;
+    sb.Free;
+  end;
+end;
+
+procedure TProcessE2ETests.SharedTarget_HandleDataOverride_SeesBothStreams;
+var
+  proc : IProcess;
+  sb : TStringBuilder;
+  counting : TCountingTarget;
+  target : IPipeTarget;
+begin
+  sb := TStringBuilder.Create;
+  try
+    counting := TCountingTarget.Create(sb, TEncoding.Default);
+    target := counting;
+    proc := TProcess.Create;
+    proc.StartInfo.HideWindow := True;
+    TTestHelpers.SetupInlineCommand(proc,
+      'echo OUTLINE& echo ERRLINE 1>&2',
+      'echo OUTLINE; echo ERRLINE 1>&2');
+    proc.WithStdOutPipe(target);
+    proc.WithStdErrPipe(target);
+    proc.Execute(nil);
+
+    Assert.AreEqual<Cardinal>(0, proc.ExitCode);
+    Assert.IsTrue(counting.Bytes >= 14, 'the HandleData override was bypassed, bytes seen: ' + IntToStr(counting.Bytes));
+    Assert.Contains(sb.ToString, 'OUTLINE', 'stdout text');
+    Assert.Contains(sb.ToString, 'ERRLINE', 'stderr text');
+    Assert.Contains(counting.OutText, 'OUTLINE', 'stdout bytes in the stdout bucket');
+    Assert.IsFalse(Pos('ERRLINE', counting.OutText) > 0, 'stderr bytes leaked into the stdout bucket: ' + counting.OutText);
+    Assert.Contains(counting.ErrText, 'ERRLINE', 'stderr bytes in the stderr bucket');
+    Assert.IsFalse(Pos('OUTLINE', counting.ErrText) > 0, 'stdout bytes leaked into the stderr bucket: ' + counting.ErrText);
+  finally
+    sb.Free;
   end;
 end;
 

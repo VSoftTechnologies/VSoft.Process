@@ -1,4 +1,4 @@
-unit VSoft.Process.PipeTarget.Classes;
+﻿unit VSoft.Process.PipeTarget.Classes;
 
 interface
 
@@ -39,32 +39,49 @@ type
     procedure Done;override;
   end;
 
-  TLinePipeTargetBase = class(TPipeTargetBase, IEncodingAwarePipeTarget)
+  TLinePipeTargetBase = class(TPipeTargetBase, IEncodingAwarePipeTarget, IStreamAwarePipeTarget)
   private
-    FEncoding : TEncoding;
-    // True when the caller passed a non-nil encoding to the constructor.
-    // Used by SetDefaultEncoding to refuse to overwrite an explicit choice.
-    FEncodingExplicit : boolean;
-    FCurrentLine : string;
-    // Bytes received after the last LF. Only text up to an LF is decoded, so
-    // a multi-byte sequence split across two pipe reads is decoded intact
-    // (0x0A never occurs inside a UTF-8 or DBCS character). For UTF-16 the LF
-    // is the code unit $000A at an even offset.
-    FPendingBytes : TBytes;
-    // Set by Start from the encoding: 1 for byte encodings, 2 for UTF-16.
-    FUnitSize : integer;
-    FBigEndian : boolean;
-    function LastLineFeedEnd(fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
-    procedure ProcessText(var text : string);
+    type
+      // One per stream, so a target attached to both stdout and stderr never
+      // joins a partial line of one to the other.
+      TStreamState = record
+        CurrentLine : string;
+        // Bytes received after the last LF. Only text up to an LF is decoded,
+        // so a multi-byte sequence split across two pipe reads is decoded
+        // intact (0x0A never occurs inside a UTF-8 or DBCS character). For
+        // UTF-16 the LF is the code unit $000A at an even offset.
+        PendingBytes : TBytes;
+      end;
+    var
+      FEncoding : TEncoding;
+      // True when the caller passed a non-nil encoding to the constructor.
+      // Used by SetDefaultEncoding to refuse to overwrite an explicit choice.
+      FEncodingExplicit : boolean;
+      // Indexed by isStdErr; HandleData counts as stdout.
+      FStreams : array[boolean] of TStreamState;
+      // Set by Start from the encoding: 1 for byte encodings, 2 for UTF-16.
+      FUnitSize : integer;
+      FBigEndian : boolean;
+      // The stream HandleStreamData is delivering, so the default HandleData
+      // (and an override that calls inherited) files the bytes under it.
+      FDispatchStdErr : boolean;
+    procedure ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+    function LastLineFeedEnd(const bytes : TBytes; fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
+    procedure ProcessText(var state : TStreamState; var text : string);
+    procedure FlushStream(var state : TStreamState);
   protected
     procedure OutputLine(const line : string);virtual;abstract;
 
     procedure Start;override;
     procedure HandleData(const data : TBytes; dataLength : NativeUInt);override;
+    procedure HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     procedure Done;override;
 
     function HasExplicitEncoding : boolean;
     procedure SetDefaultEncoding(const value : TEncoding);
+    // True while HandleStreamData is delivering stderr, so a HandleData
+    // override can tell which stream its bytes belong to.
+    property DispatchingStdErr : boolean read FDispatchStdErr;
   public
     constructor Create(const encoding : TEncoding);
   end;
@@ -124,26 +141,35 @@ type
     constructor Create(const proc : TPipeTargetProcedure);
   end;
 
-  TStringBuilderPipeTarget = class(TPipeTargetBase, IEncodingAwarePipeTarget)
+  TStringBuilderPipeTarget = class(TPipeTargetBase, IEncodingAwarePipeTarget, IStreamAwarePipeTarget)
   private
     FStringBuilder : TStringBuilder;
     FEncoding : TEncoding;
     FEncodingExplicit : boolean;
     // Trailing bytes of an incomplete character, carried to the next read.
-    FPendingBytes : TBytes;
+    // Indexed by isStdErr, so one stream's character is never completed by
+    // the other's bytes; HandleData counts as stdout.
+    FPendingBytes : array[boolean] of TBytes;
+    // The stream HandleStreamData is delivering (see TLinePipeTargetBase).
+    FDispatchStdErr : boolean;
+    procedure ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     procedure AppendText(const s : string);
   protected
     procedure Start;override;
     procedure HandleData(const data : TBytes; length : NativeUInt);override;
+    procedure HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     procedure Done;override;
 
     function HasExplicitEncoding : boolean;
     procedure SetDefaultEncoding(const value : TEncoding);
+    // True while HandleStreamData is delivering stderr, so a HandleData
+    // override can tell which stream its bytes belong to.
+    property DispatchingStdErr : boolean read FDispatchStdErr;
   public
     constructor Create(const stringBuilder : TStringBuilder; const encoding : TEncoding);
   end;
 
-  TMultiPipeTarget = class(TPipeTargetBase, IEncodingAwarePipeTarget)
+  TMultiPipeTarget = class(TPipeTargetBase, IEncodingAwarePipeTarget, IStreamAwarePipeTarget)
   private
     FTargets : TArray<IPipeTarget>;
     // Set for a contained target that raised in HandleData: like the process
@@ -152,9 +178,14 @@ type
     // The first exception a contained target raised in HandleData, raised
     // again from Done once every target has been served.
     FFirstDataError : TObject;
+    // Delivers one block to every contained target, each in its own frame
+    // (shared by HandleData and HandleStreamData).
+    procedure Fan(streamed, isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
   protected
     procedure Start;override;
     procedure HandleData(const data : TBytes; dataLength : NativeUInt);override;
+    // Passes the stream on to every contained target that is stream aware.
+    procedure HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     procedure Done;override;
 
     // Forwarded to every contained target that is encoding aware.
@@ -549,44 +580,65 @@ begin
 end;
 
 procedure TStringBuilderPipeTarget.Done;
+var
+  isStdErr : boolean;
 begin
   // Flush an incomplete trailing sequence (the stream ended mid-character).
-  if Length(FPendingBytes) > 0 then
+  for isStdErr := false to true do
   begin
-    AppendText(DecodeLenient(FEncoding, FPendingBytes, 0, Length(FPendingBytes)));
-    SetLength(FPendingBytes, 0);
+    if Length(FPendingBytes[isStdErr]) > 0 then
+    begin
+      AppendText(DecodeLenient(FEncoding, FPendingBytes[isStdErr], 0, Length(FPendingBytes[isStdErr])));
+      SetLength(FPendingBytes[isStdErr], 0);
+    end;
   end;
 end;
 
 procedure TStringBuilderPipeTarget.HandleData(const data: TBytes; length: NativeUInt);
+begin
+  ProcessStreamData(FDispatchStdErr, data, length);
+end;
+
+procedure TStringBuilderPipeTarget.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+begin
+  FDispatchStdErr := isStdErr;
+  try
+    HandleData(data, dataLength);
+  finally
+    FDispatchStdErr := false;
+  end;
+end;
+
+procedure TStringBuilderPipeTarget.ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
 var
   tailLen : integer;
   totalLen : integer;
   bytes : TBytes;
   decodeLen : integer;
 begin
-  if length = 0 then
+  if dataLength = 0 then
     exit;
-  tailLen := System.Length(FPendingBytes);
-  totalLen := tailLen + Integer(length);
+  tailLen := Length(FPendingBytes[isStdErr]);
+  totalLen := tailLen + Integer(dataLength);
   SetLength(bytes, totalLen);
   if tailLen > 0 then
-    Move(FPendingBytes[0], bytes[0], tailLen);
-  Move(data[0], bytes[tailLen], length);
+    Move(FPendingBytes[isStdErr][0], bytes[0], tailLen);
+  Move(data[0], bytes[tailLen], dataLength);
 
   decodeLen := CompleteCharLength(FEncoding, bytes, totalLen);
   if decodeLen > 0 then
     AppendText(DecodeLenient(FEncoding, bytes, 0, decodeLen));
-  SetLength(FPendingBytes, totalLen - decodeLen);
+  SetLength(FPendingBytes[isStdErr], totalLen - decodeLen);
   if totalLen > decodeLen then
-    Move(bytes[decodeLen], FPendingBytes[0], totalLen - decodeLen);
+    Move(bytes[decodeLen], FPendingBytes[isStdErr][0], totalLen - decodeLen);
 end;
 
 procedure TStringBuilderPipeTarget.Start;
 begin
   if FEncoding = nil then
     FEncoding := TEncoding.Default;
-  SetLength(FPendingBytes, 0);
+  SetLength(FPendingBytes[false], 0);
+  SetLength(FPendingBytes[true], 0);
   MonitorEnter(FStringBuilder);
   try
     FStringBuilder.Clear;
@@ -640,7 +692,7 @@ begin
     FEncoding := value;
 end;
 
-procedure TLinePipeTargetBase.ProcessText(var text : string);
+procedure TLinePipeTargetBase.ProcessText(var state : TStreamState; var text : string);
 var
   i : integer;
   j : integer;
@@ -651,7 +703,7 @@ var
   procedure FlushSpan;
   begin
     if len > 0 then
-      FCurrentLine := FCurrentLine + Copy(text, start, len);
+      state.CurrentLine := state.CurrentLine + Copy(text, start, len);
     len := 0;
   end;
 
@@ -688,8 +740,8 @@ begin
       #10:
         begin
           FlushSpan;
-          OutputLine(FCurrentLine);
-          FCurrentLine := '';
+          OutputLine(state.CurrentLine);
+          state.CurrentLine := '';
           start := i + 1;
         end;
       #13:
@@ -700,8 +752,8 @@ begin
           if (j < textLen) and (text[j + 1] = #10) then
           begin
             FlushSpan;
-            OutputLine(FCurrentLine);
-            FCurrentLine := '';
+            OutputLine(state.CurrentLine);
+            state.CurrentLine := '';
             i := j + 1; // the LF
             start := i + 1;
           end
@@ -719,36 +771,42 @@ begin
   FlushSpan;
 end;
 
-procedure TLinePipeTargetBase.Done;
+procedure TLinePipeTargetBase.FlushStream(var state : TStreamState);
 var
   remainder : string;
   lineLen : integer;
 begin
   // Flush any byte tail that never saw a final line terminator.
-  if Length(FPendingBytes) > 0 then
+  if Length(state.PendingBytes) > 0 then
   begin
     if FEncoding = nil then
       FEncoding := TEncoding.Default;
-    remainder := DecodeLenient(FEncoding, FPendingBytes, 0, Length(FPendingBytes));
-    SetLength(FPendingBytes, 0);
-    ProcessText(remainder);
+    remainder := DecodeLenient(FEncoding, state.PendingBytes, 0, Length(state.PendingBytes));
+    SetLength(state.PendingBytes, 0);
+    ProcessText(state, remainder);
   end;
   // Output that ends with CRs has no LF to complete the line ending.
-  lineLen := Length(FCurrentLine);
-  while (lineLen > 0) and (FCurrentLine[lineLen] = #13) do
+  lineLen := Length(state.CurrentLine);
+  while (lineLen > 0) and (state.CurrentLine[lineLen] = #13) do
     Dec(lineLen);
-  SetLength(FCurrentLine, lineLen);
-  if FCurrentLine <> '' then
-    OutputLine(FCurrentLine);
-  FCurrentLine := '';
+  SetLength(state.CurrentLine, lineLen);
+  if state.CurrentLine <> '' then
+    OutputLine(state.CurrentLine);
+  state.CurrentLine := '';
 end;
 
-function TLinePipeTargetBase.LastLineFeedEnd(fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
+procedure TLinePipeTargetBase.Done;
+begin
+  FlushStream(FStreams[false]);
+  FlushStream(FStreams[true]);
+end;
+
+function TLinePipeTargetBase.LastLineFeedEnd(const bytes : TBytes; fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
 var
   scanPos : NativeUInt;
 begin
   // Number of bytes up to and including the last LF in
-  // FPendingBytes[fromPos..totalLen-1], or -1 when there is none.
+  // bytes[fromPos..totalLen-1], or -1 when there is none.
   result := -1;
   if FUnitSize = 1 then
   begin
@@ -756,13 +814,13 @@ begin
     while scanPos > fromPos do
     begin
       Dec(scanPos);
-      if FPendingBytes[scanPos] = $0A then
+      if bytes[scanPos] = $0A then
         Exit(scanPos + 1);
     end;
   end
   else
   begin
-    // FPendingBytes always starts on a code unit boundary.
+    // The pending bytes always start on a code unit boundary.
     fromPos := fromPos and not NativeUInt(1);
     scanPos := totalLen and not NativeUInt(1);
     while scanPos > fromPos do
@@ -770,16 +828,33 @@ begin
       Dec(scanPos, 2);
       if FBigEndian then
       begin
-        if (FPendingBytes[scanPos] = 0) and (FPendingBytes[scanPos + 1] = $0A) then
+        if (bytes[scanPos] = 0) and (bytes[scanPos + 1] = $0A) then
           Exit(scanPos + 2);
       end
-      else if (FPendingBytes[scanPos] = $0A) and (FPendingBytes[scanPos + 1] = 0) then
+      else if (bytes[scanPos] = $0A) and (bytes[scanPos + 1] = 0) then
         Exit(scanPos + 2);
     end;
   end;
 end;
 
 procedure TLinePipeTargetBase.HandleData(const data: TBytes; dataLength: NativeUInt);
+begin
+  ProcessStreamData(FDispatchStdErr, data, dataLength);
+end;
+
+procedure TLinePipeTargetBase.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+begin
+  // Through the virtual HandleData, so a subclass overriding it still sees
+  // the bytes of both streams.
+  FDispatchStdErr := isStdErr;
+  try
+    HandleData(data, dataLength);
+  finally
+    FDispatchStdErr := false;
+  end;
+end;
+
+procedure TLinePipeTargetBase.ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
 var
   tailLen : NativeUInt;
   totalLen : NativeUInt;
@@ -791,30 +866,30 @@ begin
     Exit;
 
   // Append the new bytes to whatever tail was left from the previous call.
-  tailLen := Length(FPendingBytes);
+  tailLen := Length(FStreams[isStdErr].PendingBytes);
   totalLen := tailLen + dataLength;
-  SetLength(FPendingBytes, totalLen);
-  Move(data[0], FPendingBytes[tailLen], dataLength);
+  SetLength(FStreams[isStdErr].PendingBytes, totalLen);
+  Move(data[0], FStreams[isStdErr].PendingBytes[tailLen], dataLength);
 
   // Find the last LF. The previous tail never contains one, so only the
   // newly appended bytes need scanning.
-  lineEnd := LastLineFeedEnd(tailLen, totalLen);
+  lineEnd := LastLineFeedEnd(FStreams[isStdErr].PendingBytes, tailLen, totalLen);
   if lineEnd < 0 then
     // No newline yet - keep the entire buffer for the next call.
     Exit;
 
   // Decode everything up to and including the last LF and keep the rest.
   decodeLen := NativeUInt(lineEnd);
-  decoded := DecodeLenient(FEncoding, FPendingBytes, 0, decodeLen);
+  decoded := DecodeLenient(FEncoding, FStreams[isStdErr].PendingBytes, 0, decodeLen);
   if decodeLen < totalLen then
   begin
-    Move(FPendingBytes[decodeLen], FPendingBytes[0], totalLen - decodeLen);
-    SetLength(FPendingBytes, totalLen - decodeLen);
+    Move(FStreams[isStdErr].PendingBytes[decodeLen], FStreams[isStdErr].PendingBytes[0], totalLen - decodeLen);
+    SetLength(FStreams[isStdErr].PendingBytes, totalLen - decodeLen);
   end
   else
-    SetLength(FPendingBytes, 0);
+    SetLength(FStreams[isStdErr].PendingBytes, 0);
 
-  ProcessText(decoded);
+  ProcessText(FStreams[isStdErr], decoded);
 end;
 
 procedure TLinePipeTargetBase.Start;
@@ -825,8 +900,10 @@ begin
   FBigEndian := FEncoding.CodePage = CP_UTF16BE;
   if FBigEndian or (FEncoding.CodePage = CP_UTF16LE) then
     FUnitSize := 2;
-  FCurrentLine := '';
-  SetLength(FPendingBytes, 0);
+  FStreams[false].CurrentLine := '';
+  SetLength(FStreams[false].PendingBytes, 0);
+  FStreams[true].CurrentLine := '';
+  SetLength(FStreams[true].PendingBytes, 0);
 end;
 
 { TLineMethodPipeTarget }
@@ -924,9 +1001,10 @@ begin
     FTargets[i].Start;
 end;
 
-procedure TMultiPipeTarget.HandleData(const data: TBytes; dataLength: NativeUInt);
+procedure TMultiPipeTarget.Fan(streamed, isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
 var
-  i: Integer;
+  i : integer;
+  streamAware : IStreamAwarePipeTarget;
 begin
   // Each target in its own frame: one that raises must not starve its
   // siblings. Its exception is kept and raised from Done.
@@ -935,13 +1013,26 @@ begin
     if FFaulted[i] then
       continue;
     try
-      FTargets[i].HandleData(data, dataLength);
+      if streamed and Supports(FTargets[i], IStreamAwarePipeTarget, streamAware) then
+        streamAware.HandleStreamData(isStdErr, data, dataLength)
+      else
+        FTargets[i].HandleData(data, dataLength);
     except
       FFaulted[i] := true;
       if FFirstDataError = nil then
         FFirstDataError := TObject(AcquireExceptionObject);
     end;
   end;
+end;
+
+procedure TMultiPipeTarget.HandleData(const data: TBytes; dataLength: NativeUInt);
+begin
+  Fan(false, false, data, dataLength);
+end;
+
+procedure TMultiPipeTarget.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+begin
+  Fan(true, isStdErr, data, dataLength);
 end;
 
 function TMultiPipeTarget.HasExplicitEncoding: boolean;
