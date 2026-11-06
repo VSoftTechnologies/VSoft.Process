@@ -146,6 +146,12 @@ type
   TMultiPipeTarget = class(TPipeTargetBase, IEncodingAwarePipeTarget)
   private
     FTargets : TArray<IPipeTarget>;
+    // Set for a contained target that raised in HandleData: like the process
+    // with its own targets, it gets no more data this run.
+    FFaulted : TArray<boolean>;
+    // The first exception a contained target raised in HandleData, raised
+    // again from Done once every target has been served.
+    FFirstDataError : TObject;
   protected
     procedure Start;override;
     procedure HandleData(const data : TBytes; dataLength : NativeUInt);override;
@@ -156,6 +162,7 @@ type
     procedure SetDefaultEncoding(const value : TEncoding);
   public
     constructor Create(const targets : array of IPipeTarget);
+    destructor Destroy;override;
   end;
 
 // Number of leading bytes of data[0..dataLength-1] that end on a character
@@ -895,14 +902,24 @@ var
 begin
   inherited Create;
   SetLength(FTargets, Length(targets));
+  SetLength(FFaulted, Length(targets));
   for i := 0 to High(targets) do
     FTargets[i] := targets[i];
+end;
+
+destructor TMultiPipeTarget.Destroy;
+begin
+  FFirstDataError.Free;
+  inherited;
 end;
 
 procedure TMultiPipeTarget.Start;
 var
   i: Integer;
 begin
+  FreeAndNil(FFirstDataError);
+  for i := 0 to Length(FTargets) - 1 do
+    FFaulted[i] := false;
   for i := 0 to Length(FTargets) - 1 do
     FTargets[i].Start;
 end;
@@ -911,8 +928,20 @@ procedure TMultiPipeTarget.HandleData(const data: TBytes; dataLength: NativeUInt
 var
   i: Integer;
 begin
+  // Each target in its own frame: one that raises must not starve its
+  // siblings. Its exception is kept and raised from Done.
   for i := 0 to Length(FTargets) - 1 do
-    FTargets[i].HandleData(data, dataLength);
+  begin
+    if FFaulted[i] then
+      continue;
+    try
+      FTargets[i].HandleData(data, dataLength);
+    except
+      FFaulted[i] := true;
+      if FFirstDataError = nil then
+        FFirstDataError := TObject(AcquireExceptionObject);
+    end;
+  end;
 end;
 
 function TMultiPipeTarget.HasExplicitEncoding: boolean;
@@ -945,6 +974,13 @@ begin
       if firstError = nil then
         firstError := TObject(AcquireExceptionObject);
     end;
+  end;
+  // An exception a target raised in HandleData is reported first.
+  if FFirstDataError <> nil then
+  begin
+    firstError.Free;
+    firstError := FFirstDataError;
+    FFirstDataError := nil;
   end;
   if firstError <> nil then
     raise firstError;
