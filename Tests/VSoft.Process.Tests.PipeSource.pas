@@ -76,6 +76,13 @@ type
     // L6 - Write(string) without an encoding uses the injected InputEncoding.
     [Test]
     procedure Interactive_WriteString_UsesInjectedDefaultEncoding;
+
+    // An injected InputEncoding belongs to one run: a later run with no
+    // injection must not reuse it (it may have been freed since).
+    [Test]
+    procedure StringSource_InjectedDefault_ForgottenAfterDone;
+    [Test]
+    procedure Interactive_InjectedDefault_ForgottenAfterDone;
   end;
 
 implementation
@@ -416,6 +423,52 @@ begin
   src.Close;
   src.GetData(data, len);
   Assert.AreEqual<NativeUInt>(2, len, 'UTF-16 encodes A as two bytes');
+end;
+
+procedure TPipeSourceTests.StringSource_InjectedDefault_ForgottenAfterDone;
+var
+  src : IPipeSource;
+  enc : IEncodingAwarePipeSource;
+  data : TBytes;
+  len : NativeUInt;
+begin
+  src := TPipeSource.FromString('hello');
+  Assert.IsTrue(Supports(src, IEncodingAwarePipeSource, enc));
+  // Run 1: the process injects UTF-16.
+  enc.SetDefaultEncoding(TEncoding.Unicode);
+  src.Start;
+  src.GetData(data, len);
+  src.Done;
+  Assert.AreEqual<NativeUInt>(10, len, 'Run 1 uses the injected UTF-16');
+
+  // Run 2: no injection, so TEncoding.Default applies.
+  src.Start;
+  src.GetData(data, len);
+  src.Done;
+  Assert.AreEqual<NativeUInt>(5, len, 'Run 2 must not reuse run 1''s injected UTF-16');
+  Assert.AreEqual('hello', TEncoding.Default.GetString(data, 0, len));
+end;
+
+procedure TPipeSourceTests.Interactive_InjectedDefault_ForgottenAfterDone;
+var
+  src : IInteractivePipeSource;
+  enc : IEncodingAwarePipeSource;
+  data : TBytes;
+  len : NativeUInt;
+begin
+  src := TPipeSource.Interactive;
+  Assert.IsTrue(Supports(src, IEncodingAwarePipeSource, enc));
+  // Run 1: the process injects UTF-16.
+  enc.SetDefaultEncoding(TEncoding.Unicode);
+  src.Start;
+  src.Done;
+
+  // Run 2: no injection, so Write(string) uses UTF-8.
+  src.Start;
+  Assert.IsTrue(src.Write('A'));
+  src.Close;
+  src.GetData(data, len);
+  Assert.AreEqual<NativeUInt>(1, len, 'Run 2 must not reuse run 1''s injected UTF-16');
 end;
 
 initialization
