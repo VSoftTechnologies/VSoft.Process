@@ -56,6 +56,14 @@ type
     procedure BareName_WithoutExtension_ExeIsAppended;
     [Test]
     procedure BareName_BatchFile_RunsWithBatchRules;
+    [Test]
+    procedure BareName_BatchFile_TrailingDotOrSpace_StillChecked;
+    [Test]
+    procedure PathWithFolder_BatchFile_TrailingDotOrSpace_StillChecked;
+    [Test]
+    procedure BatchFile_PathWithPercentOrBang_IsRejected;
+    [Test]
+    procedure BareName_TrailingDot_ExeIsNotAppended;
     {$ELSE}
     [Test]
     procedure BareName_NotExecutable_IsSkipped;
@@ -369,6 +377,98 @@ begin
   finally
     output.Free;
   end;
+end;
+
+procedure TExecutableSearchTests.BareName_BatchFile_TrailingDotOrSpace_StillChecked;
+const
+  cNames : array[0..2] of string = ('echo-args.cmd.', 'echo-args.cmd ', 'echo-args.cmd. .');
+var
+  i : integer;
+  proc : IProcess;
+  output : TStringBuilder;
+begin
+  // Windows ignores trailing dots and spaces in a file name: each of these
+  // opens echo-args.cmd, and CreateProcess runs it through cmd.exe.
+  PrependToHostPath(ExcludeTrailingPathDelimiter(TTestHelpers.ScriptsDir));
+  for i := Low(cNames) to High(cNames) do
+  begin
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := cNames[i];
+    proc.CommandLine.Add('%PATH%');
+    Assert.IsFalse(proc.Execute, '"' + cNames[i] + '" ran with an argument cmd.exe expands');
+    Assert.Contains(proc.Errors.Text, 'cannot be passed safely');
+  end;
+
+  output := TStringBuilder.Create;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := 'echo-args.cmd.';
+    proc.CommandLine.Add('a,b', TQuoted.qtNone);
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.IsTrue(SameText(TTestHelpers.ScriptPath('echo-args'), proc.ResolvedExecutable), 'ResolvedExecutable = "' + proc.ResolvedExecutable + '"');
+    Assert.Contains(output.ToString, 'arg1=[a,b]');
+    Assert.Contains(output.ToString, 'total=1');
+  finally
+    output.Free;
+  end;
+end;
+
+procedure TExecutableSearchTests.PathWithFolder_BatchFile_TrailingDotOrSpace_StillChecked;
+const
+  cSuffixes : array[0..2] of string = ('.', ' ', '. .');
+var
+  i : integer;
+  proc : IProcess;
+begin
+  for i := Low(cSuffixes) to High(cSuffixes) do
+  begin
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := TTestHelpers.ScriptPath('echo-args') + cSuffixes[i];
+    proc.CommandLine.Add('%PATH%');
+    Assert.IsFalse(proc.Execute, '"' + proc.StartInfo.Executable + '" ran with an argument cmd.exe expands');
+    Assert.Contains(proc.Errors.Text, 'cannot be passed safely');
+  end;
+end;
+
+procedure TExecutableSearchTests.BatchFile_PathWithPercentOrBang_IsRejected;
+const
+  cFolders : array[0..1] of string = ('vproc-%TEMP%-x', 'vproc-!TEMP!-x');
+var
+  i : integer;
+  dir : string;
+  proc : IProcess;
+begin
+  // cmd.exe is given the batch file's path as part of its command line, and
+  // expands %VAR% (and !VAR! with delayed expansion) in it.
+  for i := Low(cFolders) to High(cFolders) do
+  begin
+    dir := TPath.Combine(FTempDir, cFolders[i]);
+    TDirectory.CreateDirectory(dir);
+    TFile.Copy(TTestHelpers.ScriptPath('echo-args'), TPath.Combine(dir, 'echo-args.cmd'));
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := TPath.Combine(dir, 'echo-args.cmd');
+    proc.CommandLine.Add('x');
+    Assert.IsFalse(proc.Execute, 'a batch file whose path cmd.exe would expand was run: ' + proc.StartInfo.Executable);
+    Assert.Contains(proc.Errors.Text, 'cannot be passed safely');
+  end;
+end;
+
+procedure TExecutableSearchTests.BareName_TrailingDot_ExeIsNotAppended;
+var
+  proc : IProcess;
+  noExtension : string;
+begin
+  // As with CreateProcess, a trailing dot means "no extension": .exe is not
+  // appended. The file is reported by the name Windows opens it by.
+  noExtension := TPath.Combine(FTempDir, cProbeName);
+  TFile.Copy(SystemCmd, noExtension);
+  PrependToHostPath(FTempDir);
+  proc := TProcess.Create;
+  SetupProbe(proc, cProbeName + '.', 7);
+  Assert.IsTrue(proc.Execute, proc.Errors.Text);
+  Assert.AreEqual<Cardinal>(7, proc.ExitCode);
+  Assert.AreEqual(noExtension, proc.ResolvedExecutable);
 end;
 {$ELSE}
 procedure TExecutableSearchTests.BareName_NotExecutable_IsSkipped;
