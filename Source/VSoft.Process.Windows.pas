@@ -121,6 +121,7 @@ implementation
 
 uses
   System.Diagnostics,
+  VSoft.Process.Credentials,
   VSoft.Process.Utils;
 
 //declaration in WinApi.Windows is incorrect and only in 10.2+
@@ -668,24 +669,33 @@ var
   domain : string;
   password : string;
   logonFlags : DWORD;
+  error : DWORD;
 begin
   userName := Credentials.UserName;
   domain := Credentials.Domain;
   // A nil domain requires a UPN (user@domain); '.' is the local account database.
   if (domain = '') and (Pos('@', userName) = 0) then
     domain := '.';
-  password := Credentials.Password;
   logonFlags := 0;
   if Credentials.LoadUserProfile then
     logonFlags := logonFlags or LOGON_WITH_PROFILE;
   if Credentials.NetCredentialsOnly then
     logonFlags := logonFlags or LOGON_NETCREDENTIALS_ONLY;
-  if domain = '' then
-    result := CreateProcessWithLogonW(PChar(userName), nil, PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
-                                      creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo)
-  else
-    result := CreateProcessWithLogonW(PChar(userName), PChar(domain), PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
-                                      creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo);
+  // A copy of our own (the builder hands one out), wiped as soon as the
+  // logon has used it; the Windows error is kept across the wipe.
+  password := Credentials.Password;
+  try
+    if domain = '' then
+      result := CreateProcessWithLogonW(PChar(userName), nil, PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
+                                        creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo)
+    else
+      result := CreateProcessWithLogonW(PChar(userName), PChar(domain), PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
+                                        creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo);
+    error := GetLastError;
+  finally
+    ScrubString(password);
+  end;
+  SetLastError(error);
 end;
 
 function IsBareProgramName(const exe : string) : boolean;

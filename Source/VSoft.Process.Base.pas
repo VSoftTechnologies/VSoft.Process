@@ -1086,7 +1086,14 @@ begin
 end;
 
 function TProcessBase.ValidateStartUpBuilder: boolean;
+var
+  password : string;
+  hasPassword : boolean;
 begin
+  // The builder hands out a copy of the password: wipe it once looked at.
+  password := FCredBuilder.Password;
+  hasPassword := password <> '';
+  ScrubString(password);
   result := true;
   if FStartInfoBuilder.Executable = '' then
   begin
@@ -1109,7 +1116,7 @@ begin
   // and must remain a no-op.
   if (FCredBuilder.UserName <> '') or
      (FCredBuilder.Domain <> '') or
-     (FCredBuilder.Password <> '') then
+     hasPassword then
   begin
     if not FCredBuilder.Validate(LogError) then
       result := false;
@@ -1120,7 +1127,7 @@ begin
   // credentials - that would be misleading and is almost certainly a bug.
   if (FCredBuilder.UserName <> '') or
      (FCredBuilder.Domain <> '') or
-     (FCredBuilder.Password <> '') then
+     hasPassword then
   begin
     LogError('Credentials are not supported on POSIX platforms');
     result := false;
