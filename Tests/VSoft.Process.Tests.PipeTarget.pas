@@ -214,6 +214,23 @@ type
     procedure LineTarget_Utf16BE_EverySplitPoint;
     [Test]
     procedure LineTarget_Utf16LE_OneByteAtATime;
+
+    // Output that never sends a LF (a progress meter redrawn with lone CRs)
+    // must not be buffered without limit: at the cap the text so far is
+    // emitted as a line, with nothing lost.
+    [Test]
+    procedure LineTarget_LineWithoutLF_EmittedAtCap;
+    // A LF arriving just after a forced break ends the emitted piece; it
+    // does not add an empty line.
+    [Test]
+    procedure LineTarget_LineFeedAfterCap_NoEmptyLine;
+
+    // A target created without an encoding and used without Start decodes
+    // with TEncoding.Default instead of a nil encoding.
+    [Test]
+    procedure StringBuilderTarget_WithoutStart_DecodesWithDefault;
+    [Test]
+    procedure LineTarget_WithoutStart_DecodesWithDefault;
   end;
 
 implementation
@@ -1292,6 +1309,101 @@ begin
   for i := 0 to High(full) do
     chunks[i] := TBytes.Create(full[i]);
   Assert.AreEqual(cUtf16Lines, FeedLines(TEncoding.Unicode, chunks));
+end;
+
+procedure TPipeTargetTests.LineTarget_LineWithoutLF_EmittedAtCap;
+const
+  cChunk = 64 * 1024;
+  cExtra = 1000;
+var
+  target  : IPipeTarget;
+  capture : TLineCapture;
+  chunk   : TBytes;
+  i       : integer;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8);
+    target.Start;
+    SetLength(chunk, cChunk);
+    FillChar(chunk[0], cChunk, Ord('x'));
+    for i := 1 to cMaxPendingLineBytes div cChunk do
+      target.HandleData(chunk, cChunk);
+    target.HandleData(chunk, cExtra);
+    Assert.AreEqual(1, capture.Lines.Count, 'The capped text should be emitted before Done');
+    Assert.AreEqual(cMaxPendingLineBytes, Length(capture.Lines[0]));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual(cExtra, Length(capture.Lines[1]), 'No character may be lost after a forced break');
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.LineTarget_LineFeedAfterCap_NoEmptyLine;
+var
+  target  : IPipeTarget;
+  capture : TLineCapture;
+  chunk   : TBytes;
+  tail    : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8);
+    target.Start;
+    SetLength(chunk, cMaxPendingLineBytes);
+    FillChar(chunk[0], cMaxPendingLineBytes, Ord('x'));
+    target.HandleData(chunk, cMaxPendingLineBytes);
+    tail := MakeBytes(#10'y'#10);
+    target.HandleData(tail, Length(tail));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count, 'The LF ends the capped piece; it should not add an empty line');
+    Assert.AreEqual(cMaxPendingLineBytes, Length(capture.Lines[0]));
+    Assert.AreEqual('y', capture.Lines[1], false);
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_WithoutStart_DecodesWithDefault;
+var
+  target  : IPipeTarget;
+  sb      : TStringBuilder;
+  payload : TBytes;
+begin
+  sb := TStringBuilder.Create;
+  try
+    target := TPipeTarget.ToStringBuilder(sb);
+    payload := TBytes.Create(Ord('a'), Ord('b'), Ord('c'));
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    Assert.AreEqual('abc', sb.ToString, false);
+  finally
+    sb.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.LineTarget_WithoutStart_DecodesWithDefault;
+var
+  target  : IPipeTarget;
+  capture : TLineCapture;
+  payload : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine);
+    payload := TBytes.Create(Ord('a'), Ord('b'), 10, Ord('c'));
+    target.HandleData(payload, Length(payload));
+    Assert.AreEqual(1, capture.Lines.Count, 'The first line should be split at its LF, before Done');
+    target.Done;
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('ab', capture.Lines[0], false);
+    Assert.AreEqual('c', capture.Lines[1], false);
+  finally
+    capture.Free;
+  end;
 end;
 
 initialization
