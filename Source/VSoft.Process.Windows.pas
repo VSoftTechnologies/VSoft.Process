@@ -1089,7 +1089,7 @@ begin
   if FJobHandle <> 0 then
     TerminateJobObject(FJobHandle, exitCode)
   else
-    TSystemUtils.TerminateProcessTree(FProcessInfo.dwProcessId, exitCode);
+    TSystemUtils.TerminateProcessTree(FProcessInfo.dwProcessId, exitCode, FProcessInfo.hProcess);
   // The child itself, whatever happened above.
   TerminateProcess(FProcessInfo.hProcess, exitCode);
   WaitForSingleObject(FProcessInfo.hProcess, 5000);
