@@ -33,7 +33,8 @@ type
   // The stdin writer for one run. Its thread works only on this object
   // (reference counted, shared with the process), so a writer still blocked
   // in the source's GetData when the run ends can be left to finish on its
-  // own without touching the next run. It keeps the process alive until then.
+  // own without touching the next run. It keeps the process alive until then,
+  // unless the run detaches it.
   IStdInWriter = interface
     // Runs on the writer thread.
     procedure Execute;
@@ -43,12 +44,18 @@ type
     // Why the source failed; read it once WaitFor has returned True.
     function Error : string;
     procedure SetThreadId(value : TThreadID);
+    // Cuts a writer that is being left behind loose from its process, so it
+    // no longer keeps the process alive. Returns the writer's reference to
+    // the process for the run to release once it no longer touches it.
+    function Detach : IInterface;
   end;
 
   TStdInWriter = class(TInterfacedObject, IStdInWriter)
   private
     FOwner : TProcessBase;
     FOwnerRef : IInterface;
+    // Guards FOwner / FOwnerRef between Execute's end and Detach.
+    FOwnerLock : TCriticalSection;
     FSource : IPipeSource;
     FAbort : Integer;
     FError : string;
@@ -68,6 +75,7 @@ type
     function WaitFor(timeoutMs : Cardinal) : boolean;
     function Error : string;
     procedure SetThreadId(value : TThreadID);
+    function Detach : IInterface;
   end;
 
   TProcessBase = class(TInterfacedObject, IProcess)
@@ -116,6 +124,10 @@ type
     // Called by a stdin writer as it finishes.
     procedure StdInWriterFinished(threadId : TThreadID);
   protected
+    // The process reference handed back by a stdin writer that was detached
+    // (left blocked in its source's GetData). Released by the run as its
+    // very last action, so the process is never freed in the middle of it.
+    FDetachedOwnerRef : IInterface;
     // stdin source for the current run (snapshot of WithStdInPipe).
     FRunStdIn : IPipeSource;
     // Full path of the program being launched, set by the platform's
@@ -289,15 +301,19 @@ begin
   FOwnerRef := owner;
   FSource := source;
   FFinished := TEvent.Create(nil, true, false, '');
+  FOwnerLock := TCriticalSection.Create;
 end;
 
 destructor TStdInWriter.Destroy;
 begin
   FFinished.Free;
+  FOwnerLock.Free;
   inherited;
 end;
 
 procedure TStdInWriter.Execute;
+var
+  ownerRef : IInterface;
 begin
   try
     try
@@ -307,12 +323,33 @@ begin
         FError := 'Stdin pipe source raised ' + E.ClassName + ' - ' + E.Message;
     end;
   finally
-    FOwner.StdInWriterFinished(FThreadId);
-    FOwner := nil;
+    // Under the lock: a detached writer's process may already be gone.
+    FOwnerLock.Enter;
+    try
+      if FOwner <> nil then
+        FOwner.StdInWriterFinished(FThreadId);
+      FOwner := nil;
+      ownerRef := FOwnerRef;
+      FOwnerRef := nil;
+    finally
+      FOwnerLock.Leave;
+    end;
     FSource := nil;
     FFinished.SetEvent;
     // Last: it can be the final reference to the process.
+    ownerRef := nil;
+  end;
+end;
+
+function TStdInWriter.Detach : IInterface;
+begin
+  FOwnerLock.Enter;
+  try
+    FOwner := nil;
+    result := FOwnerRef;
     FOwnerRef := nil;
+  finally
+    FOwnerLock.Leave;
   end;
 end;
 
@@ -609,6 +646,8 @@ begin
 end;
 
 function TProcessBase.InternalStart: boolean;
+var
+  keepAlive : IInterface;
 begin
   result := false;
   FStartThreadId := CurrentThreadId;
@@ -623,7 +662,13 @@ begin
     result := DoCreateProcess;
   finally
     if not result then
+    begin
+      // Taken before AbortStart publishes the end of the run; released when
+      // this method returns.
+      keepAlive := FDetachedOwnerRef;
+      FDetachedOwnerRef := nil;
       AbortStart;
+    end;
   end;
   if not result then
     exit;
@@ -636,6 +681,7 @@ function TProcessBase.InternalStartAsync: boolean;
 var
   selfRef : IProcess;
   worker : TThread;
+  keepAlive : IInterface;
 begin
   result := false;
   FStartThreadId := CurrentThreadId;
@@ -649,7 +695,13 @@ begin
     result := DoCreateProcess;
   finally
     if not result then
+    begin
+      // Taken before AbortStart publishes the end of the run; released when
+      // this method returns.
+      keepAlive := FDetachedOwnerRef;
+      FDetachedOwnerRef := nil;
       AbortStart;
+    end;
   end;
   if not result then
     exit;
@@ -684,6 +736,7 @@ end;
 procedure TProcessBase.RunWorker;
 var
   outcome : TProcessOutcome;
+  keepAlive : IInterface;
 begin
   outcome.Status := TProcessStatus.Terminated;
   outcome.ExitCode := FStartInfoBuilder.TerminateExitCode;
@@ -697,6 +750,11 @@ begin
     end;
   finally
     StopPipeTargets;
+    // A reference a left-behind stdin writer handed back: taken before the
+    // run is published (the next run may detach its own writer) and released
+    // as the very last action, once nothing here touches this object.
+    keepAlive := FDetachedOwnerRef;
+    FDetachedOwnerRef := nil;
     CompleteRun(outcome);
   end;
   DoOnExited(outcome.ExitCode);

@@ -55,6 +55,11 @@ type
     [Test]
     procedure StdInSourceNeverReturns_RunStillCompletes;
 
+    // ...nor keep the process alive once the caller has released it, or
+    // JobMode KillOnRelease never runs.
+    [Test]
+    procedure StdInSourceNeverReturns_ProcessNotPinned;
+
     // M11 - one target attached to stdout and stderr receives every byte.
     [Test]
     procedure SharedTargetOnBothStreams_ReceivesEveryByte;
@@ -253,6 +258,20 @@ type
     function GetData(var data : TBytes; out length : NativeUInt) : boolean;
     procedure Done;
     procedure Release;
+  end;
+
+  // A stdout target that ignores its data and sets an event when it is
+  // destroyed. A process holds its targets until it is destroyed itself, so
+  // the event tells a test when the process has really been freed.
+  TLifetimeProbeTarget = class(TInterfacedObject, IPipeTarget)
+  private
+    FDestroyed : TEvent;
+  public
+    constructor Create(destroyed : TEvent);
+    destructor Destroy; override;
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
   end;
 
   // A cancellation token whose first IsCancelled call blocks until Open is
@@ -854,6 +873,69 @@ begin
     // Lets the writer thread finish (and the run, if it is still waiting).
     source.Release;
     proc := nil;
+  end;
+end;
+
+{ TLifetimeProbeTarget }
+
+constructor TLifetimeProbeTarget.Create(destroyed : TEvent);
+begin
+  inherited Create;
+  FDestroyed := destroyed;
+end;
+
+destructor TLifetimeProbeTarget.Destroy;
+begin
+  FDestroyed.SetEvent;
+  inherited;
+end;
+
+procedure TLifetimeProbeTarget.Start;
+begin
+end;
+
+procedure TLifetimeProbeTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+begin
+end;
+
+procedure TLifetimeProbeTarget.Done;
+begin
+end;
+
+// Configured here so the IProcess results of the With* calls (hidden
+// temporaries the compiler keeps until the end of the routine) are released
+// before the test drops its own reference.
+function MakeNeverReturningStdInProcess(const source : IPipeSource; destroyed : TEvent) : IProcess;
+begin
+  result := TProcess.Create;
+  TTestHelpers.SetupInlineCommand(result, 'exit 0', 'exit 0');
+  result.WithStdInPipe(source);
+  result.WithStdOutPipe(TLifetimeProbeTarget.Create(destroyed));
+end;
+
+procedure TProcessLifecycleTests.StdInSourceNeverReturns_ProcessNotPinned;
+var
+  proc : IProcess;
+  source : TBlockingPipeSource;
+  sourceRef : IPipeSource;
+  destroyed : TEvent;
+begin
+  destroyed := TEvent.Create(nil, true, false, '');
+  source := TBlockingPipeSource.Create;
+  sourceRef := source;
+  try
+    proc := MakeNeverReturningStdInProcess(sourceRef, destroyed);
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.Contains(proc.Errors.Text, 'did not return from GetData', 'the writer must have been left behind for this test');
+    proc := nil;
+    Assert.AreEqual(wrSignaled, destroyed.WaitFor(2000),
+                    'the process was not destroyed: the abandoned stdin writer still holds it');
+  finally
+    // Lets the writer thread finish; only then can a pinned process go.
+    source.Release;
+    proc := nil;
+    destroyed.WaitFor(5000);
+    destroyed.Free;
   end;
 end;
 
