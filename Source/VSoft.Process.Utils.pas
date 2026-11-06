@@ -134,30 +134,44 @@ begin
   result := buf;
 end;
 
-class function TStringUtils.DoubleQuoteString(const value: string; const checkString: boolean): string;
+// Removes one pair of quote characters that wraps the whole value, but only
+// when the value holds no other quote of that kind: in "a" b "c" the outer
+// quotes are part of the data.
+function StripWrapperQuotes(const value : string; const quote : Char) : string;
 var
-  needsQuotes : boolean;
+  len : integer;
+begin
+  len := Length(value);
+  if (len >= 2) and (value[1] = quote) and (value[len] = quote) and (Pos(quote, Copy(value, 2, len - 2)) = 0) then
+    result := Copy(value, 2, len - 2)
+  else
+    result := value;
+end;
+
+// True when CommandLineToArgvW would split or mangle the value (whitespace,
+// embedded double quotes) or drop it (empty) unless it is quoted.
+function NeedsWindowsQuoting(const value : string) : boolean;
+var
   i : integer;
 begin
-  // Matched leading/trailing quotes are stripped first for back-compat -
-  // some callers wrap their values in quotes manually and expect
-  // DoubleQuoteString to be a no-op.
-  result := StripQuotes(value);
+  result := value = '';
+  for i := 1 to Length(value) do
+    if (value[i] = ' ') or (value[i] = #9) or (value[i] = '"') then
+      Exit(True);
+end;
 
-  if checkString then
-  begin
-    // Auto mode: only quote when CommandLineToArgvW would otherwise split
-    // or mangle the value (whitespace, embedded quotes) or drop it (empty).
-    needsQuotes := result = '';
-    for i := 1 to Length(result) do
-      if (result[i] = ' ') or (result[i] = #9) or (result[i] = '"') then
-      begin
-        needsQuotes := True;
-        Break;
-      end;
-    if not needsQuotes then
-      Exit;
-  end;
+class function TStringUtils.DoubleQuoteString(const value: string; const checkString: boolean): string;
+begin
+  // A value the caller wrapped in one plain pair of quotes is taken as
+  // already quoted, for back-compat - some callers wrap their values in
+  // quotes manually and expect DoubleQuoteString to be a no-op. Quotes that
+  // are part of the data ("a" b "c") are kept and escaped.
+  result := StripWrapperQuotes(value, '"');
+
+  // Auto mode: only quote when CommandLineToArgvW would otherwise split
+  // or mangle the value (whitespace, embedded quotes) or drop it (empty).
+  if checkString and (not NeedsWindowsQuoting(result)) then
+    Exit;
 
   // Always escape when wrapping: a value ending in a backslash would
   // otherwise escape the closing quote.
@@ -204,14 +218,15 @@ end;
 
 class function TStringUtils.QuoteString(const value: string; const checkString: boolean): string;
 begin
-  result := StripQuotes(value);
-  if checkString then
-  begin
-    if (pos(' ', result) > 0) then
-      result := '''' + result + '''';
-  end
-  else
-    result := '''' + result + '''';
+  result := StripWrapperQuotes(value, '''');
+  if checkString and (not NeedsWindowsQuoting(result)) then
+    Exit;
+  result := '''' + result + '''';
+  // Single quotes do not group for CommandLineToArgvW: when the text holds a
+  // space, tab or ", pass the single-quoted text to the child as ONE
+  // argument, escaped like any double-quoted value.
+  if NeedsWindowsQuoting(result) then
+    result := EscapeForWindowsCommandLine(result);
 end;
 
 class function TStringUtils.StripQuotes(const value : string) : string;
