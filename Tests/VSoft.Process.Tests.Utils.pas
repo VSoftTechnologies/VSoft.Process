@@ -87,6 +87,11 @@ type
     // H10 - ids that must never be tree-killed (0, our own pid, System / init).
     [Test]
     procedure CanTerminateTree_RejectsUnsafeIds;
+
+    // A root that cannot be opened by id (another user's DACL) is still killed
+    // through a handle the caller holds.
+    [Test]
+    procedure TerminateProcessTree_UsesSuppliedRootHandle;
   end;
 
 implementation
@@ -251,6 +256,35 @@ begin
   {$ENDIF}
   Assert.IsTrue(TSystemUtils.CanTerminateTree(12345));
 end;
+
+{$IFDEF MSWINDOWS}
+procedure TStringUtilsTests.TerminateProcessTree_UsesSuppliedRootHandle;
+var
+  si : TStartupInfo;
+  pi : TProcessInformation;
+  cmd : string;
+begin
+  FillChar(si, SizeOf(si), 0);
+  si.cb := SizeOf(si);
+  cmd := 'ping.exe -n 30 127.0.0.1';
+  UniqueString(cmd);
+  Assert.IsTrue(CreateProcess(nil, PChar(cmd), nil, nil, False, CREATE_NO_WINDOW, nil, nil, si, pi), 'start child');
+  try
+    // An id that opens nothing stands for the root we cannot open by id.
+    TSystemUtils.TerminateProcessTree($7FFFFFF0, 1, pi.hProcess);
+    Assert.AreEqual(WAIT_OBJECT_0, WaitForSingleObject(pi.hProcess, 5000), 'root killed through the supplied handle');
+  finally
+    TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+  end;
+end;
+{$ELSE}
+procedure TStringUtilsTests.TerminateProcessTree_UsesSuppliedRootHandle;
+begin
+  Assert.Pass('Windows only');
+end;
+{$ENDIF}
 
 initialization
   TDUnitX.RegisterTestFixture(TStringUtilsTests);

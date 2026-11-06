@@ -912,8 +912,10 @@ begin
     creationFlags := CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT or CREATE_SUSPENDED or PriorityClass(StartInfo.Priority);
     // Before Windows 8 a process already in a job cannot be put in a second
     // one, so our job would fail; leave the host's job when it allows that.
+    // Only KillOnRelease needs a job of its own to kill the child; KillOnTerminate
+    // keeps dying with the host's job as before.
     // Not for CreateProcessWithLogonW, which rejects the flag.
-    if (StartInfo.JobMode <> TProcessJobMode.NoJob) and (Credentials.UserName = '') and (not TOSVersion.Check(6, 2)) and
+    if (StartInfo.JobMode = TProcessJobMode.KillOnRelease) and (Credentials.UserName = '') and (not TOSVersion.Check(6, 2)) and
        HostJobAllowsBreakaway then
       creationFlags := creationFlags or VPROCESS_CREATE_BREAKAWAY_FROM_JOB;
 
@@ -1454,7 +1456,7 @@ begin
   begin
     // KillOnRelease without a job: what the job would have killed is the
     // child's tree. The handle we hold keeps its id from being reused.
-    TSystemUtils.TerminateProcessTree(FReleaseKillProcessId, StartInfo.TerminateExitCode);
+    TSystemUtils.TerminateProcessTree(FReleaseKillProcessId, StartInfo.TerminateExitCode, FReleaseKillProcess);
     SafeCloseHandle(FReleaseKillProcess);
     FReleaseKillProcessId := 0;
   end;
