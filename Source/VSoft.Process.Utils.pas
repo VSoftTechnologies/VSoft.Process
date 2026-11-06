@@ -166,9 +166,15 @@ end;
 
 class function TStringUtils.IsBatchFile(const fileName : string) : boolean;
 var
+  len : integer;
   ext : string;
 begin
-  ext := LowerCase(ExtractFileExt(fileName));
+  // Windows ignores trailing dots and spaces in a file name, so 'run.cmd. '
+  // opens run.cmd and CreateProcess runs it through cmd.exe.
+  len := Length(fileName);
+  while (len > 0) and ((fileName[len] = '.') or (fileName[len] = ' ')) do
+    Dec(len);
+  ext := LowerCase(ExtractFileExt(Copy(fileName, 1, len)));
   result := (ext = '.bat') or (ext = '.cmd');
 end;
 

@@ -216,6 +216,12 @@ begin
   Assert.IsTrue(TStringUtils.IsBatchFile('C:\x\BUILD.BAT'));
   Assert.IsFalse(TStringUtils.IsBatchFile('C:\x\cmd.exe'));
   Assert.IsFalse(TStringUtils.IsBatchFile('C:\x\script.cmdline'));
+  // Windows ignores trailing dots and spaces: these all open build.cmd.
+  Assert.IsTrue(TStringUtils.IsBatchFile('C:\x\build.cmd.'));
+  Assert.IsTrue(TStringUtils.IsBatchFile('C:\x\build.bat '));
+  Assert.IsTrue(TStringUtils.IsBatchFile('build.cmd. .'));
+  Assert.IsFalse(TStringUtils.IsBatchFile('C:\x\build.exe.'));
+  Assert.IsFalse(TStringUtils.IsBatchFile('.'));
 end;
 
 procedure TStringUtilsTests.ContainsCmdMetaChars_DetectsShellSyntax;

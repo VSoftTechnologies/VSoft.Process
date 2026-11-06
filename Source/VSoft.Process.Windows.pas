@@ -734,7 +734,10 @@ begin
     candidate := IncludeTrailingPathDelimiter(dir) + exe;
     if FileExists(candidate) then
     begin
-      resolved := candidate;
+      // Windows ignores trailing dots and spaces in a name ('run.cmd.' opens
+      // run.cmd). GetFullPathName removes them as CreateProcess will, so the
+      // file is judged (batch file or not) by the name it is opened by.
+      resolved := ExpandFileName(candidate);
       Exit(true);
     end;
   end;
@@ -758,6 +761,13 @@ begin
   end;
   if TStringUtils.IsBatchFile(FResolvedExecutable) then
   begin
+    // The path is part of the command line cmd.exe parses, and %VAR% (and
+    // !VAR! with delayed expansion) is expanded even inside quotes.
+    if TStringUtils.ContainsCmdUnsafeChars(FResolvedExecutable) then
+    begin
+      LogError('The batch file path cannot be passed safely to cmd.exe: it contains % or ! (' + FResolvedExecutable + ')');
+      result := false;
+    end;
     for i := 0 to CommandLine.Count - 1 do
     begin
       arg := CommandLine.Arguments[i];
