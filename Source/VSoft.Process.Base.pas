@@ -745,11 +745,13 @@ begin
         end;
       end);
   except
-    // No monitor thread: stop the child and clean up on this thread.
-    selfRef := nil;
+    // No monitor thread: stop the child and clean up on this thread. selfRef
+    // is kept until RunWorker has returned, so an OnExit handler that drops
+    // the caller's last reference cannot free this object under it.
     FTerminateEvent.SetEvent;
     FWorkerThreadId := CurrentThreadId;
     RunWorker;
+    selfRef := nil;
     raise;
   end;
   FWorkerThreadId := worker.ThreadID;
