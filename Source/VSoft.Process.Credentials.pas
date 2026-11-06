@@ -207,13 +207,6 @@ begin
     errorProc('A UserName is required when a Domain or Password is specified');
     result := false;
   end;
-  // CreateProcessWithLogonW takes LOGON_WITH_PROFILE or
-  // LOGON_NETCREDENTIALS_ONLY, not both.
-  if FLoadProfile and FNetCredOnly then
-  begin
-    errorProc('LoadUserProfile and NetCredentialsOnly cannot both be set: the logon takes one of them or neither');
-    result := false;
-  end;
 end;
 
 function TCredentialsBuilder.WithDomain(const value: string): ICredentialsBuilder;

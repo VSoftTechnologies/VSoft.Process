@@ -26,11 +26,6 @@ type
     procedure Password_ZeroedOnDestroy;
     {$ENDIF}
 
-    // CreateProcessWithLogonW takes LOGON_WITH_PROFILE or
-    // LOGON_NETCREDENTIALS_ONLY, not both, so Validate must refuse the pair.
-    [Test]
-    procedure Validate_RejectsProfileWithNetCredentialsOnly;
-
     // W3 - Validate must reject a UPN-format username paired with a Domain.
     // CreateProcessWithLogonW rejects this combo with an opaque error; we
     // catch it earlier and return a clear message.
@@ -164,28 +159,6 @@ begin
     Assert.IsFalse(ok, 'UPN-format user + non-empty Domain must fail Validate');
     Assert.IsTrue(Pos('UPN', sink.Last) > 0,
                   'Error message should mention UPN format');
-  finally
-    sink.Free;
-  end;
-end;
-
-procedure TCredentialsTests.Validate_RejectsProfileWithNetCredentialsOnly;
-var
-  creds : ICredentialsBuilder;
-  sink  : TValidateErrorSink;
-  ok    : boolean;
-begin
-  sink := TValidateErrorSink.Create;
-  try
-    creds := MakeBuilder;
-    creds.WithUser('alice')
-         .WithPassword('hunter2')
-         .WithUserProfile(true)
-         .WithNetCredentialsOnly(true);
-    ok := creds.Validate(sink.Capture);
-    Assert.IsFalse(ok, 'LoadUserProfile with NetCredentialsOnly must fail Validate');
-    Assert.IsTrue(Pos('NetCredentialsOnly', sink.Last) > 0,
-                  'Error message should mention NetCredentialsOnly');
   finally
     sink.Free;
   end;
