@@ -243,8 +243,8 @@ type
     procedure SetArgvZero(const value : string);
     function GetWorkingDir : string;
     procedure SetWorkingDir(const value : string);
-    function GetProcessorAffinity: Cardinal;
-    procedure SetProcessorAffinity(value : Cardinal);
+    function GetProcessorAffinity: NativeUInt;
+    procedure SetProcessorAffinity(value : NativeUInt);
     function GetPriority : TProcessPriority;
     procedure SetPriority(value : TProcessPriority);
     function GetTerminateExitCode: Cardinal;
@@ -277,7 +277,7 @@ type
     function WithArgvZero(const value : string) : IStartInfoBuilder;
     function WithHideWindow(value : boolean) : IStartInfoBuilder;
     function WithWorkingDirectory(const value : string) : IStartInfoBuilder;
-    function WithProcessorAffinity(value : Cardinal) : IStartInfoBuilder;
+    function WithProcessorAffinity(value : NativeUInt) : IStartInfoBuilder;
     function WithPriority(value : TProcessPriority) : IStartInfoBuilder;
     function WithTerminateExitCode(value : Cardinal) : IStartInfoBuilder;
     function WithTimedOutExitCode(value : Cardinal) : IStartInfoBuilder;
@@ -321,7 +321,7 @@ type
     property TimedOutExitCode : Cardinal read GetTimedOutExitCode write SetTimedOutExitCode;
     property InputEncoding : TEncoding read GetInputEncoding write SetInputEncoding;
     property OutputEncoding : TEncoding read GetOutputEncoding write SetOutputEncoding;
-    property ProcessorAffinity : Cardinal read GetProcessorAffinity write SetProcessorAffinity;
+    property ProcessorAffinity : NativeUInt read GetProcessorAffinity write SetProcessorAffinity;
     // Pipe buffer size for stdout/stderr/stdin redirection. 0 (default)
     // means 64KB - the historical hard-coded value. Larger values reduce
     // wakeup frequency for chatty processes; smaller values reduce memory
