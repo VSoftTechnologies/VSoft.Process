@@ -59,8 +59,11 @@ type
   TSystemUtils = record
     { Terminates the process identified by parentProcessId and all of its
       descendants. Returns the supplied termExitCode. Does nothing for process
-      ids that are never valid tree roots (see CanTerminateTree). }
-    class function TerminateProcessTree(parentProcessId: Cardinal; termExitCode: Cardinal): Cardinal; static;
+      ids that are never valid tree roots (see CanTerminateTree). On Windows,
+      a rootHandle with PROCESS_TERMINATE access (the caller keeps ownership)
+      is used for the root instead of opening parentProcessId, for a root
+      whose security descriptor denies us OpenProcess. }
+    class function TerminateProcessTree(parentProcessId: Cardinal; termExitCode: Cardinal; rootHandle : THandle = 0): Cardinal; static;
     { False for ids that must never be tree-killed: 0, the System process,
       init (1) on POSIX, ids that are negative as a pid_t, and the current
       process. }
@@ -265,7 +268,7 @@ end;
   quickly, so a process is only treated as a child when it was created after
   its supposed parent (a recycled pid always belongs to a newer process).
   A visited set protects against cycles that pid reuse can create. }
-class function TSystemUtils.TerminateProcessTree(parentProcessId: Cardinal; termExitCode: Cardinal): Cardinal;
+class function TSystemUtils.TerminateProcessTree(parentProcessId: Cardinal; termExitCode: Cardinal; rootHandle : THandle): Cardinal;
 var
   hSnapshot: THandle;
   children: TObjectDictionary<DWORD, TList<DWORD>>;
@@ -274,17 +277,38 @@ var
   res: boolean;
   childList: TList<DWORD>;
 
-  function OpenForKill(processId : DWORD; out creationTime : Int64) : THandle;
+  function ReadCreationTime(hProcess : THandle) : Int64;
   var
     createdAt, exitedAt, kernelTime, userTime : TFileTime;
   begin
+    result := 0;
+    if GetProcessTimes(hProcess, createdAt, exitedAt, kernelTime, userTime) then
+      result := Int64(createdAt.dwHighDateTime) shl 32 or createdAt.dwLowDateTime;
+  end;
+
+  function OpenForKill(processId : DWORD; out creationTime : Int64) : THandle;
+  var
+    hQuery : THandle;
+  begin
     creationTime := 0;
     result := OpenProcess(PROCESS_TERMINATE or cProcessQueryLimitedInformation, False, processId);
-    if result = 0 then
-      // Pre-Vista or restricted: terminate rights alone (no creation time).
-      result := OpenProcess(PROCESS_TERMINATE, False, processId)
-    else if GetProcessTimes(result, createdAt, exitedAt, kernelTime, userTime) then
-      creationTime := Int64(createdAt.dwHighDateTime) shl 32 or createdAt.dwLowDateTime;
+    if result <> 0 then
+    begin
+      creationTime := ReadCreationTime(result);
+      Exit;
+    end;
+    // Pre-Vista or restricted: terminate rights alone (no creation time).
+    result := OpenProcess(PROCESS_TERMINATE, False, processId);
+    if result <> 0 then
+      Exit;
+    // A process we may not terminate: query rights alone, so its creation
+    // time can still vouch for it as the parent of processes we can kill.
+    hQuery := OpenProcess(cProcessQueryLimitedInformation, False, processId);
+    if hQuery <> 0 then
+    begin
+      creationTime := ReadCreationTime(hQuery);
+      CloseHandle(hQuery);
+    end;
   end;
 
   procedure TerminateRecursive(processId: DWORD; hProcess : THandle; creationTime : Int64);
@@ -302,15 +326,21 @@ var
         if visited.ContainsKey(localChildren[i]) or (not CanTerminateTree(localChildren[i])) then
           continue;
         childHandle := OpenForKill(localChildren[i], childCreated);
-        if childHandle = 0 then
+        // A child we may not terminate is only followed when both creation
+        // times are known, so a recycled parent id is never followed: leave
+        // it and its descendants alone otherwise.
+        if (childHandle = 0) and ((childCreated = 0) or (creationTime = 0)) then
           continue;
         try
           // Recycled parent id: this process was never our descendant.
           if (creationTime <> 0) and (childCreated <> 0) and (childCreated < creationTime) then
             continue;
+          // A child we may not terminate is still descended into; only the
+          // TerminateProcess call is skipped for it (hProcess = 0).
           TerminateRecursive(localChildren[i], childHandle, childCreated);
         finally
-          CloseHandle(childHandle);
+          if childHandle <> 0 then
+            CloseHandle(childHandle);
         end;
       end;
     end;
@@ -319,16 +349,28 @@ var
   end;
 
 var
-  rootHandle : THandle;
+  ownHandle : THandle;
   rootCreated : Int64;
+  createdAt, exitedAt, kernelTime, userTime : TFileTime;
 begin
   result := termExitCode;
   if not CanTerminateTree(parentProcessId) then
     Exit;
 
-  rootHandle := OpenForKill(parentProcessId, rootCreated);
-  if rootHandle = 0 then
-    Exit;
+  rootCreated := 0;
+  ownHandle := 0;
+  if rootHandle <> 0 then
+  begin
+    if GetProcessTimes(rootHandle, createdAt, exitedAt, kernelTime, userTime) then
+      rootCreated := Int64(createdAt.dwHighDateTime) shl 32 or createdAt.dwLowDateTime;
+  end
+  else
+  begin
+    ownHandle := OpenForKill(parentProcessId, rootCreated);
+    if ownHandle = 0 then
+      Exit;
+    rootHandle := ownHandle;
+  end;
   try
     hSnapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if hSnapshot = INVALID_HANDLE_VALUE then
@@ -367,7 +409,8 @@ begin
       children.Free;
     end;
   finally
-    CloseHandle(rootHandle);
+    if ownHandle <> 0 then
+      CloseHandle(ownHandle);
   end;
 end;
 {$ENDIF}
@@ -381,7 +424,7 @@ begin
   result := (Integer(processId) > 1) and (Integer(processId) <> getpid);
 end;
 
-class function TSystemUtils.TerminateProcessTree(parentProcessId: Cardinal; termExitCode: Cardinal): Cardinal;
+class function TSystemUtils.TerminateProcessTree(parentProcessId: Cardinal; termExitCode: Cardinal; rootHandle : THandle): Cardinal;
 var
   pid : Integer;
   i : integer;

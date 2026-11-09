@@ -73,6 +73,16 @@ type
     [Test]
     procedure Add_NameOnly_DefaultQuoting_LeavesNameBare;
 
+    // A sensitive argument must stay sensitive when the builder is cloned
+    // (IProcess.Clone clones the command line), or ToLogString shows it.
+    [Test]
+    procedure Clone_SensitiveArgument_StaysMasked;
+
+    // CreateSensitiveArgument (the correctly spelt factory) builds a masked
+    // argument with the builder's separator and the given quoting.
+    [Test]
+    procedure CreateSensitiveArgument_MasksValue;
+
     // Add(text) with no value used to be written raw unless QuoteName was
     // set, so a path with spaces became several arguments and an embedded
     // " swallowed the arguments that followed it.
@@ -313,6 +323,39 @@ begin
   b := MakeBuilder;
   b.Add('--verbose');
   Assert.AreEqual('--verbose', b.ToString);
+end;
+
+procedure TCommandLineTests.Clone_SensitiveArgument_StaysMasked;
+var
+  src, dst : ICommandLineBuilder;
+begin
+  src := MakeBuilder;
+  src.AddSensitive('--password', 'topsecret123', TQuoted.qtNone);
+  src.AddSensitive('--token=rawtoken456');
+  dst := src.Clone;
+  Assert.IsFalse(Pos('topsecret123', dst.ToLogString) > 0, 'the clone leaked the secret value: ' + dst.ToLogString);
+  Assert.IsFalse(Pos('rawtoken456', dst.ToLogString) > 0, 'the clone leaked a name-only secret: ' + dst.ToLogString);
+  Assert.AreEqual('--password topsecret123 --token=rawtoken456', dst.ToString, False);
+end;
+
+type
+  TArgumentsBuilderAccess = class(TArgumentsBuilder);
+
+procedure TCommandLineTests.CreateSensitiveArgument_MasksValue;
+var
+  builder : TArgumentsBuilderAccess;
+  keep : ICommandLineBuilder;
+  arg : IArgument;
+begin
+  builder := TArgumentsBuilderAccess.Create;
+  keep := builder;
+  builder.WithDefaultValueSeparator('=');
+  arg := builder.CreateSensitiveArgument('--pw', 'hunter2', TQuoted.qtAutoSingle);
+  Assert.AreEqual('=', arg.NameValueSeparator);
+  Assert.IsTrue(arg.Quoted = TQuoted.qtAutoSingle, 'quoting');
+  Assert.AreEqual('--pw=hunter2', arg.ToString, False);
+  Assert.AreEqual('--pw=****', arg.ToLogString, False);
+  Assert.IsNotNull(keep);
 end;
 
 procedure TCommandLineTests.Add_NameOnly_PathWithSpaces_QuotedAsOneArgument;
