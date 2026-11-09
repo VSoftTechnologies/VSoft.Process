@@ -122,6 +122,32 @@ type
     // holds Windows drive-directory entries such as "=C:=C:\dir".
     [Test]
     procedure Exists_EmptyName_ReturnsFalse;
+
+    // A #0 in a name or value ends the entry early in the environment block
+    // and starts another variable, so it is refused.
+    [Test]
+    procedure AddOrSet_NulInName_Raises;
+
+    [Test]
+    procedure AddOrSet_NulInValue_RaisesAndAddsNothing;
+
+    // A list with a bad entry is refused as a whole.
+    [Test]
+    procedure AddOrSetValues_NulInLaterEntry_ChangesNothing;
+
+    {$IFDEF MSWINDOWS}
+    // An empty name must not match drive entries such as "=C:=C:\dir".
+    [Test]
+    procedure Remove_EmptyName_LeavesDriveEntries;
+
+    [Test]
+    procedure TryGetValue_EmptyName_ReturnsFalse;
+
+    // Names are matched as Windows matches them: ordinally, ignoring case,
+    // not by a locale-aware comparison.
+    [Test]
+    procedure Lookup_IsOrdinalNotLinguistic;
+    {$ENDIF}
   end;
 
 implementation
@@ -632,6 +658,125 @@ begin
   {$ENDIF}
   Assert.IsFalse(env.Exists(''));
 end;
+
+procedure TEnvironmentTests.AddOrSet_NulInName_Raises;
+var
+  env : IEnvironmentBuilder;
+begin
+  env := MakeBuilder;
+  Assert.WillRaise(
+    procedure
+    begin
+      env.AddOrSet('VSOFT_NUL'#0'INJECTED', 'x');
+    end,
+    EArgumentException);
+  Assert.IsFalse(env.HasOverrides, 'a refused name must not change the builder');
+end;
+
+procedure TEnvironmentTests.AddOrSet_NulInValue_RaisesAndAddsNothing;
+var
+  env : IEnvironmentBuilder;
+  count : integer;
+begin
+  env := MakeBuilder;
+  count := env.Count;
+  Assert.WillRaise(
+    procedure
+    begin
+      env.AddOrSet('VSOFT_NUL_VALUE', 'x'#0'VSOFT_INJECTED=1');
+    end,
+    EArgumentException);
+  Assert.AreEqual(count, env.Count, 'nothing may be added');
+  Assert.IsFalse(env.Exists('VSOFT_NUL_VALUE'));
+  Assert.IsFalse(env.HasOverrides, 'a refused value must not change the builder');
+end;
+
+procedure TEnvironmentTests.AddOrSetValues_NulInLaterEntry_ChangesNothing;
+var
+  env : IEnvironmentBuilder;
+  list : TStringList;
+  count : integer;
+begin
+  env := MakeBuilder;
+  count := env.Count;
+  list := TStringList.Create;
+  try
+    list.Add('VSOFT_FIRST_OK=1');
+    list.Add('VSOFT_SECOND=x'#0'VSOFT_INJECTED=1');
+    Assert.WillRaise(
+      procedure
+      begin
+        env.AddOrSetValues(list);
+      end,
+      EArgumentException);
+  finally
+    list.Free;
+  end;
+  Assert.AreEqual(count, env.Count, 'nothing may be added');
+  Assert.IsFalse(env.Exists('VSOFT_FIRST_OK'), 'the valid entry before the bad one must not be applied');
+  Assert.IsFalse(env.HasOverrides);
+end;
+
+{$IFDEF MSWINDOWS}
+procedure TEnvironmentTests.Remove_EmptyName_LeavesDriveEntries;
+var
+  env : IEnvironmentBuilder;
+  count : integer;
+  before : string;
+begin
+  SetEnvironmentVariable('=Z:', 'Z:\');
+  try
+    env := MakeBuilder;
+  finally
+    SetEnvironmentVariable('=Z:', nil);
+  end;
+  count := env.Count;
+  before := env.ToString;
+  env.Remove('');
+  Assert.AreEqual(count, env.Count, 'Remove('''') must not delete a drive entry');
+  Assert.AreEqual(before, env.ToString, False);
+  Assert.IsFalse(env.HasOverrides);
+end;
+
+procedure TEnvironmentTests.TryGetValue_EmptyName_ReturnsFalse;
+var
+  env : IEnvironmentBuilder;
+  value : string;
+begin
+  SetEnvironmentVariable('=Z:', 'Z:\');
+  try
+    env := MakeBuilder;
+  finally
+    SetEnvironmentVariable('=Z:', nil);
+  end;
+  value := 'unset';
+  Assert.Contains(env.ToString, '=Z:=Z:\', 'sanity: the drive entry must be in the builder');
+  Assert.IsFalse(env.TryGetValue('', value));
+  Assert.AreEqual('', value);
+end;
+
+procedure TEnvironmentTests.Lookup_IsOrdinalNotLinguistic;
+var
+  env : IEnvironmentBuilder;
+  count : integer;
+  value : string;
+begin
+  env := MakeBuilder;
+  count := env.Count;
+  // A linguistic comparison gives a soft hyphen (U+00AD) and a zero-width
+  // no-break space (U+FEFF) no weight, so it calls these two names equal.
+  // Windows compares the code units, so they are two variables.
+  env.AddOrSet('VSOFT_ORD'#$00AD'NAME', 'soft hyphen');
+  Assert.IsFalse(env.Exists('VSOFT_ORD'#$FEFF'NAME'), 'U+FEFF is not U+00AD');
+  env.AddOrSet('VSOFT_ORD'#$FEFF'NAME', 'no-break');
+  Assert.AreEqual(count + 2, env.Count, 'two distinct variables');
+  Assert.IsTrue(env.TryGetValue('vsoft_ord'#$00AD'name', value), 'case is still ignored');
+  Assert.AreEqual('soft hyphen', value, False);
+  env.AddOrSet('VSOFT_CAF'#$00E9, 'accented');
+  Assert.IsTrue(env.TryGetValue('VSOFT_CAF'#$00C9, value), 'case is ignored beyond ASCII too, as Windows does');
+  Assert.AreEqual('accented', value, False);
+end;
+{$ENDIF}
 
 initialization
   TDUnitX.RegisterTestFixture(TEnvironmentTests);

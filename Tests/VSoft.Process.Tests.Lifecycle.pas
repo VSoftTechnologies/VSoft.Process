@@ -55,6 +55,11 @@ type
     [Test]
     procedure StdInSourceNeverReturns_RunStillCompletes;
 
+    // ...nor keep the process alive once the caller has released it, or
+    // JobMode KillOnRelease never runs.
+    [Test]
+    procedure StdInSourceNeverReturns_ProcessNotPinned;
+
     // M11 - one target attached to stdout and stderr receives every byte.
     [Test]
     procedure SharedTargetOnBothStreams_ReceivesEveryByte;
@@ -182,6 +187,12 @@ type
     // Re-use: the next ExecuteAsync resets it and that run sets it again.
     [Test]
     procedure CompletionHandle_SecondExecuteAsync_ResetsThenSetsAgain;
+
+    // A target raises and logging that fails (out of memory), so an exception
+    // leaves the pipe-target isolation and reaches the read callback. The
+    // stream stops; that must be logged, not swallowed.
+    [Test]
+    procedure ReadCallbackException_StopsStreamAndIsLogged;
     {$ENDIF}
 
     {$IFNDEF MSWINDOWS}
@@ -255,6 +266,20 @@ type
     procedure Release;
   end;
 
+  // A stdout target that ignores its data and sets an event when it is
+  // destroyed. A process holds its targets until it is destroyed itself, so
+  // the event tells a test when the process has really been freed.
+  TLifetimeProbeTarget = class(TInterfacedObject, IPipeTarget)
+  private
+    FDestroyed : TEvent;
+  public
+    constructor Create(destroyed : TEvent);
+    destructor Destroy; override;
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
+  end;
+
   // A cancellation token whose first IsCancelled call blocks until Open is
   // called, which holds the Execute* call that checks it inside its start-up.
   TGateToken = class(TInterfacedObject, ICancellationToken)
@@ -320,6 +345,16 @@ type
     destructor Destroy; override;
     procedure HandleExit(const process : IProcess; exitCode : Cardinal);
     property Exited : TEvent read FExited;
+  end;
+
+  // Raises from HandleData after arranging for the next memory allocation on
+  // its thread to fail, so the process's attempt to log the failure raises
+  // EOutOfMemory from inside its own exception handler.
+  TOutOfMemoryOnLogTarget = class(TInterfacedObject, IPipeTarget)
+  public
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
   end;
   {$ENDIF}
 
@@ -595,7 +630,9 @@ begin
                       'The StringBuilder target is cleared and refilled every run');
       Assert.Contains(outSB.ToString, 'this-is-stdout');
       Assert.AreEqual(run, errLines.Count, 'One stderr line per run');
-      Assert.Contains(TEncoding.Default.GetString(TTestHelpers.ReadFileBytes(outFile)), 'this-is-stdout');
+      // The file target is rewritten every run, so it holds the output once.
+      Assert.AreEqual('this-is-stdout' + sLineBreak, TEncoding.Default.GetString(TTestHelpers.ReadFileBytes(outFile)), False,
+                      'The file target must hold this run''s output only');
     end;
     proc := nil;
   finally
@@ -666,6 +703,7 @@ var
   proc : IProcess;
   counter : TCountingTarget;
   counterIntf : IPipeTarget;
+  deadline : Int64;
 begin
   counter := TCountingTarget.Create;
   counterIntf := counter;
@@ -674,8 +712,10 @@ begin
   TTestHelpers.SetupShellCommand(proc, 'print-large', [IntToStr(cLines)]);
   proc.WithStdOutPipe(counterIntf);
   Assert.IsTrue(proc.ExecuteAsync);
-  while proc.Status = TProcessStatus.Running do
+  deadline := TTestHelpers.TickMs + 30000;
+  while (proc.Status = TProcessStatus.Running) and (TTestHelpers.TickMs < deadline) do
     Sleep(1);
+  Assert.AreNotEqual(TProcessStatus.Running, proc.Status, 'The run did not complete within 30 seconds');
   // No extra waiting: the moment Status changes the run is complete.
   Assert.AreEqual(cLines, counter.LineCount, 'All output must be delivered before Status leaves Running');
   Assert.AreEqual(1, counter.DoneCount, 'Done must have been called before Status leaves Running');
@@ -854,6 +894,69 @@ begin
     // Lets the writer thread finish (and the run, if it is still waiting).
     source.Release;
     proc := nil;
+  end;
+end;
+
+{ TLifetimeProbeTarget }
+
+constructor TLifetimeProbeTarget.Create(destroyed : TEvent);
+begin
+  inherited Create;
+  FDestroyed := destroyed;
+end;
+
+destructor TLifetimeProbeTarget.Destroy;
+begin
+  FDestroyed.SetEvent;
+  inherited;
+end;
+
+procedure TLifetimeProbeTarget.Start;
+begin
+end;
+
+procedure TLifetimeProbeTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+begin
+end;
+
+procedure TLifetimeProbeTarget.Done;
+begin
+end;
+
+// Configured here so the IProcess results of the With* calls (hidden
+// temporaries the compiler keeps until the end of the routine) are released
+// before the test drops its own reference.
+function MakeNeverReturningStdInProcess(const source : IPipeSource; destroyed : TEvent) : IProcess;
+begin
+  result := TProcess.Create;
+  TTestHelpers.SetupInlineCommand(result, 'exit 0', 'exit 0');
+  result.WithStdInPipe(source);
+  result.WithStdOutPipe(TLifetimeProbeTarget.Create(destroyed));
+end;
+
+procedure TProcessLifecycleTests.StdInSourceNeverReturns_ProcessNotPinned;
+var
+  proc : IProcess;
+  source : TBlockingPipeSource;
+  sourceRef : IPipeSource;
+  destroyed : TEvent;
+begin
+  destroyed := TEvent.Create(nil, true, false, '');
+  source := TBlockingPipeSource.Create;
+  sourceRef := source;
+  try
+    proc := MakeNeverReturningStdInProcess(sourceRef, destroyed);
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.Contains(proc.Errors.Text, 'did not return from GetData', 'the writer must have been left behind for this test');
+    proc := nil;
+    Assert.AreEqual(wrSignaled, destroyed.WaitFor(2000),
+                    'the process was not destroyed: the abandoned stdin writer still holds it');
+  finally
+    // Lets the writer thread finish; only then can a pinned process go.
+    source.Release;
+    proc := nil;
+    destroyed.WaitFor(5000);
+    destroyed.Free;
   end;
 end;
 
@@ -1178,16 +1281,24 @@ var
   output : TStringBuilder;
   expected : string;
   text : string;
+  fileName : string;
 begin
   // The leading 'x' puts every 2-byte character at an odd offset, so reads
   // of 4096 bytes always end in the middle of one.
   expected := 'x' + StringOfChar(#$00E9, cChars);
+  fileName := '';
   output := TStringBuilder.Create;
   try
     proc := TProcess.Create;
     proc.StartInfo.TimeoutInMSec := 30000;
     proc.StartInfo.PipeBufferSize := 4096;
-    TTestHelpers.SetupInlineCommand(proc, 'chcp 65001 > nul && echo ' + expected, 'printf ''' + expected + '\n''');
+    {$IFDEF MSWINDOWS}
+    // The child prints the exact UTF-8 bytes from a file: chcp 65001 on the
+    // same cmd /c line does not change the code page of that line's echo.
+    fileName := TTestHelpers.SetupPrintUtf8(proc, expected);
+    {$ELSE}
+    TTestHelpers.SetupInlineCommand(proc, '', 'printf ''' + expected + '\n''');
+    {$ENDIF}
     proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output, TEncoding.UTF8));
     Assert.IsTrue(proc.Execute);
     text := output.ToString;
@@ -1195,6 +1306,8 @@ begin
     Assert.Contains(text, expected);
   finally
     output.Free;
+    if fileName <> '' then
+      DeleteFile(fileName);
   end;
 end;
 
@@ -1649,6 +1762,89 @@ begin
     Assert.AreEqual<Cardinal>(0, proc.ExitCode);
     Assert.AreEqual<THandle>(handle, proc.CompletionHandle, 'The same handle is used for every run');
   end;
+end;
+
+// A memory manager that passes everything to the real one, except that the
+// first allocation made on thread GFailAllocThreadId fails (once).
+var
+  GRealMemoryManager : TMemoryManagerEx;
+  GFailAllocThreadId : Cardinal;
+
+function TakeFailure : boolean;
+begin
+  result := (GFailAllocThreadId <> 0) and (GFailAllocThreadId = GetCurrentThreadId);
+  if result then
+    GFailAllocThreadId := 0;
+end;
+
+function FailingGetMem(size : NativeInt) : Pointer;
+begin
+  if TakeFailure then
+    result := nil
+  else
+    result := GRealMemoryManager.GetMem(size);
+end;
+
+function FailingAllocMem(size : NativeInt) : Pointer;
+begin
+  if TakeFailure then
+    result := nil
+  else
+    result := GRealMemoryManager.AllocMem(size);
+end;
+
+function FailingReallocMem(p : Pointer; size : NativeInt) : Pointer;
+begin
+  if TakeFailure then
+    result := nil
+  else
+    result := GRealMemoryManager.ReallocMem(p, size);
+end;
+
+{ TOutOfMemoryOnLogTarget }
+
+procedure TOutOfMemoryOnLogTarget.Start;
+begin
+end;
+
+procedure TOutOfMemoryOnLogTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+var
+  error : Exception;
+begin
+  error := Exception.Create('target failure for test');
+  GFailAllocThreadId := GetCurrentThreadId;
+  raise error;
+end;
+
+procedure TOutOfMemoryOnLogTarget.Done;
+begin
+end;
+
+procedure TProcessLifecycleTests.ReadCallbackException_StopsStreamAndIsLogged;
+var
+  proc : IProcess;
+  failing : TMemoryManagerEx;
+begin
+  proc := TProcess.Create;
+  proc.StartInfo.TimeoutInMSec := 30000;
+  TTestHelpers.SetupInlineCommand(proc, 'echo hello', 'echo hello');
+  proc.WithStdOutPipe(TOutOfMemoryOnLogTarget.Create);
+  GFailAllocThreadId := 0;
+  GetMemoryManager(GRealMemoryManager);
+  failing := GRealMemoryManager;
+  failing.GetMem := FailingGetMem;
+  failing.AllocMem := FailingAllocMem;
+  failing.ReallocMem := FailingReallocMem;
+  SetMemoryManager(failing);
+  try
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+  finally
+    SetMemoryManager(GRealMemoryManager);
+    GFailAllocThreadId := 0;
+  end;
+  Assert.AreEqual(TProcessStatus.Exited, proc.Status);
+  Assert.Contains(proc.Errors.Text, 'stdout reading stopped', 'the exception that stopped stdout must be logged');
+  Assert.Contains(proc.Errors.Text, 'EOutOfMemory');
 end;
 {$ENDIF}
 
