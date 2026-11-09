@@ -82,10 +82,81 @@ uses
 
 { TEnvironment }
 
+{$IFDEF MSWINDOWS}
+// bIgnoreCase must be exactly 0 or 1 (LongBool True is -1 and is rejected).
+function CompareStringOrdinal(lpString1 : PWideChar; cchCount1 : Integer; lpString2 : PWideChar; cchCount2 : Integer; bIgnoreCase : Integer) : Integer; stdcall; external kernel32 name 'CompareStringOrdinal';
+
+// Name part of a NAME=VALUE entry. Drive-cwd entries like "=C:=C:\dir" start
+// with '=' which is part of the name.
+function EnvName(const entry : string) : string;
+var
+  idx : integer;
+begin
+  idx := Pos('=', Copy(entry, 2, MaxInt));
+  if idx = 0 then
+    result := entry
+  else
+    result := Copy(entry, 1, idx);
+end;
+
+// Compares two names the way Windows does: case-insensitively, in Unicode
+// ordinal order, without regard to locale.
+function CompareNames(const name1 : string; const name2 : string) : integer;
+begin
+  result := CompareStringOrdinal(PWideChar(name1), Length(name1), PWideChar(name2), Length(name2), 1);
+  if result = 0 then // failed - fall back to an ASCII case-insensitive compare
+    result := CompareText(name1, name2)
+  else
+    result := result - 2; // CSTR_LESS_THAN / CSTR_EQUAL / CSTR_GREATER_THAN -> -1 / 0 / 1
+end;
+
+function CompareEnvEntries(list : TStringList; index1, index2 : integer) : integer;
+begin
+  // CreateProcess requires the block sorted case-insensitively by name in
+  // Unicode ordinal order, without regard to locale.
+  result := CompareNames(EnvName(list[index1]), EnvName(list[index2]));
+end;
+{$ENDIF}
+
 procedure ValidateName(const name : string);
 begin
+  // A #0 would end the entry early in the environment block and start
+  // another variable.
+  if (name = '') or (Pos('=', name) > 0) or (Pos(#0, name) > 0) then
+    raise EArgumentException.Create('Invalid environment variable name: "' + StringReplace(name, #0, '\0', [rfReplaceAll]) + '"');
+end;
+
+procedure ValidateValue(const name : string; const value : string);
+begin
+  if Pos(#0, value) > 0 then
+    raise EArgumentException.Create('Invalid value for environment variable "' + name + '": it contains a NUL character');
+end;
+
+// Index of the variable called name, or -1. An empty name (or one holding
+// '=') is never a variable, so drive entries such as "=C:=C:\dir" are not
+// matched. Windows matches names ordinally, ignoring case, as it sorts them;
+// TStringList.IndexOfName would use a locale-aware comparison.
+function IndexOfVariable(const list : TStringList; const name : string) : integer;
+{$IFDEF MSWINDOWS}
+var
+  i : integer;
+  entry : string;
+{$ENDIF}
+begin
+  result := -1;
   if (name = '') or (Pos('=', name) > 0) then
-    raise EArgumentException.Create('Invalid environment variable name: "' + name + '"');
+    exit;
+  {$IFDEF MSWINDOWS}
+  for i := 0 to list.Count - 1 do
+  begin
+    entry := list[i];
+    // An entry without '=' has no name, as with IndexOfName.
+    if (Pos('=', Copy(entry, 2, MaxInt)) > 0) and (CompareNames(EnvName(entry), name) = 0) then
+      Exit(i);
+  end;
+  {$ELSE}
+  result := list.IndexOfName(name);
+  {$ENDIF}
 end;
 
 function TEnvironmentBuilder.AddOrSet(const name, value: string) : IEnvironmentBuilder;
@@ -93,8 +164,9 @@ var
   idx : integer;
 begin
   ValidateName(name);
+  ValidateValue(name, value);
   result := Self;
-  idx := FVariables.IndexOfName(name);
+  idx := IndexOfVariable(FVariables, name);
   if idx <> -1 then
     // Not ValueFromIndex: assigning '' to it deletes the line.
     FVariables[idx] := FVariables.Names[idx] + '=' + value
@@ -116,6 +188,15 @@ begin
   result := Self;
   if list = nil then
     exit;
+  // Check every entry first, so a bad one leaves the builder unchanged.
+  for i := 0 to list.Count -1 do
+  begin
+    if Pos('=',list.Strings[i]) > 1 then
+    begin
+      ValidateName(list.Names[i]);
+      ValidateValue(list.Names[i], list.ValueFromIndex[i]);
+    end;
+  end;
   for i := 0 to list.Count -1 do
   begin
     if Pos('=',list.Strings[i]) > 1 then
@@ -170,39 +251,6 @@ function TEnvironmentBuilder.GetCount: integer;
 begin
   result := FVariables.Count;
 end;
-
-{$IFDEF MSWINDOWS}
-// bIgnoreCase must be exactly 0 or 1 (LongBool True is -1 and is rejected).
-function CompareStringOrdinal(lpString1 : PWideChar; cchCount1 : Integer; lpString2 : PWideChar; cchCount2 : Integer; bIgnoreCase : Integer) : Integer; stdcall; external kernel32 name 'CompareStringOrdinal';
-
-// Name part of a NAME=VALUE entry. Drive-cwd entries like "=C:=C:\dir" start
-// with '=' which is part of the name.
-function EnvName(const entry : string) : string;
-var
-  idx : integer;
-begin
-  idx := Pos('=', Copy(entry, 2, MaxInt));
-  if idx = 0 then
-    result := entry
-  else
-    result := Copy(entry, 1, idx);
-end;
-
-function CompareEnvEntries(list : TStringList; index1, index2 : integer) : integer;
-var
-  name1, name2 : string;
-begin
-  // CreateProcess requires the block sorted case-insensitively by name in
-  // Unicode ordinal order, without regard to locale.
-  name1 := EnvName(list[index1]);
-  name2 := EnvName(list[index2]);
-  result := CompareStringOrdinal(PWideChar(name1), Length(name1), PWideChar(name2), Length(name2), 1);
-  if result = 0 then // failed - fall back to an ASCII case-insensitive compare
-    result := CompareText(name1, name2)
-  else
-    result := result - 2; // CSTR_LESS_THAN / CSTR_EQUAL / CSTR_GREATER_THAN -> -1 / 0 / 1
-end;
-{$ENDIF}
 
 function TEnvironmentBuilder.ToEnvironmentBlock: Pointer;
 var
@@ -331,7 +379,7 @@ var
   idx : integer;
 begin
   result := Self;
-  idx := FVariables.IndexOfName(name);
+  idx := IndexOfVariable(FVariables, name);
   if idx <> -1 then
   begin
     FVariables.Delete(idx);
@@ -352,7 +400,7 @@ function TEnvironmentBuilder.TryGetValue(const name : string; out value : string
 var
   idx : integer;
 begin
-  idx := FVariables.IndexOfName(name);
+  idx := IndexOfVariable(FVariables, name);
   result := idx <> -1;
   if result then
     value := FVariables.ValueFromIndex[idx]
@@ -362,8 +410,9 @@ end;
 
 function TEnvironmentBuilder.Exists(const name : string) : boolean;
 begin
-  // An empty name would match Windows drive entries such as "=C:=C:\dir".
-  result := (name <> '') and (FVariables.IndexOfName(name) <> -1);
+  // IndexOfVariable never matches an empty name, so Windows drive entries
+  // such as "=C:=C:\dir" are not found.
+  result := IndexOfVariable(FVariables, name) <> -1;
 end;
 
 function TEnvironmentBuilder.ToString: string;

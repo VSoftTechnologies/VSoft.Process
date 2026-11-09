@@ -63,6 +63,13 @@ type
     class function FindChildProcess(parentId : Cardinal; const exeName : string) : Cardinal; static;
     // Number of handles this process has open.
     class function HandleCount : Cardinal; static;
+    // Configure proc to print text plus CRLF as exact UTF-8 bytes: the text
+    // is written to a new temp file (returned; the caller deletes it), which
+    // the print-file fixture copies to stdout byte for byte. Unlike
+    // `chcp 65001 > nul && echo`, the bytes do not depend on the console
+    // code page: chcp does not change the code page used by an echo later
+    // on the same cmd /c line.
+    class function SetupPrintUtf8(const proc : IProcess; const text : string) : string; static;
     {$ENDIF}
   end;
 
@@ -394,6 +401,22 @@ begin
   for i := 0 to High(args) do
     inner := inner + ' "' + StringReplace(args[i], '"', '""', [rfReplaceAll]) + '"';
   result := '"' + inner + '"';
+end;
+
+class function TTestHelpers.SetupPrintUtf8(const proc : IProcess; const text : string) : string;
+var
+  bytes : TBytes;
+  fs : TFileStream;
+begin
+  bytes := TEncoding.UTF8.GetBytes(text + #13#10);
+  result := TempFileName('vsoft_proc_utf8_', '.txt');
+  fs := TFileStream.Create(result, fmCreate);
+  try
+    fs.WriteBuffer(bytes[0], Length(bytes));
+  finally
+    fs.Free;
+  end;
+  SetupShellCommand(proc, 'print-file', [result]);
 end;
 {$ENDIF}
 

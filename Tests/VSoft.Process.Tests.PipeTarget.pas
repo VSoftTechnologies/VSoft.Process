@@ -221,6 +221,11 @@ type
     procedure LineTarget_InjectedDefault_ForgottenAfterDone;
     [Test]
     procedure StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
+
+    // A ToAll child that raises must not stop delivery to its siblings; it
+    // gets no more data this run and its exception is raised from Done.
+    [Test]
+    procedure MultiTarget_RaisingChild_SiblingsKeepReceiving;
   end;
 
 implementation
@@ -829,6 +834,7 @@ var
   target  : IPipeTarget;
   capture : TLineCapture;
   enc     : IEncodingAwarePipeTarget;
+  payload : TBytes;
 begin
   capture := TLineCapture.Create;
   try
@@ -840,8 +846,13 @@ begin
     // Injecting a different default must NOT clobber the explicit choice.
     enc.SetDefaultEncoding(TEncoding.ASCII);
     target.Start;
-    // (no further assertions needed - HasExplicitEncoding == True is the contract)
+    payload := TEncoding.UTF8.GetBytes('caf' + #$00E9 + #10);
+    target.HandleData(payload, Length(payload));
     target.Done;
+
+    Assert.AreEqual(1, capture.Lines.Count);
+    Assert.AreEqual('caf' + #$00E9, capture.Lines[0], False,
+                    'The explicit UTF-8 encoding must decode the line, not the injected ASCII default');
   finally
     capture.Free;
   end;
@@ -1359,6 +1370,49 @@ begin
     Assert.AreEqual('ab', sb.ToString, false, 'Run 2 must not reuse run 1''s injected UTF-16');
   finally
     sb.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.MultiTarget_RaisingChild_SiblingsKeepReceiving;
+var
+  multi   : IPipeTarget;
+  stream  : TMemoryStream;
+  part1   : TBytes;
+  part2   : TBytes;
+  calls   : integer;
+begin
+  calls := 0;
+  part1 := MakeBytes('abc');
+  part2 := MakeBytes('def');
+  stream := TMemoryStream.Create;
+  try
+    multi := TPipeTarget.ToAll([
+      TPipeTarget.ToDelegate(
+        procedure(const data : TBytes; length : NativeUInt)
+        begin
+          Inc(calls);
+          raise EInvalidOpException.Create('boom');
+        end),
+      TPipeTarget.ToStream(stream)]);
+    multi.Start;
+    Assert.WillNotRaiseAny(
+      procedure
+      begin
+        multi.HandleData(part1, Length(part1));
+        multi.HandleData(part2, Length(part2));
+      end,
+      'A raising target must not stop the fan-out');
+    Assert.AreEqual<Int64>(6, stream.Size, 'The healthy sibling must receive every block');
+    Assert.AreEqual(1, calls, 'A target that raised gets no more data this run');
+    Assert.WillRaise(
+      procedure
+      begin
+        multi.Done;
+      end,
+      EInvalidOpException, 'Done must report the raising target''s exception');
+  finally
+    multi := nil;
+    stream.Free;
   end;
 end;
 
