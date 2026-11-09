@@ -430,12 +430,23 @@ end;
 
 destructor TProcessBase.Destroy;
 begin
+  // A run holds its own reference to this object until it has finished with
+  // it (OnExit included), so when used through IProcess this object is never
+  // destroyed during a run. What follows covers a synchronous Execute still in
+  // progress on another thread when the object is freed. It does NOT make use
+  // without an interface reference safe: the completion event is set before
+  // OnExit fires, so Destroy can return and free the object before the run's
+  // tail has finished with it. Such use is unsupported (an OnStarted/OnExit
+  // handler already frees a RefCount 0 object through the temporary reference
+  // that handler(Self) takes). The caller must also hold a reference until
+  // Execute has started: the RefCount check that takes the run's own reference
+  // is not atomic against a concurrent last release.
   if (FCompletionEvent <> nil) and (FCompletionEvent.WaitFor(0) <> wrSignaled) then
   begin
-    // A run is still active (only possible for a synchronous Execute on
-    // another thread). Ask it to stop and wait until it has released
-    // everything we are about to free. Every wait inside the worker is
-    // bounded, so this terminates.
+    // Ask it to stop and wait until it has released everything we are about
+    // to free. Every library wait inside the worker is bounded; only user
+    // code (a target, a source's Done) can hold it longer, and freeing early
+    // would be a use-after-free.
     FTerminateEvent.SetEvent;
     FCompletionEvent.WaitFor(INFINITE);
   end;
@@ -506,8 +517,9 @@ begin
       else
         result := InternalStartAsync;
     finally
-      // A run that started owns the references until CompleteRun clears them.
-      if not result then
+      // Once handed over, CompleteRun or AbortStart clears them, and after
+      // that this object may already be freed (Destroy on another thread).
+      if not handedOver then
       begin
         FCancellationToken := nil;
         FCancellationEvent := nil;
@@ -648,8 +660,19 @@ end;
 function TProcessBase.InternalStart: boolean;
 var
   keepAlive : IInterface;
+  selfRef : IInterface;
 begin
   result := false;
+  // The run's own reference, as an asynchronous run's worker holds one: the
+  // caller may release the last of theirs while the run is still using this
+  // object (from OnExit, or from another thread), and the object must then
+  // be freed here, on this thread, once the run has finished with it, never
+  // in the middle of it or on a thread that has to wait for this one.
+  // Released when this method returns, after everything else. Only taken
+  // when the object is already reference counted: one used without an
+  // interface reference would be freed by its release.
+  if RefCount > 0 then
+    selfRef := Self;
   FStartThreadId := CurrentThreadId;
   // The calling thread is the worker for a synchronous run.
   FWorkerThreadId := FStartThreadId;
@@ -722,11 +745,13 @@ begin
         end;
       end);
   except
-    // No monitor thread: stop the child and clean up on this thread.
-    selfRef := nil;
+    // No monitor thread: stop the child and clean up on this thread. selfRef
+    // is kept until RunWorker has returned, so an OnExit handler that drops
+    // the caller's last reference cannot free this object under it.
     FTerminateEvent.SetEvent;
     FWorkerThreadId := CurrentThreadId;
     RunWorker;
+    selfRef := nil;
     raise;
   end;
   FWorkerThreadId := worker.ThreadID;
@@ -738,26 +763,34 @@ var
   outcome : TProcessOutcome;
   keepAlive : IInterface;
 begin
+  // The caller (InternalStart, or the asynchronous worker) holds a reference
+  // to this object until this method has returned, so OnExit can release
+  // every other reference without this object being freed under it.
   outcome.Status := TProcessStatus.Terminated;
   outcome.ExitCode := FStartInfoBuilder.TerminateExitCode;
   outcome.TimedOut := false;
   try
     try
-      DoWaitForCompletion(outcome);
-    except
-      on E : Exception do
-        LogError('Error while waiting for the process: ' + E.ClassName + ' - ' + E.Message);
+      try
+        DoWaitForCompletion(outcome);
+      except
+        on E : Exception do
+          LogError('Error while waiting for the process: ' + E.ClassName + ' - ' + E.Message);
+      end;
+    finally
+      StopPipeTargets;
+      // A reference a left-behind stdin writer handed back: taken before the
+      // run is published (the next run may detach its own writer) and
+      // released as the very last action, once nothing here touches this
+      // object.
+      keepAlive := FDetachedOwnerRef;
+      FDetachedOwnerRef := nil;
+      CompleteRun(outcome);
     end;
+    DoOnExited(outcome.ExitCode);
   finally
-    StopPipeTargets;
-    // A reference a left-behind stdin writer handed back: taken before the
-    // run is published (the next run may detach its own writer) and released
-    // as the very last action, once nothing here touches this object.
-    keepAlive := FDetachedOwnerRef;
-    FDetachedOwnerRef := nil;
-    CompleteRun(outcome);
+    keepAlive := nil;
   end;
-  DoOnExited(outcome.ExitCode);
 end;
 
 procedure TProcessBase.CompleteRun(const outcome : TProcessOutcome);
@@ -779,6 +812,8 @@ begin
   FCancellationToken := nil;
   FCancellationEvent := nil;
   FWorkerThreadId := 0;
+  // Last: from here Destroy on another thread may free an object used
+  // without an interface reference.
   FCompletionEvent.SetEvent;
 end;
 
