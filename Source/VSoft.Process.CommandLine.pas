@@ -192,39 +192,35 @@ begin
     result := '""';
 end;
 
+// Quotes a name or value by the argument's quoting style. When allowForced
+// is False, qtSingle / qtDouble fall back to the auto rule of the same family
+// (quote only when the text is empty or holds a space, tab or "), so a switch
+// such as -v stays bare while a path with spaces stays one argument.
+function QuotePart(const text : string; const quoted : TQuoted; const allowForced : boolean) : string;
+begin
+  case quoted of
+    TQuoted.qtSingle     : result := TStringUtils.QuoteString(text, not allowForced);
+    TQuoted.qtDouble     : result := TStringUtils.DoubleQuoteString(text, not allowForced);
+    TQuoted.qtAutoSingle : result := TStringUtils.QuoteString(text, True);
+    TQuoted.qtAutoDouble : result := TStringUtils.DoubleQuoteString(text, True);
+  else
+    result := text;
+  end;
+end;
+
 function TArgument.ToString: string;
-var
-  sValue : string;
 begin
   // Add('', '') is an explicit empty argument.
   if (FName = '') and (FValue = '') then
     Exit(EmptyArgument(FQuoted));
-  result := FName;
-  if FValue <> '' then
-  begin
-    if FName <> '' then
-      result := Result + FNameSeparator;
-    sValue := FValue;
-    case FQuoted of
-      TQuoted.qtSingle : sValue := TStringUtils.QuoteString(sValue, False);
-      TQuoted.qtDouble : sValue := TStringUtils.DoubleQuoteString(sValue, False);
-      TQuoted.qtAutoSingle : sValue := TStringUtils.QuoteString(sValue, True);
-      TQuoted.qtAutoDouble : sValue := TStringUtils.DoubleQuoteString(sValue, True);
-    end;
-    result := Result +  sValue;
-  end
-  else
-  begin
-    if FQuoteName  then
-    begin
-      case FQuoted of
-        TQuoted.qtSingle : result := TStringUtils.QuoteString(result, False);
-        TQuoted.qtDouble : result := TStringUtils.DoubleQuoteString(result, False);
-        TQuoted.qtAutoSingle : result := TStringUtils.QuoteString(result, True);
-        TQuoted.qtAutoDouble : result := TStringUtils.DoubleQuoteString(result, True);
-      end;
-    end;
-  end;
+  // Add(name): a switch or a bare value. It is quoted when it needs to be,
+  // or always when QuoteName is set; qtNone leaves it as given.
+  if FValue = '' then
+    Exit(QuotePart(FName, FQuoted, FQuoteName));
+  result := '';
+  if FName <> '' then
+    result := QuotePart(FName, FQuoted, False) + FNameSeparator;
+  result := result + QuotePart(FValue, FQuoted, True);
 end;
 
 function TArgument.GetNameSep: String;
@@ -282,49 +278,27 @@ end;
 function TSensitiveArgument.BuildRendered(const maskValue : boolean) : string;
 const
   cMask = '****';
-var
-  sValue : string;
 begin
   // Mirror TArgument.ToString but substitute the mask token in place of the
   // real value so we never produce a string containing the secret that we
   // then have to scrub.
   if (FName = '') and (FValue = '') then
     Exit(EmptyArgument(FQuoted));
-  result := FName;
-  if FValue <> '' then
-  begin
-    if FName <> '' then
-      result := result + FNameSeparator;
-    if maskValue then
-      sValue := cMask
-    else
-    begin
-      sValue := FValue;
-      case FQuoted of
-        TQuoted.qtSingle      : sValue := TStringUtils.QuoteString(sValue, False);
-        TQuoted.qtDouble      : sValue := TStringUtils.DoubleQuoteString(sValue, False);
-        TQuoted.qtAutoSingle  : sValue := TStringUtils.QuoteString(sValue, True);
-        TQuoted.qtAutoDouble  : sValue := TStringUtils.DoubleQuoteString(sValue, True);
-      end;
-    end;
-    result := result + sValue;
-  end
-  else
+  if FValue = '' then
   begin
     // AddSensitive(name): the whole argument is the secret
     // ('--password=secret', a token passed on its own).
     if maskValue then
       Exit(cMask);
-    if FQuoteName then
-    begin
-      case FQuoted of
-        TQuoted.qtSingle      : result := TStringUtils.QuoteString(result, False);
-        TQuoted.qtDouble      : result := TStringUtils.DoubleQuoteString(result, False);
-        TQuoted.qtAutoSingle  : result := TStringUtils.QuoteString(result, True);
-        TQuoted.qtAutoDouble  : result := TStringUtils.DoubleQuoteString(result, True);
-      end;
-    end;
+    Exit(QuotePart(FName, FQuoted, FQuoteName));
   end;
+  result := '';
+  if FName <> '' then
+    result := QuotePart(FName, FQuoted, False) + FNameSeparator;
+  if maskValue then
+    result := result + cMask
+  else
+    result := result + QuotePart(FValue, FQuoted, True);
 end;
 
 function TSensitiveArgument.Clone : IArgument;

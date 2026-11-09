@@ -82,6 +82,28 @@ type
     // argument with the builder's separator and the given quoting.
     [Test]
     procedure CreateSensitiveArgument_MasksValue;
+
+    // Add(text) with no value used to be written raw unless QuoteName was
+    // set, so a path with spaces became several arguments and an embedded
+    // " swallowed the arguments that followed it.
+    [Test]
+    procedure Add_NameOnly_PathWithSpaces_QuotedAsOneArgument;
+
+    [Test]
+    procedure Add_NameOnly_EmbeddedQuote_Escaped;
+
+    // qtNone still passes a pre-built fragment through untouched.
+    [Test]
+    procedure Add_NameOnly_QtNone_LeftRaw;
+
+    // A name holding a space is quoted when a value follows it.
+    [Test]
+    procedure Add_NameWithSpaceAndValue_NameQuoted;
+
+    // Name-only arguments under the single-quote styles, and a value joined
+    // to its name by a non-space separator.
+    [Test]
+    procedure Add_NameOnly_SingleQuoteStyles;
   end;
 
 implementation
@@ -334,6 +356,57 @@ begin
   Assert.AreEqual('--pw=hunter2', arg.ToString, False);
   Assert.AreEqual('--pw=****', arg.ToLogString, False);
   Assert.IsNotNull(keep);
+end;
+
+procedure TCommandLineTests.Add_NameOnly_PathWithSpaces_QuotedAsOneArgument;
+var
+  b : ICommandLineBuilder;
+begin
+  b := MakeBuilder;
+  b.Add('C:\Program Files\x.txt').Add('-v');
+  Assert.AreEqual('"C:\Program Files\x.txt" -v', b.ToString);
+  b.Clear.Add('a b', TQuoted.qtAutoDouble);
+  Assert.AreEqual('"a b"', b.ToString, 'auto double quoting');
+end;
+
+procedure TCommandLineTests.Add_NameOnly_EmbeddedQuote_Escaped;
+var
+  b : ICommandLineBuilder;
+begin
+  b := MakeBuilder;
+  b.Add('say"hi').Add('next');
+  Assert.AreEqual('"say\"hi" next', b.ToString);
+end;
+
+procedure TCommandLineTests.Add_NameOnly_QtNone_LeftRaw;
+var
+  b : ICommandLineBuilder;
+begin
+  b := MakeBuilder;
+  b.Add('/c').Add('exit /b 17', TQuoted.qtNone);
+  Assert.AreEqual('/c exit /b 17', b.ToString);
+end;
+
+procedure TCommandLineTests.Add_NameWithSpaceAndValue_NameQuoted;
+var
+  b : ICommandLineBuilder;
+begin
+  b := MakeBuilder;
+  b.Add('--my opt', 'v', TQuoted.qtAutoDouble);
+  Assert.AreEqual('"--my opt" v', b.ToString);
+  b.Clear.Add('--opt', 'v', TQuoted.qtAutoDouble);
+  Assert.AreEqual('--opt v', b.ToString, 'a plain name stays bare');
+end;
+
+procedure TCommandLineTests.Add_NameOnly_SingleQuoteStyles;
+var
+  b : ICommandLineBuilder;
+begin
+  b := MakeBuilder;
+  b.Add('a b', TQuoted.qtAutoSingle).Add('-v', TQuoted.qtSingle);
+  Assert.AreEqual('"''a b''" -v', b.ToString);
+  b.Clear.WithDefaultValueSeparator('=').Add('--out', 'C:\a b', TQuoted.qtAutoDouble);
+  Assert.AreEqual('--out="C:\a b"', b.ToString);
 end;
 
 initialization

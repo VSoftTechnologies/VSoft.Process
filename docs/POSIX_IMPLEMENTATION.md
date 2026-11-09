@@ -17,7 +17,7 @@ The unit's initialization sets SIGPIPE to `SIG_IGN` for the whole host process, 
 - **In the child:**
   1. `setpgid(0,0)` when using a process group (the parent also calls `setpgid`, so the group exists before any signal can be sent).
   2. Reset the signal mask, and SIGPIPE/SIGXFSZ to `SIG_DFL`. Ignored dispositions survive `execve`.
-  3. Set affinity (Linux only, CPUs 0..31 from the 32-bit `ProcessorAffinity`) and the nice value (`Idle` 19, `BelowNormal` 10, `AboveNormal` -10, which needs `CAP_SYS_NICE` / root). Failures here and in `setpgid` are ignored.
+  3. Set affinity (Linux only, CPUs 0..63 from the pointer-sized `ProcessorAffinity`) and the nice value (`Idle` 19, `BelowNormal` 10, `AboveNormal` -10, which needs `CAP_SYS_NICE` / root). Failures here and in `setpgid` are ignored.
   4. `dup2` the stdio. A stream that isn't redirected keeps the parent's handle unless it is closed, in which case it gets `/dev/null`.
   5. Close fds ≥ 3: on Linux 5.11+ `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` marks them close-on-exec; otherwise a loop closes fds 3 up to `sysconf(_SC_OPEN_MAX)` (capped at 65536), skipping the error pipe.
   6. `chdir`, then `execve`, with a `/bin/sh` retry on `ENOEXEC`.
@@ -58,7 +58,7 @@ A double fork: the first child calls `setsid`, the grandchild runs `RunChild` wi
 | Child exit wake-up | `pidfd_open` (5.3+) | `EVFILT_PROC` / `NOTE_EXIT` (`$80000000`), one-shot |
 | CLOEXEC pipes | `pipe2` | `pipe` + `fcntl` under `GSpawnLock` |
 | Closing inherited fds | `close_range` (5.11+), else a loop | loop |
-| Processor affinity | `sched_setaffinity`, CPUs 0..31 | not available |
+| Processor affinity | `sched_setaffinity`, CPUs 0..63 | not available |
 
 `fcntl` and `syscall` are variadic. They must be declared `varargs` with only their fixed parameters, because Apple arm64 passes variadic arguments on the stack. The `pidfd_open` (434) and `close_range` (436) syscall numbers are the x86-64 ones.
 

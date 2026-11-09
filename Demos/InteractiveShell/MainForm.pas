@@ -114,16 +114,24 @@ end;
 
 procedure TfrmMainForm.FormCloseQuery(Sender: TObject; var CanClose: Boolean);
 begin
-  if (FProcess <> nil) and (FProcess.Status = TProcessStatus.Running) then
-    FProcess.Terminate;
   CanClose := True;
+  if (FProcess <> nil) and (FProcess.Status = TProcessStatus.Running) then
+    //Terminate waits up to 5 seconds for the run to complete. Until it has,
+    //the line callbacks can still fire and they use this form's state
+    //(FPending, FPendingLock), so the form must stay open.
+    if not FProcess.Terminate and (FProcess.Status = TProcessStatus.Running) then
+    begin
+      CanClose := False;
+      lblStatus.Caption := 'cmd.exe did not stop within 5 seconds - try closing again';
+    end;
 end;
 
 procedure TfrmMainForm.FormDestroy(Sender: TObject);
 begin
   FStdIn := nil;
-  //Destructor waits on FCompletionEvent so the worker is fully done and
-  //no more callbacks can fire after this returns.
+  //FormCloseQuery keeps the form open until the run has completed, so no
+  //more line callbacks can fire. (Dropping FProcess does not wait for a
+  //run: the worker holds its own reference.)
   FProcess := nil;
   FreeAndNil(FPending);
   FreeAndNil(FPendingLock);
@@ -363,7 +371,8 @@ end;
 procedure TfrmMainForm.btnStopClick(Sender: TObject);
 begin
   if (FProcess <> nil) and (FProcess.Status = TProcessStatus.Running) then
-    FProcess.Terminate;
+    if not FProcess.Terminate and (FProcess.Status = TProcessStatus.Running) then
+      lblStatus.Caption := 'cmd.exe did not stop within 5 seconds';
 end;
 
 procedure TfrmMainForm.edInputKeyPress(Sender: TObject; var Key: Char);

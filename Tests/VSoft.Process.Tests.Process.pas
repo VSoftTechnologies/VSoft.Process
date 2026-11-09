@@ -201,27 +201,113 @@ begin
                             'ExitCode from second run should be 0, not 5 (stale)');
 end;
 
+// Helpers for ExecuteAsync_NoUseAfterFreeWhenCallerDropsRef: OnExit is
+// recorded on a separate object, and a pipe target signals when it is
+// destroyed, which happens when the process that owns it is freed.
+type
+  TDroppedRefExitCapture = class
+  public
+    Fired : TEvent;
+    ExitCode : Cardinal;
+    constructor Create;
+    destructor Destroy; override;
+    procedure HandleExited(const process : IProcess; exitCode : Cardinal);
+  end;
+
+  TLifetimeProbeTarget = class(TInterfacedObject, IPipeTarget)
+  private
+    FDestroyed : TEvent;
+  public
+    constructor Create(destroyed : TEvent);
+    destructor Destroy; override;
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
+  end;
+
+constructor TDroppedRefExitCapture.Create;
+begin
+  inherited Create;
+  Fired := TEvent.Create(nil, True, False, '');
+  ExitCode := $FFFFFFFF;
+end;
+
+destructor TDroppedRefExitCapture.Destroy;
+begin
+  Fired.Free;
+  inherited;
+end;
+
+procedure TDroppedRefExitCapture.HandleExited(const process : IProcess; exitCode : Cardinal);
+begin
+  Self.ExitCode := exitCode;
+  Fired.SetEvent;
+end;
+
+constructor TLifetimeProbeTarget.Create(destroyed : TEvent);
+begin
+  inherited Create;
+  FDestroyed := destroyed;
+end;
+
+destructor TLifetimeProbeTarget.Destroy;
+begin
+  FDestroyed.SetEvent;
+  inherited;
+end;
+
+procedure TLifetimeProbeTarget.Start;
+begin
+end;
+
+procedure TLifetimeProbeTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+begin
+end;
+
+procedure TLifetimeProbeTarget.Done;
+begin
+end;
+
+// Configured here so the IProcess results of the With* calls (hidden
+// temporaries kept until the end of the routine) do not outlive it.
+function MakeDroppedRefProcess(capture : TDroppedRefExitCapture; destroyed : TEvent) : IProcess;
+begin
+  result := TProcess.Create;
+  result.StartInfo.HideWindow := True;
+  TTestHelpers.SetupInlineCommand(result, 'ping 127.0.0.1 -n 2 > nul', 'sleep 1');
+  result.OnExit := capture.HandleExited;
+  result.WithStdOutPipe(TLifetimeProbeTarget.Create(destroyed));
+end;
+
 procedure TProcessExecutionTests.ExecuteAsync_NoUseAfterFreeWhenCallerDropsRef;
 var
   proc : IProcess;
-  pidGate : Cardinal;
+  capture : TDroppedRefExitCapture;
+  destroyed : TEvent;
 begin
-  proc := TProcess.Create;
-  proc.StartInfo.HideWindow := True;
-  TTestHelpers.SetupInlineCommand(proc, 'ping 127.0.0.1 -n 2 > nul', 'sleep 1');
-  proc.ExecuteAsync;
-  pidGate := proc.ProcessId;
-  Assert.IsTrue(pidGate <> 0, 'Should have a PID after ExecuteAsync');
+  capture := TDroppedRefExitCapture.Create;
+  destroyed := TEvent.Create(nil, True, False, '');
+  try
+    proc := MakeDroppedRefProcess(capture, destroyed);
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    Assert.IsTrue(proc.ProcessId <> 0, 'Should have a PID after ExecuteAsync');
+    Assert.AreEqual(TProcessStatus.Running, proc.Status, 'The child must still be running when the reference is dropped');
 
-  // Drop our reference. The worker thread must keep Self alive until it's
-  // finished. Without the fix this can crash or trip leak detection.
-  proc := nil;
+    // Drop our reference. The worker thread must keep Self alive until it's
+    // finished, then release it.
+    proc := nil;
 
-  // Give the child plenty of time to exit. We are not asserting anything
-  // about the dropped reference - the assertion is that we got here without
-  // a crash and that ReportMemoryLeaksOnShutdown produces no leak.
-  Sleep(3500);
-  Assert.Pass('Survived async-with-dropped-reference');
+    Assert.AreEqual(wrSignaled, capture.Fired.WaitFor(10000), 'OnExit never fired after the caller dropped its reference');
+    Assert.AreEqual<Cardinal>(0, capture.ExitCode, 'OnExit must report the child''s exit code');
+    Assert.AreEqual(wrSignaled, destroyed.WaitFor(10000), 'The process was not freed once the run had finished');
+  finally
+    // Never free what a still-running worker may use.
+    if destroyed.WaitFor(10000) = wrSignaled then
+    begin
+      destroyed.Free;
+      capture.Free;
+    end;
+  end;
 end;
 
 // Helper for ExecuteAsync_OnStartedAndOnExitFire. The IProcess event types are
