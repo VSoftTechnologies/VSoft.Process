@@ -1,4 +1,4 @@
-unit VSoft.Process.Tests.PipeTarget;
+﻿unit VSoft.Process.Tests.PipeTarget;
 
 interface
 
@@ -221,6 +221,19 @@ type
     procedure LineTarget_InjectedDefault_ForgottenAfterDone;
     [Test]
     procedure StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
+    // With a target on both streams, the injected default is forgotten only
+    // after both are flushed: the stderr tail still decodes with it.
+    [Test]
+    procedure LineTarget_InjectedDefault_SharedByBothStreams_BothTailsDecoded;
+
+    // One target attached to both streams keeps each stream's partial line,
+    // or split character, apart from the other's.
+    [Test]
+    procedure LineTarget_SharedByBothStreams_KeepsPartialLinesApart;
+    [Test]
+    procedure StringBuilderTarget_SharedByBothStreams_KeepsSplitCharacterApart;
+    [Test]
+    procedure MultiTarget_ForwardsStreamToChildren;
 
     // A ToAll child that raises must not stop delivery to its siblings; it
     // gets no more data this run and its exception is raised from Done.
@@ -1343,6 +1356,60 @@ begin
   end;
 end;
 
+procedure TPipeTargetTests.LineTarget_InjectedDefault_SharedByBothStreams_BothTailsDecoded;
+var
+  target  : IPipeTarget;
+  enc     : IEncodingAwarePipeTarget;
+  streams : IStreamAwarePipeTarget;
+  capture : TLineCapture;
+  payload : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine);
+    Assert.IsTrue(Supports(target, IEncodingAwarePipeTarget, enc));
+    Assert.IsTrue(Supports(target, IStreamAwarePipeTarget, streams));
+    enc.SetDefaultEncoding(TEncoding.Unicode);
+    target.Start;
+    // Neither stream ends with LF, so both tails are decoded by Done.
+    payload := TEncoding.Unicode.GetBytes('out');
+    streams.HandleStreamData(false, payload, Length(payload));
+    payload := TEncoding.Unicode.GetBytes('err');
+    streams.HandleStreamData(true, payload, Length(payload));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('out', capture.Lines[0], false);
+    Assert.AreEqual('err', capture.Lines[1], false, 'the stderr tail must decode with the injected UTF-16');
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.LineTarget_SharedByBothStreams_KeepsPartialLinesApart;
+var
+  target  : IPipeTarget;
+  streams : IStreamAwarePipeTarget;
+  capture : TLineCapture;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8);
+    Assert.IsTrue(Supports(target, IStreamAwarePipeTarget, streams), 'A line target should keep per-stream state');
+    target.Start;
+    streams.HandleStreamData(false, MakeBytes('out-a'), 5);
+    streams.HandleStreamData(true, MakeBytes('err-1'#10), 6);
+    streams.HandleStreamData(false, MakeBytes('out-b'#10), 6);
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('err-1', capture.Lines[0], false, 'stdout''s partial line must not join stderr''s');
+    Assert.AreEqual('out-aout-b', capture.Lines[1], false, 'stdout''s line is completed by stdout only');
+  finally
+    capture.Free;
+  end;
+end;
+
 procedure TPipeTargetTests.StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
 var
   target  : IPipeTarget;
@@ -1370,6 +1437,53 @@ begin
     Assert.AreEqual('ab', sb.ToString, false, 'Run 2 must not reuse run 1''s injected UTF-16');
   finally
     sb.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_SharedByBothStreams_KeepsSplitCharacterApart;
+var
+  target  : IPipeTarget;
+  streams : IStreamAwarePipeTarget;
+  sb      : TStringBuilder;
+begin
+  sb := TStringBuilder.Create;
+  try
+    target := TPipeTarget.ToStringBuilder(sb, TEncoding.UTF8);
+    Assert.IsTrue(Supports(target, IStreamAwarePipeTarget, streams), 'A StringBuilder target should keep per-stream state');
+    target.Start;
+    // U+00E9 is C3 A9 in UTF-8.
+    streams.HandleStreamData(false, TBytes.Create($C3), 1);
+    streams.HandleStreamData(true, TBytes.Create(Ord('x')), 1);
+    streams.HandleStreamData(false, TBytes.Create($A9), 1);
+    target.Done;
+
+    Assert.AreEqual('x' + #$00E9, sb.ToString, false, 'Each stream''s character must be completed by its own bytes');
+  finally
+    sb.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.MultiTarget_ForwardsStreamToChildren;
+var
+  multi   : IPipeTarget;
+  streams : IStreamAwarePipeTarget;
+  capture : TLineCapture;
+begin
+  capture := TLineCapture.Create;
+  try
+    multi := TPipeTarget.ToAll([TPipeTarget.ToLineMethod(capture.OnLine, TEncoding.UTF8)]);
+    Assert.IsTrue(Supports(multi, IStreamAwarePipeTarget, streams), 'ToAll should pass the stream on');
+    multi.Start;
+    streams.HandleStreamData(false, MakeBytes('out-a'), 5);
+    streams.HandleStreamData(true, MakeBytes('err-1'#10), 6);
+    streams.HandleStreamData(false, MakeBytes('out-b'#10), 6);
+    multi.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('err-1', capture.Lines[0], false);
+    Assert.AreEqual('out-aout-b', capture.Lines[1], false);
+  finally
+    capture.Free;
   end;
 end;
 

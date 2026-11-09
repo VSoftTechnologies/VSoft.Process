@@ -420,6 +420,18 @@ type
     procedure Done;
   end;
 
+  // Implemented by pipe targets that keep separate state for stdout and
+  // stderr (line targets, StringBuilder target, ToAll), so one instance
+  // attached to both streams never joins a partial line, or a split
+  // multi-byte character, of one stream to the other. The process calls
+  // HandleStreamData instead of IPipeTarget.HandleData when the target
+  // supports it; HandleData counts as stdout. The same rules apply as for
+  // HandleData.
+  IStreamAwarePipeTarget = interface
+  ['{B608D9F4-7656-49DF-BACE-CDF5CBC98E88}']
+    procedure HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
+  end;
+
   // Implemented by pipe targets that decode bytes into a string (line targets,
   // StringBuilder target). Lets the process inject StartInfo.OutputEncoding as
   // the default when the user did not pass an explicit encoding to the
