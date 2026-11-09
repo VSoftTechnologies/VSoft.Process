@@ -41,7 +41,7 @@ type
     FExecutable : string;
     FArgvZero   : string;
     FWorkingDir : string;
-    FProcessorAffinity : Cardinal;
+    FProcessorAffinity : NativeUInt;
     FPriority : TProcessPriority;
     FTerminateExitCode : Cardinal;
     FTimedOutExitCode : Cardinal;
@@ -63,8 +63,8 @@ type
     procedure SetArgvZero(const value : string);
     function GetWorkingDir : string;
     procedure SetWorkingDir(const value : string);
-    function GetProcessorAffinity: Cardinal;
-    procedure SetProcessorAffinity(value : Cardinal);
+    function GetProcessorAffinity: NativeUInt;
+    procedure SetProcessorAffinity(value : NativeUInt);
     function GetPriority : TProcessPriority;
     procedure SetPriority(value : TProcessPriority);
     function GetTerminateExitCode: Cardinal;
@@ -92,7 +92,7 @@ type
     function WithArgvZero(const value : string) : IStartInfoBuilder;
     function WithHideWindow(value : boolean) : IStartInfoBuilder;
     function WithWorkingDirectory(const value : string) : IStartInfoBuilder;
-    function WithProcessorAffinity(value : Cardinal) : IStartInfoBuilder;
+    function WithProcessorAffinity(value : NativeUInt) : IStartInfoBuilder;
     function WithPriority(value : TProcessPriority) : IStartInfoBuilder;
     function WithTerminateExitCode(value : Cardinal) : IStartInfoBuilder;
     function WithTimedOutExitCode(value : Cardinal) : IStartInfoBuilder;
@@ -189,7 +189,7 @@ begin
   result := FPipeBufferSize;
 end;
 
-function TStartInfoBuilder.GetProcessorAffinity: Cardinal;
+function TStartInfoBuilder.GetProcessorAffinity: NativeUInt;
 begin
   result := FProcessorAffinity;
 end;
@@ -269,7 +269,7 @@ begin
   FPipeBufferSize := value;
 end;
 
-procedure TStartInfoBuilder.SetProcessorAffinity(value: Cardinal);
+procedure TStartInfoBuilder.SetProcessorAffinity(value: NativeUInt);
 begin
   FProcessorAffinity := value;
 end;
@@ -354,7 +354,7 @@ begin
   result := Self;
 end;
 
-function TStartInfoBuilder.WithProcessorAffinity(value: Cardinal): IStartInfoBuilder;
+function TStartInfoBuilder.WithProcessorAffinity(value: NativeUInt): IStartInfoBuilder;
 begin
   FProcessorAffinity := value;
   result := Self;

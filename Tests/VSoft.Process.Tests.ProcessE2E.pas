@@ -224,14 +224,29 @@ begin
   TTestHelpers.ScriptsDir;
 end;
 
+// The exact text print-large writes for count lines.
+function ExpectedLargeOutput(count : integer) : string;
+var
+  sb : TStringBuilder;
+  i : integer;
+begin
+  sb := TStringBuilder.Create;
+  try
+    for i := 1 to count do
+      sb.Append('line ').Append(i).Append(': the quick brown fox jumps over the lazy dog 0123456789').Append(sLineBreak);
+    result := sb.ToString;
+  finally
+    sb.Free;
+  end;
+end;
+
 procedure TProcessE2ETests.StdOut_LargeOutputCaptured;
 const
   cLineCount = 2000;
 var
   proc : IProcess;
   output : TStringBuilder;
-  capturedLines : integer;
-  i : integer;
+  text : string;
 begin
   output := TStringBuilder.Create;
   try
@@ -242,13 +257,12 @@ begin
     proc.Execute(nil);
 
     Assert.AreEqual<Cardinal>(0, proc.ExitCode, 'script should exit 0');
-    // Count the lines we received - both LF and CRLF tolerant.
-    capturedLines := 0;
-    for i := 1 to Length(output.ToString) do
-      if output.ToString[i] = #10 then
-        Inc(capturedLines);
-    Assert.AreEqual(cLineCount, capturedLines,
+    // Taken once: every ToString call builds a new ~144 KB string.
+    text := output.ToString;
+    Assert.AreEqual(cLineCount, TTestHelpers.CountChar(text, #10),
                     'Should have captured all 2000 lines (~144 KB across many pipe reads)');
+    Assert.AreEqual(ExpectedLargeOutput(cLineCount), text, False,
+                    'The captured text differs from what the script printed');
   finally
     output.Free;
   end;
@@ -261,8 +275,7 @@ var
   proc : IProcess;
   outFile : string;
   fileBytes : TBytes;
-  fs : TFileStream;
-  lineCount : integer;
+  expected : TBytes;
   i : integer;
 begin
   outFile := TTestHelpers.TempFileName('vsoft_proc_e2e_', '.txt');
@@ -276,27 +289,19 @@ begin
     Assert.AreEqual<Cardinal>(0, proc.ExitCode);
     Assert.IsTrue(FileExists(outFile), 'output file should exist');
 
-    fs := TFileStream.Create(outFile, fmOpenRead or fmShareDenyWrite);
-    try
-      SetLength(fileBytes, fs.Size);
-      if fs.Size > 0 then
-        fs.ReadBuffer(fileBytes[0], fs.Size);
-    finally
-      fs.Free;
-    end;
+    fileBytes := TTestHelpers.ReadFileBytes(outFile);
 
     // Validate the byte-level content: pre-C1-fix, the file would have been
-    // full of pointer/stack garbage instead of script output. We check both
-    // that the file has reasonable size and that the line markers are present.
+    // full of pointer/stack garbage instead of script output. Compare every
+    // byte with what the script prints (pure ASCII).
     Assert.IsTrue(Length(fileBytes) > 64 * 1024,
                   'output should exceed 64 KB to cover multiple pipe reads');
-
-    lineCount := 0;
-    for i := 0 to High(fileBytes) do
-      if fileBytes[i] = 10 then
-        Inc(lineCount);
-    Assert.AreEqual(cLineCount, lineCount,
-                    'Every script-emitted line must be present in the captured file');
+    expected := TEncoding.ASCII.GetBytes(ExpectedLargeOutput(cLineCount));
+    Assert.AreEqual(Length(expected), Length(fileBytes),
+                    'The file is not the size of the output printed');
+    for i := 0 to High(expected) do
+      if fileBytes[i] <> expected[i] then
+        Assert.Fail(Format('The file differs from the output printed at byte %d', [i]));
   finally
     if FileExists(outFile) then
       DeleteFile(outFile);
@@ -1004,23 +1009,24 @@ var
   hadNonAscii : Boolean;
   i : Integer;
   s : string;
+  fileName : string;
 begin
+  fileName := '';
   collector := TLineCollector.Create;
   try
     proc := TProcess.Create;
-    proc.StartInfo.Executable := TTestHelpers.ShellExePath;
     proc.StartInfo.HideWindow := True;
     // The whole point of this test: set the encoding ON StartInfo and use a
     // line target WITHOUT an explicit encoding. Previously this was a silent
     // no-op (the line target fell back to TEncoding.Default).
     proc.StartInfo.OutputEncoding := TEncoding.UTF8;
     {$IFDEF MSWINDOWS}
-    proc.CommandLine.Add('/c');
-    // chcp 65001 switches the cmd code page to UTF-8 for the rest of the
-    // session, then echo the non-ASCII char. > nul on chcp suppresses the
-    // "Active code page: 65001" line so we can easily find our target line.
-    proc.CommandLine.Add('chcp 65001 > nul && echo caf' + #$00E9);
+    // The child prints the UTF-8 bytes of "caf" + e-acute from a file, so
+    // they do not depend on the console code page (chcp 65001 on the same
+    // cmd /c line does not change the code page of that line's echo).
+    fileName := TTestHelpers.SetupPrintUtf8(proc, 'caf' + #$00E9);
     {$ELSE}
+    proc.StartInfo.Executable := TTestHelpers.ShellExePath;
     // POSIX shells default to UTF-8 in modern locales. printf emits the byte
     // sequence verbatim so the UTF-8 encoding of e-acute (#$C3 #$A9) reaches
     // the pipe and the implicit StartInfo.OutputEncoding decodes it back.
@@ -1051,6 +1057,8 @@ begin
                   'Line target should have decoded e-acute via the injected UTF-8 default');
   finally
     collector.Free;
+    if fileName <> '' then
+      DeleteFile(fileName);
   end;
 end;
 
@@ -1443,8 +1451,7 @@ const
 var
   proc          : IProcess;
   output        : TStringBuilder;
-  capturedLines : Integer;
-  i             : Integer;
+  text          : string;
 begin
   output := TStringBuilder.Create;
   try
@@ -1460,12 +1467,12 @@ begin
     proc.Execute(ICancellationToken(nil));
 
     Assert.AreEqual<Cardinal>(0, proc.ExitCode, 'script should exit 0');
-    capturedLines := 0;
-    for i := 1 to Length(output.ToString) do
-      if output.ToString[i] = #10 then
-        Inc(capturedLines);
-    Assert.AreEqual(cLineCount, capturedLines,
+    // Taken once: every ToString call builds a new ~144 KB string.
+    text := output.ToString;
+    Assert.AreEqual(cLineCount, TTestHelpers.CountChar(text, #10),
                     'Every line must arrive even when PipeBufferSize is 4 KB');
+    Assert.AreEqual(ExpectedLargeOutput(cLineCount), text, False,
+                    'The captured text differs from what the script printed');
   finally
     output.Free;
   end;

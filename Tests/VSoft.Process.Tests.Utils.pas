@@ -88,7 +88,26 @@ type
     [Test]
     procedure CanTerminateTree_RejectsUnsafeIds;
 
+    // Single quotes do not group for CommandLineToArgvW, so a single-quoted
+    // value holding a space, tab or " is passed as one argument instead.
+    [Test]
+    procedure QuoteString_EscapesEmbeddedDoubleQuote;
+
+    // Outer quotes are only stripped when they are one plain wrapping pair;
+    // "a" b "c" used to lose them and reach the child as a" b "c.
+    [Test]
+    procedure DoubleQuoteString_OuterQuotesWithInnerQuotes_Kept;
+
+    [Test]
+    procedure DoubleQuoteString_CallerWrappedValue_StillUnwrapped;
+
     {$IFDEF MSWINDOWS}
+    [Test]
+    procedure QuoteString_GroupsAsOneArgumentForCommandLineToArgvW;
+
+    [Test]
+    procedure DoubleQuoteString_OuterQuotesWithInnerQuotes_ArriveIntact;
+
     // A child we may not terminate must not stop the walk: its own
     // children (our grandchildren) are still killed.
     [Test]
@@ -102,6 +121,7 @@ uses
   {$IFDEF MSWINDOWS}
   System.SysUtils,
   Winapi.Windows,
+  Winapi.ShellAPI,
   VSoft.Process.WinAPI;
   {$ELSE}
   Posix.Unistd;
@@ -150,7 +170,8 @@ end;
 
 procedure TStringUtilsTests.QuoteString_WrapsWhenSpaces;
 begin
-  Assert.AreEqual(''''+'x y'+'''', TStringUtils.QuoteString('x y', True));
+  // Wrapped in double quotes as well, so the child sees 'x y' as one argument.
+  Assert.AreEqual('"''x y''"', TStringUtils.QuoteString('x y', True));
 end;
 
 procedure TStringUtilsTests.DoubleQuoteString_EscapesEmbeddedDoubleQuote;
@@ -225,6 +246,12 @@ begin
   Assert.IsTrue(TStringUtils.IsBatchFile('C:\x\BUILD.BAT'));
   Assert.IsFalse(TStringUtils.IsBatchFile('C:\x\cmd.exe'));
   Assert.IsFalse(TStringUtils.IsBatchFile('C:\x\script.cmdline'));
+  // Windows ignores trailing dots and spaces: these all open build.cmd.
+  Assert.IsTrue(TStringUtils.IsBatchFile('C:\x\build.cmd.'));
+  Assert.IsTrue(TStringUtils.IsBatchFile('C:\x\build.bat '));
+  Assert.IsTrue(TStringUtils.IsBatchFile('build.cmd. .'));
+  Assert.IsFalse(TStringUtils.IsBatchFile('C:\x\build.exe.'));
+  Assert.IsFalse(TStringUtils.IsBatchFile('.'));
 end;
 
 procedure TStringUtilsTests.ContainsCmdMetaChars_DetectsShellSyntax;
@@ -261,7 +288,66 @@ begin
   Assert.IsTrue(TSystemUtils.CanTerminateTree(12345));
 end;
 
+procedure TStringUtilsTests.QuoteString_EscapesEmbeddedDoubleQuote;
+begin
+  Assert.AreEqual('"''a\"b''"', TStringUtils.QuoteString('a"b', False));
+  Assert.AreEqual('"''a\"b''"', TStringUtils.QuoteString('a"b', True));
+  Assert.AreEqual('''foo''', TStringUtils.QuoteString('foo', False));
+  Assert.AreEqual('foo', TStringUtils.QuoteString('foo', True));
+end;
+
+procedure TStringUtilsTests.DoubleQuoteString_OuterQuotesWithInnerQuotes_Kept;
+begin
+  Assert.AreEqual('"\"a\" b \"c\""', TStringUtils.DoubleQuoteString('"a" b "c"', True));
+  Assert.AreEqual('"\"x\"y\""', TStringUtils.DoubleQuoteString('"x"y"', False));
+end;
+
+procedure TStringUtilsTests.DoubleQuoteString_CallerWrappedValue_StillUnwrapped;
+begin
+  Assert.AreEqual('"C:\Program Files\x"', TStringUtils.DoubleQuoteString('"C:\Program Files\x"', True));
+  Assert.AreEqual('"C:\Program Files\x"', TStringUtils.DoubleQuoteString('"C:\Program Files\x"', False));
+end;
+
 {$IFDEF MSWINDOWS}
+// Parses rendered argument text the way a child process does and checks
+// that it arrives as exactly one argument with the expected text.
+procedure AssertOneArgument(const rendered : string; const expected : string);
+var
+  argv : PPWideChar;
+  count : integer;
+  first, second : string;
+begin
+  count := 0;
+  argv := CommandLineToArgvW(PWideChar('prog.exe ' + rendered + ' next'), count);
+  Assert.IsTrue(argv <> nil, 'CommandLineToArgvW failed');
+  try
+    Assert.AreEqual(3, count, 'argument count for [' + rendered + ']');
+    first := PPWideChar(PByte(argv) + SizeOf(PWideChar))^;
+    second := PPWideChar(PByte(argv) + 2 * SizeOf(PWideChar))^;
+    Assert.AreEqual(expected, first, False);
+    Assert.AreEqual('next', second, False);
+  finally
+    LocalFree(HLOCAL(argv));
+  end;
+end;
+
+procedure TStringUtilsTests.QuoteString_GroupsAsOneArgumentForCommandLineToArgvW;
+begin
+  AssertOneArgument(TStringUtils.QuoteString('x y', True), '''x y''');
+  AssertOneArgument(TStringUtils.QuoteString('x y', False), '''x y''');
+  AssertOneArgument(TStringUtils.QuoteString('a'#9'b', True), '''a'#9'b''');
+  AssertOneArgument(TStringUtils.QuoteString('a"b c', True), '''a"b c''');
+  AssertOneArgument(TStringUtils.QuoteString('a"b', False), '''a"b''');
+  AssertOneArgument(TStringUtils.QuoteString('C:\dir with space\', True), '''C:\dir with space\''');
+end;
+
+procedure TStringUtilsTests.DoubleQuoteString_OuterQuotesWithInnerQuotes_ArriveIntact;
+begin
+  AssertOneArgument(TStringUtils.DoubleQuoteString('"a" b "c"', True), '"a" b "c"');
+  AssertOneArgument(TStringUtils.DoubleQuoteString('"a" b "c"', False), '"a" b "c"');
+  AssertOneArgument(TStringUtils.DoubleQuoteString('"x"y"', True), '"x"y"');
+end;
+
 function TestConvertSddl(StringSecurityDescriptor : PWideChar; StringSDRevision : DWORD; var SecurityDescriptor : Pointer;
                          SecurityDescriptorSize : PULONG) : BOOL; stdcall;
   external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
