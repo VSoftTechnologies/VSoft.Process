@@ -72,6 +72,12 @@ type
   private
     FProcessInfo : TProcessInformation;
     FJobHandle : THandle;
+    // KillOnRelease when the last child could not be put in a job (Windows 7
+    // nested jobs, Run-As children): a handle to the child, which keeps its
+    // process id from being reused, and that id. CloseJobObject kills the
+    // child's tree where closing the job would have killed the job.
+    FReleaseKillProcess : THandle;
+    FReleaseKillProcessId : Cardinal;
 
     //STDIO
     FStdOutIO : TIOInfo;
@@ -101,6 +107,7 @@ type
     function CreateJobObject: Boolean;
     procedure ConfigureJobObject;
     procedure CloseJobObject;
+    procedure KeepForReleaseKill;
   protected
     procedure DeliverOutput(isStdErr : boolean; const buffer : TBytes; count : NativeUInt);
 
@@ -149,6 +156,9 @@ function CreateJobObjectW(lpJobAttributes: PSecurityAttributes; lpName: LPCWSTR)
 function AssignProcessToJobObject(hJob: THandle; hProcess: THandle): BOOL; stdcall; external kernel32 name 'AssignProcessToJobObject';
 function TerminateJobObject(hJob: THandle; uExitCode: UINT): BOOL; stdcall; external kernel32 name 'TerminateJobObject';
 function SetInformationJobObject(hJob: THandle; JobObjectInfoClass: Integer; lpJobObjectInfo: Pointer; cbJobObjectInfoLength: DWORD): BOOL; stdcall; external kernel32 name 'SetInformationJobObject';
+function QueryInformationJobObject(hJob: THandle; JobObjectInfoClass: Integer; lpJobObjectInfo: Pointer; cbJobObjectInfoLength: DWORD;
+                                   lpReturnLength: PDWORD): BOOL; stdcall; external kernel32 name 'QueryInformationJobObject';
+function IsProcessInJob(processHandle: THandle; jobHandle: THandle; out result: BOOL): BOOL; stdcall; external kernel32 name 'IsProcessInJob';
 
 const
   JobObjectExtendedLimitInformation = 9;
@@ -466,6 +476,21 @@ begin
   else
     result := '';
   result := result + '"' + value + '"';
+end;
+
+// True when this process is in a job that lets its children break away
+// (JOB_OBJECT_LIMIT_BREAKAWAY_OK), so CREATE_BREAKAWAY_FROM_JOB will work.
+function HostJobAllowsBreakaway : boolean;
+var
+  inJob : BOOL;
+  info : JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+begin
+  if (not IsProcessInJob(GetCurrentProcess, 0, inJob)) or (not inJob) then
+    Exit(false);
+  ZeroMemory(@info, SizeOf(info));
+  // A nil job handle queries the job of the calling process.
+  result := QueryInformationJobObject(0, JobObjectExtendedLimitInformation, @info, SizeOf(info), nil) and
+            ((info.BasicLimitInformation.LimitFlags and JOB_OBJECT_LIMIT_BREAKAWAY_OK) <> 0);
 end;
 
 { TWindowsProcess }
@@ -932,6 +957,14 @@ begin
     pEnvironment := GetEnvironmentBlock;
     // Suspended so the job is assigned before the child can create children.
     creationFlags := CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT or CREATE_SUSPENDED or PriorityClass(StartInfo.Priority);
+    // Before Windows 8 a process already in a job cannot be put in a second
+    // one, so our job would fail; leave the host's job when it allows that.
+    // Only KillOnRelease needs a job of its own to kill the child; KillOnTerminate
+    // keeps dying with the host's job as before.
+    // Not for CreateProcessWithLogonW, which rejects the flag.
+    if (StartInfo.JobMode = TProcessJobMode.KillOnRelease) and (Credentials.UserName = '') and (not TOSVersion.Check(6, 2)) and
+       HostJobAllowsBreakaway then
+      creationFlags := creationFlags or VPROCESS_CREATE_BREAKAWAY_FROM_JOB;
 
     GSpawnLock.Enter;
     try
@@ -1000,16 +1033,28 @@ begin
 
     // Create and configure job object for process tree management. If the
     // child can't be assigned (Win7 nested jobs, Run-As children) the job is
-    // dropped so termination falls back to the process tree.
+    // dropped so termination falls back to the process tree, and so does
+    // KillOnRelease.
     if (StartInfo.JobMode <> TProcessJobMode.NoJob) and CreateJobObject then
     begin
       ConfigureJobObject;
       if not AssignProcessToJobObject(FJobHandle, FProcessInfo.hProcess) then
       begin
-        LogError('Failed to assign process to job object (' + SysErrorMessage(Winapi.Windows.GetLastError) + '); terminate will use the process tree instead');
+        error := Winapi.Windows.GetLastError;
         CloseJobObject;
+        if StartInfo.JobMode = TProcessJobMode.KillOnRelease then
+        begin
+          KeepForReleaseKill;
+          LogError('Failed to assign process to job object (' + SysErrorMessage(error) + '); terminate will use the process tree ' +
+                   'instead, and KillOnRelease will kill the process tree when the IProcess is released or run again');
+        end
+        else
+          LogError('Failed to assign process to job object (' + SysErrorMessage(error) + '); terminate will use the process tree instead');
       end;
-    end;
+    end
+    else if StartInfo.JobMode = TProcessJobMode.KillOnRelease then
+      // No job at all: the fallback still kills the tree at release.
+      KeepForReleaseKill;
 
     if StartInfo.ProcessorAffinity <> 0 then
     begin
@@ -1123,7 +1168,7 @@ begin
   if FJobHandle <> 0 then
     TerminateJobObject(FJobHandle, exitCode)
   else
-    TSystemUtils.TerminateProcessTree(FProcessInfo.dwProcessId, exitCode);
+    TSystemUtils.TerminateProcessTree(FProcessInfo.dwProcessId, exitCode, FProcessInfo.hProcess);
   // The child itself, whatever happened above.
   TerminateProcess(FProcessInfo.hProcess, exitCode);
   WaitForSingleObject(FProcessInfo.hProcess, 5000);
@@ -1489,6 +1534,26 @@ end;
 procedure TWindowsProcess.CloseJobObject;
 begin
   SafeCloseHandle(FJobHandle);
+  if FReleaseKillProcess <> 0 then
+  begin
+    // KillOnRelease without a job: what the job would have killed is the
+    // child's tree. The handle we hold keeps its id from being reused.
+    TSystemUtils.TerminateProcessTree(FReleaseKillProcessId, StartInfo.TerminateExitCode, FReleaseKillProcess);
+    SafeCloseHandle(FReleaseKillProcess);
+    FReleaseKillProcessId := 0;
+  end;
+end;
+
+procedure TWindowsProcess.KeepForReleaseKill;
+begin
+  if DuplicateHandle(GetCurrentProcess, FProcessInfo.hProcess, GetCurrentProcess, @FReleaseKillProcess, 0, False,
+                     DUPLICATE_SAME_ACCESS) then
+    FReleaseKillProcessId := FProcessInfo.dwProcessId
+  else
+  begin
+    FReleaseKillProcess := 0;
+    LogError('KillOnRelease cannot fall back to the process tree: ' + SysErrorMessage(Winapi.Windows.GetLastError));
+  end;
 end;
 
 initialization
