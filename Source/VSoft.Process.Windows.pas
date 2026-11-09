@@ -128,6 +128,7 @@ implementation
 
 uses
   System.Diagnostics,
+  VSoft.Process.Credentials,
   VSoft.Process.Utils;
 
 //declaration in WinApi.Windows is incorrect and only in 10.2+
@@ -261,13 +262,14 @@ function QueueAsyncPipeRead(info : PIOInfo) : boolean;
 var
   error : DWORD;
   attempt : integer;
+  retry : boolean;
 begin
-  result := false;
-  EnterCriticalSection(info.Lock);
-  try
-    attempt := 0;
-    while not info.Closing do
-    begin
+  attempt := 0;
+  repeat
+    EnterCriticalSection(info.Lock);
+    try
+      if info.Closing then
+        Exit(false);
       FillChar(info.Overlapped, SizeOf(info.Overlapped), 0);
       info.ReadCounted := info.CountReads;
       StartThreadpoolIo(info.IO);
@@ -279,20 +281,21 @@ begin
       if error = ERROR_IO_PENDING then
         Exit(true);
       CancelThreadpoolIo(info.IO);
-      if ((error = ERROR_NOT_ENOUGH_MEMORY) or (error = ERROR_INVALID_USER_BUFFER) or (error = ERROR_NOT_ENOUGH_QUOTA)) and
-         (attempt < cMaxReadRetries) then
-      begin
-        Inc(attempt);
-        Sleep(5);
-        continue;
-      end;
-      if (error <> ERROR_BROKEN_PIPE) and (error <> ERROR_HANDLE_EOF) and (error <> ERROR_OPERATION_ABORTED) then
-        info.Owner.LogError('Pipe read failed: ' + SysErrorMessage(error));
-      Exit(false);
+      retry := ((error = ERROR_NOT_ENOUGH_MEMORY) or (error = ERROR_INVALID_USER_BUFFER) or (error = ERROR_NOT_ENOUGH_QUOTA)) and
+               (attempt < cMaxReadRetries);
+    finally
+      LeaveCriticalSection(info.Lock);
     end;
-  finally
-    LeaveCriticalSection(info.Lock);
-  end;
+    // Outside the lock, so CloseIO is not held up by the back-off.
+    if retry then
+    begin
+      Inc(attempt);
+      Sleep(5);
+    end;
+  until not retry;
+  if (error <> ERROR_BROKEN_PIPE) and (error <> ERROR_HANDLE_EOF) and (error <> ERROR_OPERATION_ABORTED) then
+    info.Owner.LogError('Pipe read failed: ' + SysErrorMessage(error));
+  result := false;
 end;
 
 //called when the overlapped read completes
@@ -300,6 +303,7 @@ procedure IoCompletionCallback(instance : PTP_CALLBACK_INSTANCE; context : Point
 var
   info : PIOInfo;
   readMore : boolean;
+  streamName : string;
 begin
   info := PIOInfo(context);
   readMore := false;
@@ -318,8 +322,25 @@ begin
       info.Owner.LogError('Pipe read failed: ' + SysErrorMessage(ioResult));
   except
     // Target exceptions are already isolated by DeliverOutput; anything else
-    // stops this stream rather than taking down a threadpool thread.
-    readMore := false;
+    // stops this stream rather than taking down a threadpool thread, and is
+    // logged so the lost output is explained.
+    on E : Exception do
+    begin
+      readMore := false;
+      if info.IsStdErr then
+        streamName := 'stderr'
+      else
+        streamName := 'stdout';
+      try
+        info.Owner.LogError(streamName + ' reading stopped: ' + E.ClassName + ' - ' + E.Message);
+      except
+        // Logging itself failed (out of memory): the stream still stops.
+        on Exception do
+          readMore := false;
+      end;
+    end;
+    else
+      readMore := false;
   end;
   if not readMore then
     SetEvent(info.DoneEvent);
@@ -630,10 +651,14 @@ begin
       LogError(FStdInWriter.Error);
   end
   else
+  begin
     // Blocked in the source's GetData, which can't be cancelled. The writer
-    // holds everything it uses and finishes whenever GetData returns.
+    // holds everything it uses and finishes whenever GetData returns; it is
+    // detached so it no longer keeps this process (and its job) alive.
+    FDetachedOwnerRef := FStdInWriter.Detach;
     LogError('The stdin pipe source did not return from GetData within ' + IntToStr(cCancelWaitMS) +
              'ms of being stopped; its writer thread was left to finish on its own');
+  end;
   CloseHandle(FStdInWriteThread);
   FStdInWriteThread := 0;
   FStdInWriterThreadId := 0;
@@ -689,24 +714,33 @@ var
   domain : string;
   password : string;
   logonFlags : DWORD;
+  error : DWORD;
 begin
   userName := Credentials.UserName;
   domain := Credentials.Domain;
   // A nil domain requires a UPN (user@domain); '.' is the local account database.
   if (domain = '') and (Pos('@', userName) = 0) then
     domain := '.';
-  password := Credentials.Password;
   logonFlags := 0;
   if Credentials.LoadUserProfile then
     logonFlags := logonFlags or LOGON_WITH_PROFILE;
   if Credentials.NetCredentialsOnly then
     logonFlags := logonFlags or LOGON_NETCREDENTIALS_ONLY;
-  if domain = '' then
-    result := CreateProcessWithLogonW(PChar(userName), nil, PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
-                                      creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo)
-  else
-    result := CreateProcessWithLogonW(PChar(userName), PChar(domain), PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
-                                      creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo);
+  // A copy of our own (the builder hands one out), wiped as soon as the
+  // logon has used it; the Windows error is kept across the wipe.
+  password := Credentials.Password;
+  try
+    if domain = '' then
+      result := CreateProcessWithLogonW(PChar(userName), nil, PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
+                                        creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo)
+    else
+      result := CreateProcessWithLogonW(PChar(userName), PChar(domain), PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
+                                        creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo);
+    error := GetLastError;
+  finally
+    ScrubString(password);
+  end;
+  SetLastError(error);
 end;
 
 function IsBareProgramName(const exe : string) : boolean;
@@ -759,7 +793,10 @@ begin
     candidate := IncludeTrailingPathDelimiter(dir) + exe;
     if FileExists(candidate) then
     begin
-      resolved := candidate;
+      // Windows ignores trailing dots and spaces in a name ('run.cmd.' opens
+      // run.cmd). GetFullPathName removes them as CreateProcess will, so the
+      // file is judged (batch file or not) by the name it is opened by.
+      resolved := ExpandFileName(candidate);
       Exit(true);
     end;
   end;
@@ -783,6 +820,13 @@ begin
   end;
   if TStringUtils.IsBatchFile(FResolvedExecutable) then
   begin
+    // The path is part of the command line cmd.exe parses, and %VAR% (and
+    // !VAR! with delayed expansion) is expanded even inside quotes.
+    if TStringUtils.ContainsCmdUnsafeChars(FResolvedExecutable) then
+    begin
+      LogError('The batch file path cannot be passed safely to cmd.exe: it contains % or ! (' + FResolvedExecutable + ')');
+      result := false;
+    end;
     for i := 0 to CommandLine.Count - 1 do
     begin
       arg := CommandLine.Arguments[i];
@@ -829,6 +873,7 @@ var
   created : boolean;
   threadId : TThreadID;
   writer : IStdInWriter;
+  pipeEnd : THandle;
 
   procedure AddInheritable(handle : THandle);
   var
@@ -837,7 +882,9 @@ var
     for i := 0 to inheritCount - 1 do
       if inheritList[i] = handle then
         Exit;
-    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    // A std handle the child cannot inherit would be invalid in the child.
+    if not SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) then
+      RaiseLastOSError;
     inheritList[inheritCount] := handle;
     Inc(inheritCount);
   end;
@@ -941,9 +988,11 @@ begin
         GetMem(attrList, attrSize);
         if not VProcInitializeProcThreadAttributeList(attrList, 1, 0, attrSize) then
         begin
+          // Read before FreeMem, which may change it.
+          error := Winapi.Windows.GetLastError;
           FreeMem(attrList);
           attrList := nil;
-          RaiseLastOSError;
+          RaiseLastOSError(error);
         end;
         if not VProcUpdateProcThreadAttribute(attrList, 0, VPROC_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, @inheritList[0],
                                               NativeUInt(inheritCount) * SizeOf(THandle), nil, nil) then
@@ -1013,20 +1062,27 @@ begin
         LogError('Failed to set processor affinity: ' + SysErrorMessage(Winapi.Windows.GetLastError));
     end;
 
+    // Each read end is handed over (and our copy zeroed) before InitIOInfo
+    // runs: InitIOInfo stores it in the IO info first, so if it then fails
+    // the handle is closed once, by CloseIO, not again as outRead / errRead.
+    // Its first read is queued at once, so from then on the done event is
+    // set or a read is pending.
     if redirectOut then
     begin
-      InitIOInfo(@FStdOutIO, outRead, false);
+      pipeEnd := outRead;
       outRead := 0;
+      InitIOInfo(@FStdOutIO, pipeEnd, false);
+      if not QueueAsyncPipeRead(@FStdOutIO) then
+        SetEvent(FStdOutIO.DoneEvent);
     end;
     if redirectErr then
     begin
-      InitIOInfo(@FStdErrIO, errRead, true);
+      pipeEnd := errRead;
       errRead := 0;
+      InitIOInfo(@FStdErrIO, pipeEnd, true);
+      if not QueueAsyncPipeRead(@FStdErrIO) then
+        SetEvent(FStdErrIO.DoneEvent);
     end;
-    if redirectOut and (not QueueAsyncPipeRead(@FStdOutIO)) then
-      SetEvent(FStdOutIO.DoneEvent);
-    if redirectErr and (not QueueAsyncPipeRead(@FStdErrIO)) then
-      SetEvent(FStdErrIO.DoneEvent);
     if redirectIn then
     begin
       writer := TWindowsStdInWriter.Create(Self, FRunStdIn, FStdInWriteHandle);
@@ -1045,7 +1101,20 @@ begin
       writer.SetThreadId(threadId);
       FStdInWriterThreadId := threadId;
       FStdInWriter := writer;
-      ResumeThread(FStdInWriteThread);
+      if ResumeThread(FStdInWriteThread) = $FFFFFFFF then
+      begin
+        error := Winapi.Windows.GetLastError;
+        // The thread never ran, so it never took over its reference and
+        // nothing waits on it: end it and drop the reference here.
+        TerminateThread(FStdInWriteThread, 0);
+        WaitForSingleObject(FStdInWriteThread, cCancelWaitMS);
+        CloseHandle(FStdInWriteThread);
+        FStdInWriteThread := 0;
+        FStdInWriterThreadId := 0;
+        FStdInWriter := nil;
+        writer._Release;
+        RaiseLastOSError(error);
+      end;
     end;
 
     if ResumeThread(FProcessInfo.hThread) = $FFFFFFFF then
@@ -1074,9 +1143,19 @@ begin
 end;
 
 function TWindowsProcess.ReadExitCode : Cardinal;
+var
+  error : DWORD;
 begin
+  // The Windows error code is not reported as the exit code: a caller could
+  // not tell the two apart.
   if not GetExitCodeProcess(FProcessInfo.hProcess, result) then
-    result := Winapi.Windows.GetLastError;
+  begin
+    error := Winapi.Windows.GetLastError;
+    FLastError := error;
+    LogError('Could not read the exit code (' + SysErrorMessage(error) + '); reporting TerminateExitCode ' +
+             IntToStr(StartInfo.TerminateExitCode) + ' instead');
+    result := StartInfo.TerminateExitCode;
+  end;
 end;
 
 function TWindowsProcess.KillChild(exitCode : Cardinal) : boolean;
@@ -1254,6 +1333,7 @@ var
   killed : boolean;
   abandoned : boolean;
   resolved : boolean;
+  error : DWORD;
 begin
   killed := false;
   abandoned := false;
@@ -1323,7 +1403,9 @@ begin
         end;
     else // WAIT_FAILED etc - we can no longer monitor the child, so stop it.
       begin
-        LogError('Unexpected wait result ' + IntToStr(waitRes) + ': ' + SysErrorMessage(Winapi.Windows.GetLastError));
+        // Read before IntToStr, which allocates and may change it.
+        error := Winapi.Windows.GetLastError;
+        LogError('Unexpected wait result ' + IntToStr(waitRes) + ': ' + SysErrorMessage(error));
         killed := KillChild(StartInfo.TerminateExitCode);
         outcome.Status := TProcessStatus.Terminated;
         outcome.ExitCode := StartInfo.TerminateExitCode;
