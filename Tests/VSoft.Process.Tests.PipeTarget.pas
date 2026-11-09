@@ -215,6 +215,17 @@ type
     [Test]
     procedure LineTarget_Utf16LE_OneByteAtATime;
 
+    // An injected OutputEncoding belongs to one run: a later run with no
+    // injection must not reuse it (it may have been freed since).
+    [Test]
+    procedure LineTarget_InjectedDefault_ForgottenAfterDone;
+    [Test]
+    procedure StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
+    // With a target on both streams, the injected default is forgotten only
+    // after both are flushed: the stderr tail still decodes with it.
+    [Test]
+    procedure LineTarget_InjectedDefault_SharedByBothStreams_BothTailsDecoded;
+
     // One target attached to both streams keeps each stream's partial line,
     // or split character, apart from the other's.
     [Test]
@@ -1314,6 +1325,67 @@ begin
   Assert.AreEqual(cUtf16Lines, FeedLines(TEncoding.Unicode, chunks));
 end;
 
+procedure TPipeTargetTests.LineTarget_InjectedDefault_ForgottenAfterDone;
+var
+  target  : IPipeTarget;
+  enc     : IEncodingAwarePipeTarget;
+  capture : TLineCapture;
+  payload : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine);
+    Assert.IsTrue(Supports(target, IEncodingAwarePipeTarget, enc));
+    // Run 1: the process injects UTF-16.
+    enc.SetDefaultEncoding(TEncoding.Unicode);
+    target.Start;
+    payload := TEncoding.Unicode.GetBytes('one'#10);
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    // Run 2: no injection, so TEncoding.Default applies.
+    target.Start;
+    payload := TBytes.Create(Ord('a'), Ord('b'), 10);
+    target.HandleData(payload, Length(payload));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('one', capture.Lines[0], false);
+    Assert.AreEqual('ab', capture.Lines[1], false, 'Run 2 must not reuse run 1''s injected UTF-16');
+  finally
+    capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.LineTarget_InjectedDefault_SharedByBothStreams_BothTailsDecoded;
+var
+  target  : IPipeTarget;
+  enc     : IEncodingAwarePipeTarget;
+  streams : IStreamAwarePipeTarget;
+  capture : TLineCapture;
+  payload : TBytes;
+begin
+  capture := TLineCapture.Create;
+  try
+    target := TPipeTarget.ToLineMethod(capture.OnLine);
+    Assert.IsTrue(Supports(target, IEncodingAwarePipeTarget, enc));
+    Assert.IsTrue(Supports(target, IStreamAwarePipeTarget, streams));
+    enc.SetDefaultEncoding(TEncoding.Unicode);
+    target.Start;
+    // Neither stream ends with LF, so both tails are decoded by Done.
+    payload := TEncoding.Unicode.GetBytes('out');
+    streams.HandleStreamData(false, payload, Length(payload));
+    payload := TEncoding.Unicode.GetBytes('err');
+    streams.HandleStreamData(true, payload, Length(payload));
+    target.Done;
+
+    Assert.AreEqual(2, capture.Lines.Count);
+    Assert.AreEqual('out', capture.Lines[0], false);
+    Assert.AreEqual('err', capture.Lines[1], false, 'the stderr tail must decode with the injected UTF-16');
+  finally
+    capture.Free;
+  end;
+end;
+
 procedure TPipeTargetTests.LineTarget_SharedByBothStreams_KeepsPartialLinesApart;
 var
   target  : IPipeTarget;
@@ -1335,6 +1407,36 @@ begin
     Assert.AreEqual('out-aout-b', capture.Lines[1], false, 'stdout''s line is completed by stdout only');
   finally
     capture.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_InjectedDefault_ForgottenAfterDone;
+var
+  target  : IPipeTarget;
+  enc     : IEncodingAwarePipeTarget;
+  sb      : TStringBuilder;
+  payload : TBytes;
+begin
+  sb := TStringBuilder.Create;
+  try
+    target := TPipeTarget.ToStringBuilder(sb);
+    Assert.IsTrue(Supports(target, IEncodingAwarePipeTarget, enc));
+    // Run 1: the process injects UTF-16.
+    enc.SetDefaultEncoding(TEncoding.Unicode);
+    target.Start;
+    payload := TEncoding.Unicode.GetBytes('one');
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    Assert.AreEqual('one', sb.ToString, false);
+
+    // Run 2: no injection, so TEncoding.Default applies.
+    target.Start;
+    payload := TBytes.Create(Ord('a'), Ord('b'));
+    target.HandleData(payload, Length(payload));
+    target.Done;
+    Assert.AreEqual('ab', sb.ToString, false, 'Run 2 must not reuse run 1''s injected UTF-16');
+  finally
+    sb.Free;
   end;
 end;
 

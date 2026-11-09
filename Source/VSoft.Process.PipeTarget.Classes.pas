@@ -592,6 +592,10 @@ begin
       SetLength(FPendingBytes[isStdErr], 0);
     end;
   end;
+  // An injected default belongs to this run only: the next run may inject a
+  // different one, or none, and this one may since have been freed.
+  if not FEncodingExplicit then
+    FEncoding := nil;
 end;
 
 procedure TStringBuilderPipeTarget.HandleData(const data: TBytes; length: NativeUInt);
@@ -799,6 +803,11 @@ procedure TLinePipeTargetBase.Done;
 begin
   FlushStream(FStreams[false]);
   FlushStream(FStreams[true]);
+  // An injected default belongs to this run only: the next run may inject a
+  // different one, or none, and this one may since have been freed.  After
+  // both streams, so the stderr tail still decodes with it.
+  if not FEncodingExplicit then
+    FEncoding := nil;
 end;
 
 function TLinePipeTargetBase.LastLineFeedEnd(const bytes : TBytes; fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
