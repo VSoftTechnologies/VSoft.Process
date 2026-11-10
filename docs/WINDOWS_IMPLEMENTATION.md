@@ -61,7 +61,7 @@ Each run with redirected stdin gets a `TWindowsStdInWriter` (`TStdInWriter` in `
 
 ## Detached launches
 
-`DoExecuteDetached` uses `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`. When the host's job doesn't allow breakaway, CreateProcess fails with `ERROR_ACCESS_DENIED` and the launch is retried inside the job. With credentials it uses `CreateProcessWithLogonW` with the flags that API accepts. A detached launch ignores the pipes, `JobMode` and the timeout, creates no job and inherits no handles. `ProcessorAffinity` is applied, then the process and thread handles are closed and only the process and thread ids are kept.
+`DoExecuteDetached` uses `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`, or `CREATE_NEW_CONSOLE` in place of `DETACHED_PROCESS` with `StartInfo.DetachedNewConsole` (the console is shown or hidden by `wShowWindow`, from `HideWindow`). When the host's job doesn't allow breakaway, CreateProcess fails with `ERROR_ACCESS_DENIED` and the launch is retried inside the job. With credentials it uses `CreateProcessWithLogonW` with the flags that API accepts. A detached launch ignores the pipes, `JobMode` and the timeout, creates no job and inherits no handles. `ProcessorAffinity` is applied, then the process and thread handles are closed and only the process and thread ids are kept.
 
 ## Credentials
 

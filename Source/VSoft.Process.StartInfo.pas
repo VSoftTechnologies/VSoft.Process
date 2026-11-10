@@ -52,6 +52,7 @@ type
     FPipeDrainTimeoutMS : Cardinal;
     FJobMode : TProcessJobMode;
     FTerminateOnTimeout : boolean;
+    FDetachedNewConsole : boolean;
   protected
     function GetHideWindow : boolean;
     procedure SetHideWindow(value : boolean);
@@ -85,6 +86,8 @@ type
     procedure SetJobMode(value : TProcessJobMode);
     function GetTerminateOnTimeout : boolean;
     procedure SetTerminateOnTimeout(value : boolean);
+    function GetDetachedNewConsole : boolean;
+    procedure SetDetachedNewConsole(value : boolean);
 
 
     function WithTimeout(timeoutMs : Cardinal) : IStartInfoBuilder;
@@ -103,6 +106,7 @@ type
     function WithPipeDrainTimeout(value : Cardinal) : IStartInfoBuilder;
     function WithJobMode(value : TProcessJobMode) : IStartInfoBuilder;
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
+    function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
 
 
     function Clone : IStartInfoBuilder;
@@ -135,6 +139,7 @@ begin
   FPipeDrainTimeoutMS := DEFAULT_PIPE_DRAIN_TIMEOUT_MS;
   FJobMode := TProcessJobMode.KillOnRelease;
   FTerminateOnTimeout := true;
+  FDetachedNewConsole := false;
 end;
 
 constructor TStartInfoBuilder.CreateClone(const source: TStartInfoBuilder);
@@ -156,6 +161,7 @@ begin
   FJobMode := source.FJobMode;
   FTerminateOnTimeout := source.FTerminateOnTimeout;
   FPipeDrainTimeoutMS := source.FPipeDrainTimeoutMS;
+  FDetachedNewConsole := source.FDetachedNewConsole;
 end;
 
 destructor TStartInfoBuilder.Destroy;
@@ -217,6 +223,11 @@ end;
 function TStartInfoBuilder.GetTerminateOnTimeout: boolean;
 begin
   result := FTerminateOnTimeout;
+end;
+
+function TStartInfoBuilder.GetDetachedNewConsole : boolean;
+begin
+  result := FDetachedNewConsole;
 end;
 
 function TStartInfoBuilder.GetTimedOutExitCode: Cardinal;
@@ -297,6 +308,11 @@ end;
 procedure TStartInfoBuilder.SetTerminateOnTimeout(value: boolean);
 begin
   FTerminateOnTimeout := value;
+end;
+
+procedure TStartInfoBuilder.SetDetachedNewConsole(value : boolean);
+begin
+  FDetachedNewConsole := value;
 end;
 
 procedure TStartInfoBuilder.SetTimedOutExitCode(value: Cardinal);
@@ -387,6 +403,12 @@ end;
 function TStartInfoBuilder.WithTerminateOnTimeout(value: boolean): IStartInfoBuilder;
 begin
   FTerminateOnTimeout := value;
+  result := Self;
+end;
+
+function TStartInfoBuilder.WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
+begin
+  FDetachedNewConsole := value;
   result := Self;
 end;
 

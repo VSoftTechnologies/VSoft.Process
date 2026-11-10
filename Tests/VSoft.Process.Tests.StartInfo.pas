@@ -37,6 +37,9 @@ type
     [Test]
     procedure JobModeAndTerminateOnTimeout_DefaultsFluentAndClone;
 
+    [Test]
+    procedure DetachedNewConsole_DefaultsFluentAndClone;
+
     // SetProcessAffinityMask takes a DWORD_PTR, so on Win64 a mask can name
     // CPUs 32-63. The property must not truncate it.
     [Test]
@@ -181,6 +184,21 @@ begin
   src.JobMode := TProcessJobMode.NoJob;
   Assert.AreEqual(TProcessJobMode.NoJob, src.JobMode);
   Assert.AreEqual(TProcessJobMode.KillOnTerminate, dst.JobMode, 'the clone is independent');
+end;
+
+procedure TStartInfoTests.DetachedNewConsole_DefaultsFluentAndClone;
+var
+  src, dst, ret : IStartInfoBuilder;
+begin
+  src := MakeBuilder;
+  Assert.IsFalse(src.DetachedNewConsole, 'off by default');
+  ret := src.WithDetachedNewConsole(true);
+  Assert.AreSame(src, ret);
+  Assert.IsTrue(src.DetachedNewConsole);
+  dst := src.Clone;
+  Assert.IsTrue(dst.DetachedNewConsole);
+  src.DetachedNewConsole := false;
+  Assert.IsTrue(dst.DetachedNewConsole, 'the clone is independent');
 end;
 
 procedure TStartInfoTests.ProcessorAffinity_HoldsHighCpuBits;

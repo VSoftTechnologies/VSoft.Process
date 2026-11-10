@@ -767,6 +767,17 @@ proc.StartInfo.Executable := 'opener.exe';
 proc.ExecuteDetached;
 ```
 
+On Windows a detached child gets no console at all by default (`DETACHED_PROCESS`), so a console program has nowhere to write, and a window you asked for with `HideWindow = False` never appears. Set `StartInfo.DetachedNewConsole` (`WithDetachedNewConsole(True)`) to give it a console of its own instead (`CREATE_NEW_CONSOLE`), shown or hidden according to `HideWindow`:
+
+```delphi
+proc.StartInfo
+  .WithHideWindow(False)          // show the program's console window
+  .WithDetachedNewConsole(True);
+proc.ExecuteDetached;
+```
+
+The option only affects `ExecuteDetached` (`Execute` / `ExecuteAsync`, and launches with credentials, always give the child a console of its own) and is ignored on POSIX.
+
 ## Platform Support
 
 | Platform | Async I/O | Process tree termination | Credentials | Notes |
@@ -776,7 +787,7 @@ proc.ExecuteDetached;
 | Linux    | `epoll` (+ `pidfd` on kernel 5.3+) | `SIGTERM` to the child's process group, `SIGKILL` 500 ms later | n/a | UTF-8 environment + argv, `signal(SIGPIPE, SIG_IGN)` set for the whole host process at unit init (children get the default back) |
 | macOS    | `kqueue` (+ `EVFILT_PROC`) | `SIGTERM` to the child's process group, `SIGKILL` 500 ms later | n/a | UTF-8 environment + argv, `signal(SIGPIPE, SIG_IGN)` as on Linux |
 
-`ExecuteDetached` uses a double-fork on POSIX so the grandchild reparents to init (with `/dev/null` as its stdio), and `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB` on Windows so the detached child survives the host's Job Object (CI runners etc.). When the host's job does not allow breakaway, the child is started inside it instead. On POSIX, child-init failures (chdir / dup2 / exec) come back through a self-pipe, so `ExecuteDetached` still returns `False` when the program can't be started; on Windows `CreateProcess` reports them directly.
+`ExecuteDetached` uses a double-fork on POSIX so the grandchild reparents to init (with `/dev/null` as its stdio), and `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB` on Windows (`CREATE_NEW_CONSOLE` instead of `DETACHED_PROCESS` with `DetachedNewConsole`) so the detached child survives the host's Job Object (CI runners etc.). When the host's job does not allow breakaway, the child is started inside it instead. On POSIX, child-init failures (chdir / dup2 / exec) come back through a self-pipe, so `ExecuteDetached` still returns `False` when the program can't be started; on Windows `CreateProcess` reports them directly.
 
 On Windows the child always gets its own console (`CREATE_NEW_CONSOLE`), hidden unless `HideWindow` is `False`, so it never shares the host's console: output from a stream you don't redirect goes to that console. When you redirect some streams but not others, the others are connected to `NUL` (attach only a stdout target and the child's stderr is discarded and its stdin is at end of file). On POSIX, streams you don't redirect are inherited from the host.
 
@@ -790,6 +801,7 @@ Background processes the child leaves behind are not killed on a normal exit. On
 |----------|---------|-------|-------|
 | `Executable`, `WorkingDirectory`, `TimeoutInMSec` | yes | yes | yes |
 | `HideWindow` (default `True`) | shows or hides the child's console window | **ignored** | **ignored** |
+| `DetachedNewConsole` (default `False`) | `ExecuteDetached` gives the child a console of its own (`CREATE_NEW_CONSOLE`) instead of none (`DETACHED_PROCESS`) | **ignored** | **ignored** |
 | Bare `Executable` name | this process's `PATH` (never the child's), `.exe` appended when there is no extension, no `PATHEXT`, never the current directory | this process's `PATH` (never the child's; `/usr/bin:/bin` when it has none), file must be executable | same as Linux |
 | `TerminateOnTimeout` (default `True`) | `False`: child left running, our pipe ends and handles closed | `False`: no signal, pipe fds closed, child reaped by a background thread when it exits | same as Linux |
 | `JobMode` (default `KillOnRelease`) | job object flags / no job (see [Job mode](#job-mode)) | no job objects: leftovers always survive, stop signals go to the process group (only to the child when it inherits a terminal stdin) | same as Linux |
@@ -826,7 +838,7 @@ To run the tests, open the test dproj in the IDE and build/run. The console runn
 - State: `Status`, `ExitCode`, `TimedOut`, `ProcessId`, `ResolvedExecutable`, `StartMode`, `LastError` (the OS error code when the OS refused to start the child, otherwise 0; see [Execution modes](#execution-modes)), `Errors`, `CompletionHandle` (Windows only; see [Async execution and status](#6-async-execution-and-status)).
 - Events: `OnStarted`, `OnExit`.
 
-**`IStartInfoBuilder`** - `Executable`, `ArgvZero` (POSIX), `WorkingDirectory`, `HideWindow` (default `True`, Windows), `TimeoutInMSec` (default 0 = no timeout), `TimedOutExitCode`, `TerminateExitCode`, `Priority`, `ProcessorAffinity`, `InputEncoding`, `OutputEncoding`, `PipeBufferSize` (0 = 64KB), `PipeDrainTimeoutMS` (default 2000), `JobMode` (default `KillOnRelease`), `TerminateOnTimeout` (default `True`), `MarshallEventsToMainThread` (queue events on the main thread), `Clone`, and `With*` fluent equivalents (named after the property, except `WithTimeout` for `TimeoutInMSec` and `WithPipeDrainTimeout` for `PipeDrainTimeoutMS`). See the [Platform Support](#platform-support) matrix for per-platform behaviour.
+**`IStartInfoBuilder`** - `Executable`, `ArgvZero` (POSIX), `WorkingDirectory`, `HideWindow` (default `True`, Windows), `TimeoutInMSec` (default 0 = no timeout), `TimedOutExitCode`, `TerminateExitCode`, `Priority`, `ProcessorAffinity`, `InputEncoding`, `OutputEncoding`, `PipeBufferSize` (0 = 64KB), `PipeDrainTimeoutMS` (default 2000), `JobMode` (default `KillOnRelease`), `TerminateOnTimeout` (default `True`), `DetachedNewConsole` (default `False`, Windows), `MarshallEventsToMainThread` (queue events on the main thread), `Clone`, and `With*` fluent equivalents (named after the property, except `WithTimeout` for `TimeoutInMSec` and `WithPipeDrainTimeout` for `PipeDrainTimeoutMS`). See the [Platform Support](#platform-support) matrix for per-platform behaviour.
 
 **`ICommandLineBuilder`** - `Add` / `AddSensitive` (name-only or name + value, `qtDouble` by default), `Remove`, `Clear`, `Count`, `Arguments[]`, `ArgumentsByName[]`, `DefaultValueSeparator` (initially a space) / `WithDefaultValueSeparator`, `DefaultArgumentSeparator` / `WithDefaultArgumentSeparator`, `ToString`, `ToLogString`, `Clone`. `Arguments[]` returns `IArgument`: `Name`, `Value`, `Quoted`, `NameValueSeparator`, `QuoteName`. `DefaultArgumentSeparator`, `Quoted` and `QuoteName` only affect the Windows command line; POSIX passes argv slots verbatim.
 

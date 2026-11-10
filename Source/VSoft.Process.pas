@@ -261,6 +261,8 @@ type
     procedure SetJobMode(value : TProcessJobMode);
     function GetTerminateOnTimeout : boolean;
     procedure SetTerminateOnTimeout(value : boolean);
+    function GetDetachedNewConsole : boolean;
+    procedure SetDetachedNewConsole(value : boolean);
 
     function GetInputEncoding: TEncoding;
     procedure SetInputEncoding(const value: TEncoding);
@@ -286,6 +288,7 @@ type
     function WithPipeDrainTimeout(value : Cardinal) : IStartInfoBuilder;
     function WithJobMode(value : TProcessJobMode) : IStartInfoBuilder;
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
+    function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
 
     //non fluent config
     // On Windows a .bat / .cmd executable is run by cmd.exe, which re-parses
@@ -357,6 +360,13 @@ type
     // child's process group is not signalled and a background thread reaps
     // the child when it exits.
     property TerminateOnTimeout : boolean read GetTerminateOnTimeout write SetTerminateOnTimeout;
+    // Windows: ExecuteDetached gives the child a console of its own
+    // (CREATE_NEW_CONSOLE, shown or hidden by HideWindow) instead of none
+    // (DETACHED_PROCESS, the default False), so a console program has a
+    // console to write to, and its window appears when HideWindow is False.
+    // Ignored by Execute / ExecuteAsync and with credentials (a new console
+    // either way), and on POSIX.
+    property DetachedNewConsole : boolean read GetDetachedNewConsole write SetDetachedNewConsole;
   end;
 {$ENDREGION}
 

@@ -1487,12 +1487,18 @@ begin
   end
   else
   begin
-    // DETACHED_PROCESS: no inherited console.
+    // DETACHED_PROCESS: no console at all; CREATE_NEW_CONSOLE
+    //   (DetachedNewConsole): a console of its own, shown or hidden by
+    //   wShowWindow. Never ours either way.
     // CREATE_NEW_PROCESS_GROUP: child won't see our Ctrl+C / Ctrl+Break.
     // CREATE_BREAKAWAY_FROM_JOB: survive the host's job (CI runners). It
     //   makes CreateProcess fail with ERROR_ACCESS_DENIED when the host's
     //   job does not allow breakaway, so retry inside the job in that case.
-    creationFlags := DETACHED_PROCESS or CREATE_NEW_PROCESS_GROUP or CREATE_UNICODE_ENVIRONMENT or PriorityClass(StartInfo.Priority);
+    if StartInfo.DetachedNewConsole then
+      creationFlags := CREATE_NEW_CONSOLE
+    else
+      creationFlags := DETACHED_PROCESS;
+    creationFlags := creationFlags or CREATE_NEW_PROCESS_GROUP or CREATE_UNICODE_ENVIRONMENT or PriorityClass(StartInfo.Priority);
     result := CreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, FALSE,
                              creationFlags or VPROCESS_CREATE_BREAKAWAY_FROM_JOB,
                              pEnvironment, pWorkingDir, startupInfo, processInfo);

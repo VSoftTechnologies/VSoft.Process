@@ -185,6 +185,13 @@ type
     [Test]
     procedure LaunchFails_ErrorNamesTheProgramNotItsArguments;
 
+    // ExecuteDetached gives the child no console by default; with
+    // StartInfo.DetachedNewConsole it gets one of its own (hidden here).
+    [Test]
+    procedure Detached_Default_HasNoConsole;
+    [Test]
+    procedure DetachedNewConsole_ChildHasAConsole;
+
     // IProcess.CompletionHandle: no run in progress, so it is signalled.
     [Test]
     procedure CompletionHandle_NewProcess_IsSignalled;
@@ -262,6 +269,9 @@ uses
   {$IFNDEF MSWINDOWS}
   Posix.Base,
   Posix.Unistd,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  VSoft.Process.Tests.Helper,
   {$ENDIF}
   VSoft.CancellationToken,
   VSoft.Process.Tests.Common;
@@ -1922,6 +1932,69 @@ begin
     if FileExists(exeName) then
       DeleteFile(exeName);
   end;
+end;
+
+// The text of a file another process may still be writing ('' until then).
+function ReadMarkerFile(const fileName : string) : string;
+var
+  lines : TStringList;
+begin
+  result := '';
+  lines := TStringList.Create;
+  try
+    try
+      lines.LoadFromFile(fileName);
+      result := Trim(lines.Text);
+    except
+      on EFOpenError do
+        result := '';
+    end;
+  finally
+    lines.Free;
+  end;
+end;
+
+// Starts the test exe detached, in its console-check helper mode, which
+// writes "yes" to a marker file when it has a console and "no" otherwise,
+// and returns what it wrote. (cmd's "echo x > CON || echo no" can't report
+// "no": without a console cmd drops the rest of the line when the
+// redirection fails.)
+function RunDetachedConsoleProbe(newConsole : boolean) : string;
+var
+  proc : IProcess;
+  marker : string;
+  deadline : Int64;
+begin
+  result := '';
+  marker := TTestHelpers.TempFileName('vsoft_proc_console_', '.txt');
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := ParamStr(0);
+    // HideWindow stays True (the default): the console is never shown.
+    proc.StartInfo.DetachedNewConsole := newConsole;
+    proc.CommandLine.Add(HelperCommandLine('console-check', ['"' + marker + '"']), TQuoted.qtNone);
+    Assert.IsTrue(proc.ExecuteDetached, proc.Errors.Text);
+    deadline := TTestHelpers.TickMs + 15000;
+    while (result = '') and (TTestHelpers.TickMs < deadline) do
+    begin
+      Sleep(50);
+      if FileExists(marker) then
+        result := ReadMarkerFile(marker);
+    end;
+  finally
+    if FileExists(marker) then
+      DeleteFile(marker);
+  end;
+end;
+
+procedure TProcessLifecycleTests.Detached_Default_HasNoConsole;
+begin
+  Assert.AreEqual('no', RunDetachedConsoleProbe(false), 'by default a detached child has no console');
+end;
+
+procedure TProcessLifecycleTests.DetachedNewConsole_ChildHasAConsole;
+begin
+  Assert.AreEqual('yes', RunDetachedConsoleProbe(true), 'with DetachedNewConsole the detached child has a console');
 end;
 
 procedure TProcessLifecycleTests.CompletionHandle_NewProcess_IsSignalled;

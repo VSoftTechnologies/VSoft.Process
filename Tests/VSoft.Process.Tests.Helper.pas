@@ -22,6 +22,11 @@ interface
 //                                to <max> in all; prints SPAWNING once 20
 //                                have started, then sleeps <secs>.
 //   stdin-type                   prints STDIN-TYPE=<GetFileType of stdin>.
+//   console-check <file>         writes "yes" to <file> when it has a
+//                                console (CONOUT$ opens), "no" otherwise. A
+//                                cmd test (echo x > CON || ...) can't do it:
+//                                without a console cmd drops the rest of the
+//                                line when the redirection fails.
 
 // True when the command line asked for a helper mode (which has then run).
 function RunTestHelperMode : boolean;
@@ -35,7 +40,8 @@ uses
   {$IFDEF MSWINDOWS}
   Winapi.Windows,
   {$ENDIF}
-  System.SysUtils;
+  System.SysUtils,
+  System.Classes;
 
 const
   cHelperSwitch = '--vsp-helper=';
@@ -196,6 +202,28 @@ procedure StdInType;
 begin
   Say('STDIN-TYPE=' + IntToStr(GetFileType(GetStdHandle(STD_INPUT_HANDLE))));
 end;
+
+procedure ConsoleCheck;
+var
+  console : THandle;
+  answer : RawByteString;
+  fs : TFileStream;
+begin
+  console := CreateFile('CONOUT$', GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
+  if console <> INVALID_HANDLE_VALUE then
+  begin
+    answer := 'yes';
+    CloseHandle(console);
+  end
+  else
+    answer := 'no';
+  fs := TFileStream.Create(ParamStr(2), fmCreate);
+  try
+    fs.WriteBuffer(answer[1], Length(answer));
+  finally
+    fs.Free;
+  end;
+end;
 {$ENDIF}
 
 function RunTestHelperMode : boolean;
@@ -217,6 +245,8 @@ begin
     SpawnLoop
   else if mode = 'stdin-type' then
     StdInType
+  else if mode = 'console-check' then
+    ConsoleCheck
   else
   {$ENDIF}
   begin
