@@ -632,6 +632,36 @@ type
     function WithStdInPipe(const pipeSource : IPipeSource) : IProcess;
 
     /// <summary>
+    ///  Detaches every target added with WithStdOutPipe.
+    ///  </summary>
+    function ClearStdOutPipes : IProcess;
+
+    /// <summary>
+    ///  Detaches every target added with WithStdErrPipe.
+    ///  </summary>
+    function ClearStdErrPipes : IProcess;
+
+    /// <summary>
+    ///  Detaches every stdout and stderr target and the stdin source.
+    ///
+    ///  The process holds its targets until they are detached or it is
+    ///  freed. A delegate target whose anonymous method uses the IProcess
+    ///  variable (to call Terminate on a certain line, say) therefore forms
+    ///  a reference cycle - process, target, anonymous method, process - and
+    ///  neither is ever freed (nor is a KillOnRelease job released) unless
+    ///  the cycle is broken: call ClearPipes (or the Clear method for that
+    ///  stream) when done with the process.
+    ///
+    ///  Like the With methods these change the configuration for the next
+    ///  run. They may be called while a run is in progress, also from a
+    ///  target or an event handler: that run keeps the targets and source it
+    ///  started with (they still get the rest of the output and their Done)
+    ///  and lets go of them when it completes. Not thread-safe against
+    ///  another thread calling a With / Clear method or Execute*.
+    ///  </summary>
+    function ClearPipes : IProcess;
+
+    /// <summary>
     ///  Executes the process and returns when the process exits;
     ///  returns true if the process started
     ///  </summary>
@@ -667,7 +697,10 @@ type
     ///  - Status remains Running (the OS never notifies us when the
     ///    detached process exits). The IProcess can still be re-used for
     ///    another Execute / ExecuteAsync / ExecuteDetached.
-    ///  - ExitCode raises EInvalidOpException (we cannot read it).
+    ///  - ExitCode and TimedOut raise EInvalidOpException (we cannot read
+    ///    them). When the launch failed (False) they read $FFFFFFFF / False
+    ///    as after any failed Execute*.
+    ///  - The timeout, TerminateOnTimeout and JobMode are ignored.
     ///  - Terminate returns False (cannot terminate a detached process).
     ///  - ProcessId is populated on Windows (the immediate child) but is
     ///    0 on POSIX (the grandchild PID is lost across the double-fork).
@@ -682,7 +715,12 @@ type
     ///  synchronous Execute, it only requests termination and returns True
     ///  immediately. Returns False when no run is in progress (including
     ///  from OnExit, which fires after the run has completed) or the run is
-    ///  detached.
+    ///  detached. A call that is overtaken by the end of the run it was
+    ///  aimed at returns False and never stops a run started after it.
+    ///  On the main thread the wait services TThread.Synchronize / Queue
+    ///  (CheckSynchronize), so a pipe target that synchronises to the main
+    ///  thread cannot hold the run up; queued methods, a queued OnExit
+    ///  among them, can therefore run before Terminate returns.
     ///  </summary>
     function Terminate : boolean;overload;
 

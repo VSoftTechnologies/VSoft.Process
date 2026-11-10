@@ -51,8 +51,9 @@ type
     // command separators, grouping, escapes) or split it into several args.
     class function ContainsCmdMetaChars(const value : string) : boolean; static;
     // True when value cannot be passed to cmd.exe safely at all, even quoted:
-    // % and ! expand variables inside quotes, a " ends the quoted region and
-    // CR / LF end the command.
+    // % and ! expand variables inside quotes, a " ends the quoted region,
+    // CR / LF end the command and a NUL ends the command line itself (the
+    // closing quotes after it are lost).
     class function ContainsCmdUnsafeChars(const value : string) : boolean; static;
   end;
 
@@ -228,7 +229,7 @@ begin
   result := False;
   for i := 1 to Length(value) do
     case value[i] of
-      '%', '!', '"', #13, #10 :
+      '%', '!', '"', #13, #10, #0 :
         Exit(True);
     end;
 end;

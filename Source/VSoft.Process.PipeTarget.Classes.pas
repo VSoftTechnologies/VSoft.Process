@@ -61,6 +61,9 @@ type
         // line end, so a line end arriving straight after it does not add an
         // empty line.
         LineBroken : boolean;
+        // True once the first bytes of the stream have been decoded, which is
+        // the only place a byte order mark is dropped.
+        BomChecked : boolean;
       end;
     var
       FEncoding : TEncoding;
@@ -75,8 +78,16 @@ type
       // The stream HandleStreamData is delivering, so the default HandleData
       // (and an override that calls inherited) files the bytes under it.
       FDispatchStdErr : boolean;
+      // Set when delivering a line raised: the target then takes no more
+      // data and Done calls nothing, as the lines after the failed one are
+      // lost and the pieces left would join into text the child never wrote.
+      FFaulted : boolean;
     procedure ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
     procedure ResolveEncoding;
+    procedure ResetStreams;
+    // Decodes the first decodeLen pending bytes, without the byte order mark
+    // when they are the start of the stream.
+    function DecodePending(var state : TStreamState; decodeLen : integer) : string;
     function LastLineFeedEnd(const bytes : TBytes; fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
     function TrailingCRBytes(const bytes : TBytes; len : integer) : integer;
     procedure ForceLineBreak(var state : TStreamState);
@@ -163,6 +174,9 @@ type
     // Indexed by isStdErr, so one stream's character is never completed by
     // the other's bytes; HandleData counts as stdout.
     FPendingBytes : array[boolean] of TBytes;
+    // True once the start of the stream has been checked for a byte order
+    // mark, which is dropped there and nowhere else.
+    FBomChecked : array[boolean] of boolean;
     // The stream HandleStreamData is delivering (see TLinePipeTargetBase).
     FDispatchStdErr : boolean;
     procedure ProcessStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
@@ -212,6 +226,8 @@ type
 // Number of leading bytes of data[0..dataLength-1] that end on a character
 // boundary for the given encoding, so they can be decoded without splitting a
 // multi-byte sequence. The remainder must be carried to the next read.
+// Handles UTF-8, UTF-16, GB18030 and the two-byte code pages (on POSIX only
+// 932, 936, 949 and 950); any other multi-byte encoding is not held back.
 function CompleteCharLength(const encoding : TEncoding; const data : TBytes; dataLength : integer) : integer;
 
 // Decodes count bytes from data[index] without ever raising: each sequence
@@ -232,6 +248,53 @@ const
   CP_UTF8_VALUE = 65001;
   CP_UTF16LE = 1200;
   CP_UTF16BE = 1201;
+  CP_GB18030 = 54936;
+
+type
+  // First and last byte of each lead byte range of a two-byte code page,
+  // ended by a zero pair (the layout of TCPInfo.LeadByte).
+  TLeadByteRanges = array[0..11] of Byte;
+
+// Length of the byte order mark of the code page at the start of data: 0 when
+// there is none, -1 when data is too short to tell (all of it is the start of
+// the mark).
+function BomLength(codePage : Cardinal; const data : TBytes; dataLength : integer) : integer;
+const
+  cMarks : array[0..2, 0..2] of Byte = (($EF, $BB, $BF), ($FF, $FE, 0), ($FE, $FF, 0));
+var
+  mark : integer;
+  markLen : integer;
+  i : integer;
+begin
+  result := 0;
+  case codePage of
+    CP_UTF8_VALUE :
+      begin
+        mark := 0;
+        markLen := 3;
+      end;
+    CP_UTF16LE :
+      begin
+        mark := 1;
+        markLen := 2;
+      end;
+    CP_UTF16BE :
+      begin
+        mark := 2;
+        markLen := 2;
+      end;
+  else
+    exit;
+  end;
+  for i := 0 to markLen - 1 do
+  begin
+    if i >= dataLength then
+      exit(-1);
+    if data[i] <> cMarks[mark, i] then
+      exit;
+  end;
+  result := markLen;
+end;
 
 function Utf8CompleteLength(const data : TBytes; dataLength : integer) : integer;
 var
@@ -445,12 +508,98 @@ begin
   end;
 end;
 
-function CompleteCharLength(const encoding : TEncoding; const data : TBytes; dataLength : integer) : integer;
-{$IFDEF MSWINDOWS}
+function Gb18030CompleteLength(const data : TBytes; dataLength : integer) : integer;
 var
   i : integer;
-  codePage : Cardinal;
+begin
+  result := dataLength;
+  // A byte below $80 that is not a digit is a whole character or the trail
+  // byte of a two-byte one (a digit can also be the second or fourth byte of
+  // a four-byte character), so a character starts after the last such byte.
+  // Only the bytes from there on are walked.
+  i := dataLength;
+  while (i > 0) and ((data[i - 1] >= $80) or ((data[i - 1] >= $30) and (data[i - 1] <= $39))) do
+    Dec(i);
+  while i < dataLength do
+  begin
+    if (data[i] < $81) or (data[i] = $FF) then
+      Inc(i)
+    else if i + 1 >= dataLength then
+      exit(i)
+    else if (data[i + 1] < $30) or (data[i + 1] > $39) then
+      Inc(i, 2)
+    else if i + 3 < dataLength then
+      Inc(i, 4)
+    else if (i + 2 < dataLength) and ((data[i + 2] < $81) or (data[i + 2] = $FF)) then
+      Inc(i, 2) // not a four-byte character after all - nothing to wait for
+    else
+      exit(i);
+  end;
+end;
+
+function GetLeadByteRanges(const encoding : TEncoding; out ranges : TLeadByteRanges) : boolean;
+{$IFDEF MSWINDOWS}
+var
+  info : TCPInfo;
+begin
+  result := (not encoding.IsSingleByte) and GetCPInfo(encoding.CodePage, info) and (info.MaxCharSize = 2) and (info.LeadByte[0] <> 0);
+  if result then
+    Move(info.LeadByte[0], ranges[0], SizeOf(ranges));
+end;
+{$ELSE}
+begin
+  FillChar(ranges, SizeOf(ranges), 0);
+  result := true;
+  case encoding.CodePage of
+    932 :
+      begin
+        ranges[0] := $81;
+        ranges[1] := $9F;
+        ranges[2] := $E0;
+        ranges[3] := $FC;
+      end;
+    936, 949, 950 :
+      begin
+        ranges[0] := $81;
+        ranges[1] := $FE;
+      end;
+  else
+    result := false;
+  end;
+end;
 {$ENDIF}
+
+function IsLeadByte(const ranges : TLeadByteRanges; value : Byte) : boolean;
+var
+  i : integer;
+begin
+  i := 0;
+  while (i < High(ranges)) and (ranges[i] <> 0) do
+  begin
+    if (value >= ranges[i]) and (value <= ranges[i + 1]) then
+      exit(true);
+    Inc(i, 2);
+  end;
+  result := false;
+end;
+
+function DbcsCompleteLength(const ranges : TLeadByteRanges; const data : TBytes; dataLength : integer) : integer;
+var
+  i : integer;
+begin
+  // A byte that cannot be a lead byte is a whole character or a trail byte,
+  // so a character starts after it and the lead byte values that end the
+  // data pair up from there: an odd number of them leaves a lead byte
+  // without its trail byte. Only those ending bytes are looked at.
+  i := dataLength;
+  while (i > 0) and IsLeadByte(ranges, data[i - 1]) do
+    Dec(i);
+  result := dataLength - ((dataLength - i) and 1);
+end;
+
+function CompleteCharLength(const encoding : TEncoding; const data : TBytes; dataLength : integer) : integer;
+var
+  ranges : TLeadByteRanges;
 begin
   result := dataLength;
   if (encoding = nil) or (dataLength <= 0) then
@@ -459,29 +608,12 @@ begin
     CP_UTF8_VALUE : result := Utf8CompleteLength(data, dataLength);
     CP_UTF16LE    : result := Utf16CompleteLength(data, dataLength, false);
     CP_UTF16BE    : result := Utf16CompleteLength(data, dataLength, true);
+    CP_GB18030    : result := Gb18030CompleteLength(data, dataLength);
   else
-    {$IFDEF MSWINDOWS}
-    // DBCS code pages (Shift-JIS, GBK, Big5, ...): walk from the start (which
-    // is always a character boundary) and stop before a dangling lead byte.
-    if encoding.IsSingleByte then
-      exit;
-    codePage := encoding.CodePage;
-    i := 0;
-    while i < dataLength do
-    begin
-      if IsDBCSLeadByteEx(codePage, data[i]) then
-      begin
-        if i + 1 >= dataLength then
-        begin
-          result := i;
-          exit;
-        end;
-        Inc(i, 2);
-      end
-      else
-        Inc(i);
-    end;
-    {$ENDIF}
+    // Two-byte code pages (Shift-JIS, GBK, Big5, ...). No lead byte is below
+    // $80, so data that ends in ASCII needs no look at the code page.
+    if (data[dataLength - 1] >= $80) and GetLeadByteRanges(encoding, ranges) then
+      result := DbcsCompleteLength(ranges, data, dataLength);
   end;
 end;
 
@@ -604,6 +736,7 @@ begin
       AppendText(DecodeLenient(FEncoding, FPendingBytes[isStdErr], 0, Length(FPendingBytes[isStdErr])));
       SetLength(FPendingBytes[isStdErr], 0);
     end;
+    FBomChecked[isStdErr] := false;
   end;
   // An injected default belongs to this run only: the next run may inject a
   // different one, or none, and this one may since have been freed.
@@ -632,6 +765,7 @@ var
   totalLen : integer;
   bytes : TBytes;
   decodeLen : integer;
+  skipLen : integer;
 begin
   if dataLength = 0 then
     exit;
@@ -645,9 +779,22 @@ begin
     Move(FPendingBytes[isStdErr][0], bytes[0], tailLen);
   Move(data[0], bytes[tailLen], dataLength);
 
+  skipLen := 0;
+  if not FBomChecked[isStdErr] then
+  begin
+    skipLen := BomLength(FEncoding.CodePage, bytes, totalLen);
+    if skipLen < 0 then
+    begin
+      // A read ended inside what may be the byte order mark.
+      FPendingBytes[isStdErr] := bytes;
+      exit;
+    end;
+    FBomChecked[isStdErr] := true;
+  end;
+
   decodeLen := CompleteCharLength(FEncoding, bytes, totalLen);
-  if decodeLen > 0 then
-    AppendText(DecodeLenient(FEncoding, bytes, 0, decodeLen));
+  if decodeLen > skipLen then
+    AppendText(DecodeLenient(FEncoding, bytes, skipLen, decodeLen - skipLen));
   SetLength(FPendingBytes[isStdErr], totalLen - decodeLen);
   if totalLen > decodeLen then
     Move(bytes[decodeLen], FPendingBytes[isStdErr][0], totalLen - decodeLen);
@@ -659,6 +806,8 @@ begin
     FEncoding := TEncoding.Default;
   SetLength(FPendingBytes[false], 0);
   SetLength(FPendingBytes[true], 0);
+  FBomChecked[false] := false;
+  FBomChecked[true] := false;
   MonitorEnter(FStringBuilder);
   try
     FStringBuilder.Clear;
@@ -809,7 +958,7 @@ begin
   begin
     if FEncoding = nil then
       FEncoding := TEncoding.Default;
-    remainder := DecodeLenient(FEncoding, state.PendingBytes, 0, Length(state.PendingBytes));
+    remainder := DecodePending(state, Length(state.PendingBytes));
     SetLength(state.PendingBytes, 0);
     ProcessText(state, remainder);
   end;
@@ -826,17 +975,58 @@ end;
 
 procedure TLinePipeTargetBase.Done;
 begin
-  FlushStream(FStreams[false]);
-  FlushStream(FStreams[true]);
-  // An injected default belongs to this run only: the next run may inject a
-  // different one, or none, and this one may since have been freed.  After
-  // both streams, so the stderr tail still decodes with it.  The code unit
-  // size goes with it, so a run used without Start settles both afresh.
-  if not FEncodingExplicit then
-  begin
-    FEncoding := nil;
-    FUnitSize := 0;
+  try
+    if not FFaulted then
+    begin
+      FlushStream(FStreams[false]);
+      FlushStream(FStreams[true]);
+    end;
+  finally
+    // Also when a callback raised, here or earlier in the run: what is left
+    // is dropped and the next run starts clean.
+    ResetStreams;
+    // An injected default belongs to this run only: the next run may inject a
+    // different one, or none, and this one may since have been freed.  After
+    // both streams, so the stderr tail still decodes with it.  The code unit
+    // size goes with it, so a run used without Start settles both afresh.
+    if not FEncodingExplicit then
+    begin
+      FEncoding := nil;
+      FUnitSize := 0;
+    end;
   end;
+end;
+
+procedure TLinePipeTargetBase.ResetStreams;
+var
+  isStdErr : boolean;
+begin
+  for isStdErr := false to true do
+  begin
+    FStreams[isStdErr].CurrentLine := '';
+    FStreams[isStdErr].LineBroken := false;
+    FStreams[isStdErr].BomChecked := false;
+    SetLength(FStreams[isStdErr].PendingBytes, 0);
+  end;
+  FFaulted := false;
+end;
+
+function TLinePipeTargetBase.DecodePending(var state : TStreamState; decodeLen : integer) : string;
+var
+  skipLen : integer;
+begin
+  skipLen := 0;
+  if not state.BomChecked then
+  begin
+    // The first decode of a stream starts at its first byte, and it never
+    // ends inside the mark while more bytes can follow: the mark holds no
+    // line feed and is shorter than the forced break.
+    state.BomChecked := true;
+    skipLen := BomLength(FEncoding.CodePage, state.PendingBytes, decodeLen);
+    if skipLen < 0 then
+      skipLen := 0;
+  end;
+  result := DecodeLenient(FEncoding, state.PendingBytes, skipLen, decodeLen - skipLen);
 end;
 
 function TLinePipeTargetBase.LastLineFeedEnd(const bytes : TBytes; fromPos : NativeUInt; totalLen : NativeUInt) : NativeInt;
@@ -877,7 +1067,14 @@ end;
 
 procedure TLinePipeTargetBase.HandleData(const data: TBytes; dataLength: NativeUInt);
 begin
-  ProcessStreamData(FDispatchStdErr, data, dataLength);
+  if FFaulted then
+    exit;
+  try
+    ProcessStreamData(FDispatchStdErr, data, dataLength);
+  except
+    FFaulted := true;
+    raise;
+  end;
 end;
 
 procedure TLinePipeTargetBase.HandleStreamData(isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);
@@ -919,7 +1116,7 @@ begin
   begin
     // Decode everything up to and including the last LF and keep the rest.
     decodeLen := NativeUInt(lineEnd);
-    decoded := DecodeLenient(FEncoding, FStreams[isStdErr].PendingBytes, 0, decodeLen);
+    decoded := DecodePending(FStreams[isStdErr], Integer(decodeLen));
     if decodeLen < totalLen then
     begin
       Move(FStreams[isStdErr].PendingBytes[decodeLen], FStreams[isStdErr].PendingBytes[0], totalLen - decodeLen);
@@ -979,8 +1176,9 @@ begin
     Dec(decodeLen, keepCR);
   if decodeLen <= 0 then
     exit;
-  decoded := DecodeLenient(FEncoding, state.PendingBytes, 0, decodeLen);
-  Move(state.PendingBytes[decodeLen], state.PendingBytes[0], totalLen - decodeLen);
+  decoded := DecodePending(state, decodeLen);
+  if decodeLen < totalLen then
+    Move(state.PendingBytes[decodeLen], state.PendingBytes[0], totalLen - decodeLen);
   SetLength(state.PendingBytes, totalLen - decodeLen);
   ProcessText(state, decoded);
   if state.CurrentLine <> '' then
@@ -1004,12 +1202,7 @@ end;
 procedure TLinePipeTargetBase.Start;
 begin
   ResolveEncoding;
-  FStreams[false].CurrentLine := '';
-  FStreams[false].LineBroken := false;
-  SetLength(FStreams[false].PendingBytes, 0);
-  FStreams[true].CurrentLine := '';
-  FStreams[true].LineBroken := false;
-  SetLength(FStreams[true].PendingBytes, 0);
+  ResetStreams;
 end;
 
 { TLineMethodPipeTarget }
@@ -1099,12 +1292,29 @@ end;
 procedure TMultiPipeTarget.Start;
 var
   i: Integer;
+  j : integer;
 begin
   FreeAndNil(FFirstDataError);
   for i := 0 to Length(FTargets) - 1 do
     FFaulted[i] := false;
   for i := 0 to Length(FTargets) - 1 do
-    FTargets[i].Start;
+  begin
+    try
+      FTargets[i].Start;
+    except
+      // Done is only called for a target whose Start returned, so nobody
+      // else will end the targets already started.
+      for j := i - 1 downto 0 do
+      begin
+        try
+          FTargets[j].Done;
+        except
+          // the Start failure is the one to report
+        end;
+      end;
+      raise;
+    end;
+  end;
 end;
 
 procedure TMultiPipeTarget.Fan(streamed, isStdErr : boolean; const data : TBytes; dataLength : NativeUInt);

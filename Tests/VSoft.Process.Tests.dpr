@@ -42,6 +42,11 @@ uses
   VSoft.Process.Tests.ExecutableSearch in 'VSoft.Process.Tests.ExecutableSearch.pas',
   VSoft.Process.Tests.Logon in 'VSoft.Process.Tests.Logon.pas',
   VSoft.Process.Tests.Helper in 'VSoft.Process.Tests.Helper.pas',
+  VSoft.Process.Tests.Review.Windows in 'VSoft.Process.Tests.Review.Windows.pas',
+  VSoft.Process.Tests.Review.Posix in 'VSoft.Process.Tests.Review.Posix.pas',
+  VSoft.Process.Tests.Review.Core in 'VSoft.Process.Tests.Review.Core.pas',
+  VSoft.Process.Tests.Review.Pipes in 'VSoft.Process.Tests.Review.Pipes.pas',
+  VSoft.Process.Tests.Review.Support in 'VSoft.Process.Tests.Review.Support.pas',
   VSoft.Process.WinAPI in '..\Source\VSoft.Process.WinAPI.pas';
 
 {$R *.RES}

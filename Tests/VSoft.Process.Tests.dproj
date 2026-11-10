@@ -191,6 +191,7 @@
         <DCC_Define>DEBUG;$(DCC_Define)</DCC_Define>
         <DCC_Optimize>false</DCC_Optimize>
         <DCC_GenerateStackFrames>true</DCC_GenerateStackFrames>
+        <DCC_RangeChecking>true</DCC_RangeChecking>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Cfg_2_iOSDevice64)'!=''">
         <DCC_RemoteDebug>true</DCC_RemoteDebug>
@@ -234,6 +235,11 @@
         <DCCReference Include="VSoft.Process.Tests.ExecutableSearch.pas"/>
         <DCCReference Include="VSoft.Process.Tests.Logon.pas"/>
         <DCCReference Include="VSoft.Process.Tests.Helper.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.Review.Windows.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.Review.Posix.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.Review.Core.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.Review.Pipes.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.Review.Support.pas"/>
         <DCCReference Include="..\Source\VSoft.Process.WinAPI.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>

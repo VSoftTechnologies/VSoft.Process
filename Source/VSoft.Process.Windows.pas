@@ -61,11 +61,15 @@ type
     Lock : TRTLCriticalSection;
     Closing : boolean;
     // After a normal exit: bytes that were in the pipe when the child exited
-    // and have not been read yet. Only reads queued after RecordUnreadOutput
-    // (CountReads) pay them off; ReadCounted belongs to the read in flight.
+    // and have not been delivered yet. Only reads queued after
+    // RecordUnreadOutput (CountReads) pay them off, once their data has been
+    // delivered; ReadCounted belongs to the read in flight.
     Unread : Int64;
     CountReads : boolean;
     ReadCounted : boolean;
+    // A completed read's data is on its way to the targets. Set by the
+    // callback, cleared once the data has been delivered.
+    Delivering : boolean;
     // StartInfo.DeliverOnRunThread: the callback hands a completed read to
     // the thread running the run (PendingBytes / PendingResult, then
     // DataReady, a manual-reset event) instead of delivering it. That thread
@@ -118,6 +122,10 @@ type
     // True once every handle is signalled. False when drainMs elapses, or
     // (canStop) when Terminate / cancellation is requested, which sets stopped.
     function WaitForDrain(const handles : array of THandle; count : integer; drainMs : Cardinal; canStop : boolean; out stopped : boolean) : boolean;
+    // Runs what other threads passed to TThread.Synchronize / Queue. A wait
+    // on the main thread calls it, so a pipe target that synchronizes does
+    // not deadlock a synchronous Execute made from the main thread.
+    procedure ServiceSynchronize;
     function KillChild(exitCode : Cardinal) : boolean;
     function ReadExitCode : Cardinal;
     function CreateJobObject: Boolean;
@@ -230,13 +238,6 @@ const
   // retried this many times, 5ms apart.
   cMaxReadRetries = 20;
 
-var
-  // Held from "make the child's pipe ends inheritable" until they are
-  // closed after CreateProcess, so a spawn on another thread can never
-  // inherit them (which would keep our pipes open until that unrelated
-  // child exits).
-  GSpawnLock : TCriticalSection;
-
 // Returns the configured pipe buffer size or cBufferLen when 0.
 function ResolvePipeBufferSize(const startInfo : IStartInfoBuilder) : Cardinal;
 begin
@@ -265,8 +266,9 @@ begin
   // Closing a recycled handle value would close an unrelated kernel object.
   // Type-cast expressions are rvalues in XE2 and cannot be passed as `var`
   // parameters; dereference a typed pointer to expose `handle`'s storage as
-  // the right-sized lvalue for TInterlocked.Exchange.
-  {$IFDEF CPU64BITS}
+  // the right-sized lvalue for TInterlocked.Exchange. WIN64, not CPU64BITS,
+  // which XE2 to XE7 do not define.
+  {$IFDEF WIN64}
   old := THandle(TInterlocked.Exchange(PInt64(@handle)^, Int64(0)));
   {$ELSE}
   old := THandle(TInterlocked.Exchange(PInteger(@handle)^, 0));
@@ -329,7 +331,19 @@ begin
   readMore := false;
   try
     if numBytesRead > 0 then
-      info.Owner.DeliverOutput(info.IsStdErr, info.Buffer, numBytesRead);
+    begin
+      try
+        info.Owner.DeliverOutput(info.IsStdErr, info.Buffer, numBytesRead);
+      finally
+        // Only now, so the drain clock cannot start while a target still
+        // has the child's last output in its hands.
+        EnterCriticalSection(info.Lock);
+        if info.ReadCounted then
+          Dec(info.Unread, Int64(numBytesRead));
+        info.Delivering := false;
+        LeaveCriticalSection(info.Lock);
+      end;
+    end;
     if ioResult = NO_ERROR then
       readMore := QueueAsyncPipeRead(info)
     else if (ioResult <> ERROR_BROKEN_PIPE) and (ioResult <> ERROR_HANDLE_EOF) and (ioResult <> ERROR_OPERATION_ABORTED) then
@@ -369,8 +383,7 @@ begin
   if numBytesRead > 0 then
   begin
     EnterCriticalSection(info.Lock);
-    if info.ReadCounted then
-      Dec(info.Unread, Int64(numBytesRead));
+    info.Delivering := true;
     LeaveCriticalSection(info.Lock);
   end;
   if info.HandOver then
@@ -501,11 +514,49 @@ function RenderBatchArgument(const arg : IArgument) : string;
 var
   name : string;
   value : string;
+
+  // A part without cmd metacharacters, quoted by the argument's style as
+  // IArgument.ToString quotes it, but never escaped for CommandLineToArgvW:
+  // cmd.exe does not take a backslash as an escape, so the doubled backslash
+  // before a closing quote would reach the script. The part holds no ",
+  // space or tab here, so that doubling is all the escaping would do.
+  function QuotePart(const text : string; forced : boolean) : string;
+  var
+    len : integer;
+  begin
+    case arg.Quoted of
+      TQuoted.qtSingle : result := TStringUtils.QuoteString(text, not forced);
+      TQuoted.qtAutoSingle : result := TStringUtils.QuoteString(text, True);
+      TQuoted.qtDouble, TQuoted.qtAutoDouble :
+        begin
+          result := text;
+          len := Length(result);
+          if (len >= 2) and (result[1] = '"') and (result[len] = '"') then
+            result := Copy(result, 2, len - 2);
+          if (result = '') or (forced and (arg.Quoted = TQuoted.qtDouble)) then
+            result := '"' + result + '"';
+        end;
+    else
+      result := text;
+    end;
+  end;
+
 begin
   name := arg.Name;
   value := TStringUtils.StripQuotes(arg.Value);
   if not (TStringUtils.ContainsCmdMetaChars(name) or TStringUtils.ContainsCmdMetaChars(value)) then
-    Exit(arg.ToString);
+  begin
+    if (name = '') and (arg.Value = '') then
+      Exit(arg.ToString);
+    if arg.Value = '' then
+      Exit(QuotePart(name, arg.QuoteName));
+    if name <> '' then
+      result := QuotePart(name, False) + arg.NameValueSeparator
+    else
+      result := '';
+    result := result + QuotePart(arg.Value, True);
+    Exit;
+  end;
   if value = '' then
     Exit('"' + TStringUtils.StripQuotes(name) + '"');
   if TStringUtils.ContainsCmdMetaChars(name) then
@@ -577,8 +628,7 @@ begin
   // Anonymous pipes don't support overlapped I/O, so a uniquely named pipe
   // is used. FIRST_PIPE_INSTANCE fails if the name already exists (no
   // squatting) and remote clients are refused. Both ends are created
-  // non-inheritable; the child's end is made inheritable only under
-  // GSpawnLock.
+  // non-inheritable; the child's end is made inheritable only for the spawn.
   pipeName := MakeUniquePipeName;
   bufSize := ResolvePipeBufferSize(StartInfo);
   readHandle := CreateNamedPipe(PChar(pipeName),
@@ -628,6 +678,7 @@ begin
   info.Unread := 0;
   info.CountReads := false;
   info.ReadCounted := false;
+  info.Delivering := false;
   info.IO := nil;
   bufSize := ResolvePipeBufferSize(StartInfo);
   SetLength(info.Buffer, bufSize);
@@ -656,7 +707,26 @@ begin
   end;
 end;
 
+procedure TWindowsProcess.ServiceSynchronize;
+begin
+  try
+    CheckSynchronize;
+  except
+    // A method another thread queued (TThread.Queue) raised: it is not part
+    // of this run and must not end it.
+    on E : Exception do
+    begin
+      if Assigned(ApplicationHandleException) then
+        ApplicationHandleException(Self)
+      else
+        LogError('A method queued to the main thread raised ' + E.ClassName + ' - ' + E.Message);
+    end;
+  end;
+end;
+
 procedure TWindowsProcess.CloseIO(info : PIOInfo);
+var
+  waitHandles : array[0..1] of THandle;
 begin
   if info.IO <> nil then
   begin
@@ -666,6 +736,19 @@ begin
     info.Closing := true;
     LeaveCriticalSection(info.Lock);
     VProcCancelIoEx(info.Handle, nil);
+    // On the main thread a callback that is inside a target's
+    // TThread.Synchronize waits for this thread, and the wait below would
+    // wait for that callback. The callback sets DoneEvent as its last action
+    // now that no read can be queued, so wait for that first, servicing
+    // Synchronize meanwhile. Not with HandOver: there the callback never
+    // calls a target and never sets DoneEvent.
+    if (not info.HandOver) and (GetCurrentThreadId = MainThreadID) then
+    begin
+      waitHandles[0] := info.DoneEvent;
+      waitHandles[1] := SyncEvent;
+      while WaitForMultipleObjects(2, @waitHandles[0], False, INFINITE) = WAIT_OBJECT_0 + 1 do
+        ServiceSynchronize;
+    end;
     WaitForThreadpoolIoCallbacks(info.IO, False);
     CloseThreadpoolIo(info.IO);
     info.IO := nil;
@@ -931,6 +1014,34 @@ begin
     FResolvedExecutable := '';
     result := false;
   end;
+  // CreateProcess takes NUL-terminated strings, so a #0 would silently cut
+  // off the rest of the command line: every later argument, and for a batch
+  // file the closing quotes that keep cmd.exe from running argument text as
+  // a command. That holds for any program and for AddUnsafeBatchRaw text.
+  if Pos(#0, StartInfo.Executable) > 0 then
+  begin
+    LogError('The executable path contains a NUL character (#0)');
+    result := false;
+  end;
+  if Pos(#0, StartInfo.WorkingDirectory) > 0 then
+  begin
+    LogError('The working directory contains a NUL character (#0)');
+    result := false;
+  end;
+  if Pos(#0, CommandLine.DefaultArgumentSeparator) > 0 then
+  begin
+    LogError('The argument separator contains a NUL character (#0)');
+    result := false;
+  end;
+  for i := 0 to CommandLine.Count - 1 do
+  begin
+    arg := CommandLine.Arguments[i];
+    if (Pos(#0, arg.Name) > 0) or (Pos(#0, arg.Value) > 0) or (Pos(#0, arg.NameValueSeparator) > 0) then
+    begin
+      LogError('Argument ' + IntToStr(i + 1) + ' cannot be passed on a command line: it contains a NUL character (#0)');
+      result := false;
+    end;
+  end;
   if TStringUtils.IsBatchFile(FResolvedExecutable) then
   begin
     // The path is part of the command line cmd.exe parses, and %VAR% (and
@@ -968,6 +1079,7 @@ var
   redirectErr : boolean;
   redirectIn : boolean;
   useStdHandles : boolean;
+  shareConsole : boolean;
   outRead : THandle;
   errRead : THandle;
   childOut : THandle;
@@ -1020,6 +1132,7 @@ var
   var
     host : THandle;
     dupError : DWORD;
+    consoleMode : DWORD;
   begin
     result := 0;
     host := GetStdHandle(stdHandle);
@@ -1040,6 +1153,21 @@ var
       result := 0;
       LogError('Could not duplicate the host''s ' + streamName + ' handle (' + SysErrorMessage(dupError) + '); the child''s ' +
                streamName + ' is NUL instead');
+      Exit;
+    end;
+    // A console handle only works in a process attached to that console, so
+    // the child has to share ours instead of getting one of its own.
+    if GetConsoleMode(result, consoleMode) then
+    begin
+      if Credentials.UserName = '' then
+        shareConsole := true
+      else
+      begin
+        // The Secondary Logon service always gives the child a new console.
+        SafeCloseHandle(result);
+        LogError('The host''s ' + streamName + ' is a console, which a child started with credentials can''t use ' +
+                 '(it never shares the host''s console); its ' + streamName + ' is NUL instead');
+      end;
     end;
   end;
 
@@ -1054,6 +1182,7 @@ begin
   nulHandle := 0;
   attrList := nil;
   error := 0;
+  shareConsole := false;
   FStdInWriteHandle := 0;
   FStdInWriteThread := 0;
   FStdInWriter := nil;
@@ -1088,7 +1217,7 @@ begin
     end;
     // InheritHostStdHandles: a stream that is not redirected gets a copy of
     // our own std handle. Like the pipe ends it is created non-inheritable,
-    // made inheritable only under GSpawnLock and closed after the spawn.
+    // made inheritable only for the spawn and closed after it.
     if StartInfo.InheritHostStdHandles then
     begin
       if not redirectIn then
@@ -1130,7 +1259,12 @@ begin
       pWorkingDir := nil;
     pEnvironment := GetEnvironmentBlock;
     // Suspended so the job is assigned before the child can create children.
-    creationFlags := CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT or CREATE_SUSPENDED or PriorityClass(StartInfo.Priority);
+    creationFlags := CREATE_UNICODE_ENVIRONMENT or CREATE_SUSPENDED or PriorityClass(StartInfo.Priority);
+    // A console of its own, except when it was given a console handle of
+    // ours (InheritHostStdHandles): then it shares our console, and with it
+    // the console's Ctrl+C and Ctrl+Break.
+    if not shareConsole then
+      creationFlags := creationFlags or CREATE_NEW_CONSOLE;
     // Before Windows 8 a process already in a job cannot be put in a second
     // one, so our job would fail; leave the host's job when it allows that.
     // Only KillOnRelease needs a job of its own to kill the child; KillOnTerminate
@@ -1145,9 +1279,7 @@ begin
       // The Secondary Logon service is not the child's real parent: it
       // duplicates the three STARTUPINFO handles from this process into the
       // child, and the child inherits nothing else from us. So the child's
-      // ends stay non-inheritable and GSpawnLock is not taken: a logon (a
-      // user profile to load) can take seconds, and every other launch in
-      // this process would wait for it.
+      // ends stay non-inheritable.
       try
         success := LaunchWithLogon(command, creationFlags, pEnvironment, pWorkingDir, startupInfoEx.StartupInfo, FProcessInfo);
         if not success then
@@ -1161,7 +1293,10 @@ begin
     end
     else
     begin
-      GSpawnLock.Enter;
+      // No lock around the spawn: while the child's handles are inheritable
+      // no other launch can pick them up, since every CreateProcess here
+      // either names the handles it passes on (the handle list below) or
+      // inherits none (bInheritHandles False, here and in ExecuteDetached).
       try
         inheritCount := 0;
         if useStdHandles then
@@ -1200,8 +1335,7 @@ begin
         if not success then
           error := Winapi.Windows.GetLastError;
       finally
-        // The child has its own copies now. Closing ours inside the lock means
-        // no other spawn can ever see them inheritable.
+        // The child has its own copies now.
         SafeCloseHandle(childOut);
         SafeCloseHandle(childErr);
         SafeCloseHandle(childIn);
@@ -1211,7 +1345,6 @@ begin
           VProcDeleteProcThreadAttributeList(attrList);
           FreeMem(attrList);
         end;
-        GSpawnLock.Leave;
       end;
     end;
 
@@ -1471,7 +1604,9 @@ function TWindowsProcess.HasUnreadOutput : boolean;
       Exit(false);
     EnterCriticalSection(info.Lock);
     try
-      result := info.Unread > 0;
+      // Owed too: the read that was in flight when the child exited (never
+      // counted), from the moment it completes until its data is delivered.
+      result := info.CountReads and ((info.Unread > 0) or (info.Delivering and (not info.ReadCounted)));
     finally
       LeaveCriticalSection(info.Lock);
     end;
@@ -1492,8 +1627,13 @@ var
   clock : TStopwatch;
   deadline : Int64;
   waitMs : Int64;
-  readyEvents : array[0..1] of THandle;
+  // One handle not signalled yet, the DataReady events and SyncEvent.
+  wakeEvents : array[0..3] of THandle;
+  wakeCount : integer;
   readyCount : integer;
+  onMainThread : boolean;
+  pending : integer;
+  i : integer;
 begin
   // Waits in slices: the deadline only starts once the child's own output
   // has been delivered, and a stop request must be noticed.
@@ -1502,25 +1642,59 @@ begin
   deadline := -1;
   // DeliverOnRunThread: this thread delivers the reads meanwhile, so it
   // wakes for each one handed over.
-  readyCount := HandOverEvents(readyEvents, 0);
+  readyCount := HandOverEvents(wakeEvents, 1);
+  wakeCount := readyCount;
+  Dec(readyCount);
+  // On the main thread it wakes for TThread.Synchronize too: a target
+  // called on a threadpool thread may be waiting for this thread.
+  onMainThread := GetCurrentThreadId = MainThreadID;
+  if onMainThread then
+  begin
+    wakeEvents[wakeCount] := SyncEvent;
+    Inc(wakeCount);
+  end;
   while true do
   begin
     if readyCount > 0 then
       DispatchHandedOver;
-    if (deadline < 0) and (drainMs <> INFINITE) and (not HasUnreadOutput) then
-      deadline := clock.ElapsedMilliseconds + drainMs;
+    if onMainThread then
+      ServiceSynchronize;
+    if drainMs <> INFINITE then
+    begin
+      // The read in flight when the child exited may only complete (and so
+      // become owed) after the clock has started: the clock starts again
+      // once it has been delivered.
+      if HasUnreadOutput then
+        deadline := -1
+      else if deadline < 0 then
+        deadline := clock.ElapsedMilliseconds + drainMs;
+    end;
     waitMs := cSliceMs;
     if (deadline >= 0) and (deadline - clock.ElapsedMilliseconds < waitMs) then
       waitMs := deadline - clock.ElapsedMilliseconds;
     if waitMs < 0 then
       waitMs := 0;
-    if readyCount > 0 then
+    if wakeCount > 1 then
     begin
-      // Only CompleteRead, on this thread, ends a stream, so once every one
-      // has ended there is nothing handed over left to deliver.
-      if WaitForMultipleObjects(count, @handles[0], True, 0) <> WAIT_TIMEOUT then
+      // A wait for all the handles cannot also wake for the others, so it
+      // waits for one handle that is not signalled yet at a time. With
+      // DeliverOnRunThread only CompleteRead, on this thread, ends a stream,
+      // so once every one has ended there is nothing handed over left to
+      // deliver.
+      pending := -1;
+      for i := 0 to count - 1 do
+        if WaitForSingleObject(handles[i], 0) = WAIT_TIMEOUT then
+        begin
+          pending := i;
+          Break;
+        end;
+      if pending < 0 then
         Exit(true);
-      WaitForMultipleObjects(readyCount, @readyEvents[0], False, DWORD(waitMs));
+      wakeEvents[0] := handles[pending];
+      // That handle: look for the next one before anything else, so a stop
+      // request or the deadline never beats streams that have all ended.
+      if WaitForMultipleObjects(wakeCount, @wakeEvents[0], False, DWORD(waitMs)) = WAIT_OBJECT_0 then
+        Continue;
     end
     else if WaitForMultipleObjects(count, @handles[0], True, DWORD(waitMs)) <> WAIT_TIMEOUT then
       Exit(true);
@@ -1529,7 +1703,7 @@ begin
       stopped := true;
       Exit(false);
     end;
-    if (deadline >= 0) and (clock.ElapsedMilliseconds >= deadline) then
+    if (deadline >= 0) and (clock.ElapsedMilliseconds >= deadline) and (not HasUnreadOutput) then
       Exit(false);
   end;
 end;
@@ -1537,9 +1711,9 @@ end;
 procedure TWindowsProcess.DoWaitForCompletion(var outcome : TProcessOutcome);
 const
   // Wait sources: process handle, FTerminateEvent, optional FCancellationEvent,
-  // optional FCancellationToken, and with DeliverOnRunThread the DataReady
-  // events of stdout and stderr.
-  cMaxWaitHandles = 6;
+  // optional FCancellationToken, with DeliverOnRunThread the DataReady
+  // events of stdout and stderr, and on the main thread SyncEvent.
+  cMaxWaitHandles = 7;
 var
   timeOutDuration: Cardinal;
   waitRes: Cardinal;
@@ -1549,6 +1723,7 @@ var
   clock : TStopwatch;
   waitMs : Cardinal;
   handedOver : boolean;
+  onMainThread : boolean;
   killed : boolean;
   abandoned : boolean;
   resolved : boolean;
@@ -1581,6 +1756,15 @@ begin
     // Last, so the process exiting, Terminate and cancellation come first.
     readyFirst := handleCount;
     handleCount := HandOverEvents(objHandles, handleCount);
+    // A synchronous Execute on the main thread: a target called on a
+    // threadpool thread may be inside TThread.Synchronize, waiting for this
+    // thread.
+    onMainThread := GetCurrentThreadId = MainThreadID;
+    if onMainThread then
+    begin
+      objHandles[handleCount] := SyncEvent;
+      Inc(handleCount);
+    end;
 
     clock := TStopwatch.StartNew;
     repeat
@@ -1590,11 +1774,23 @@ begin
         waitMs := 0
       else
         waitMs := timeOutDuration - Cardinal(clock.ElapsedMilliseconds);
-      waitRes := WaitForMultipleObjects(handleCount, @objHandles, False, waitMs);
-      // DeliverOnRunThread: a read handed over; deliver it and wait on.
+      // Once the timeout has elapsed only the process, Terminate and
+      // cancellation are looked at: a DataReady event (or SyncEvent) that is
+      // signalled every time the wait is reached must not keep the timeout
+      // from being seen.
+      if (timeOutDuration <> INFINITE) and (waitMs = 0) then
+        waitRes := WaitForMultipleObjects(readyFirst, @objHandles, False, 0)
+      else
+        waitRes := WaitForMultipleObjects(handleCount, @objHandles, False, waitMs);
+      // A read handed over (DeliverOnRunThread) or a Synchronize request:
+      // deliver / run it and wait on.
       handedOver := (waitRes >= WAIT_OBJECT_0 + Cardinal(readyFirst)) and (waitRes < WAIT_OBJECT_0 + Cardinal(handleCount));
       if handedOver then
+      begin
         DispatchHandedOver;
+        if onMainThread then
+          ServiceSynchronize;
+      end;
     until not handedOver;
     case waitRes of
       WAIT_OBJECT_0: // Process has exited
@@ -1687,15 +1883,16 @@ begin
   begin
     // CreateProcessWithLogonW does not accept DETACHED_PROCESS or
     // CREATE_BREAKAWAY_FROM_JOB; its children are not in our job anyway.
-    creationFlags := CREATE_NEW_CONSOLE or CREATE_NEW_PROCESS_GROUP or CREATE_UNICODE_ENVIRONMENT or PriorityClass(StartInfo.Priority);
+    creationFlags := CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT or PriorityClass(StartInfo.Priority);
     result := LaunchWithLogon(command, creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo);
   end
   else
   begin
     // DETACHED_PROCESS: no console at all; CREATE_NEW_CONSOLE
     //   (DetachedNewConsole): a console of its own, shown or hidden by
-    //   wShowWindow. Never ours either way.
-    // CREATE_NEW_PROCESS_GROUP: child won't see our Ctrl+C / Ctrl+Break.
+    //   wShowWindow. Never ours either way, so our Ctrl+C / Ctrl+Break never
+    //   reaches the child. CREATE_NEW_PROCESS_GROUP is not used: it would
+    //   make the child, and everything it starts, ignore Ctrl+C.
     // CREATE_BREAKAWAY_FROM_JOB: survive the host's job (CI runners). It
     //   makes CreateProcess fail with ERROR_ACCESS_DENIED when the host's
     //   job does not allow breakaway, so retry inside the job in that case.
@@ -1703,7 +1900,7 @@ begin
       creationFlags := CREATE_NEW_CONSOLE
     else
       creationFlags := DETACHED_PROCESS;
-    creationFlags := creationFlags or CREATE_NEW_PROCESS_GROUP or CREATE_UNICODE_ENVIRONMENT or PriorityClass(StartInfo.Priority);
+    creationFlags := creationFlags or CREATE_UNICODE_ENVIRONMENT or PriorityClass(StartInfo.Priority);
     result := CreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, FALSE,
                              creationFlags or VPROCESS_CREATE_BREAKAWAY_FROM_JOB,
                              pEnvironment, pWorkingDir, startupInfo, processInfo);
@@ -1802,9 +1999,5 @@ initialization
   // and the stdin writer. The memory manager only locks when IsMultiThread
   // is set, which otherwise only happens when a TThread is created.
   IsMultiThread := True;
-  GSpawnLock := TCriticalSection.Create;
-
-finalization
-  GSpawnLock.Free;
 
 end.

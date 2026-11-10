@@ -225,6 +225,63 @@ begin
   end;
 end;
 
+// The text a part quoted by EscapeForWindowsCommandLine stands for.
+function UnescapeQuotedPart(const quotedPart : string) : string;
+var
+  i, last, backslashCount : integer;
+begin
+  result := '';
+  last := Length(quotedPart) - 1;
+  i := 2;
+  while i <= last do
+  begin
+    backslashCount := 0;
+    while (i <= last) and (quotedPart[i] = '\') do
+    begin
+      Inc(backslashCount);
+      Inc(i);
+    end;
+    if i > last then
+      result := result + StringOfChar('\', backslashCount div 2)
+    else if quotedPart[i] = '"' then
+    begin
+      result := result + StringOfChar('\', backslashCount div 2) + '"';
+      Inc(i);
+    end
+    else
+    begin
+      result := result + StringOfChar('\', backslashCount) + quotedPart[i];
+      Inc(i);
+    end;
+  end;
+end;
+
+// Puts a rendered name and separator in front of a rendered value. Each part
+// was quoted on its own, which goes wrong where the text before a value that
+// starts with a quote runs straight into it: the child then reads that quote
+// as a literal one and splits the argument at the next space. qtNone parts
+// are the caller's own text and are joined as given.
+function JoinNameAndValue(const namePart : string; const separator : string; const valuePart : string; quoted : TQuoted) : string;
+var
+  prefix : string;
+  backslashCount : integer;
+begin
+  prefix := namePart + separator;
+  if (quoted = TQuoted.qtNone) or (prefix = '') or (valuePart = '') or (valuePart[1] <> '"') then
+    Exit(prefix + valuePart);
+  // "a b""c d": a quote right after a closing quote is a literal quote, so a
+  // quoted name and a quoted value with nothing between them are quoted as
+  // the one piece of text they are.
+  if (separator = '') and (namePart[1] = '"') then
+    Exit(TStringUtils.EscapeForWindowsCommandLine(UnescapeQuotedPart(namePart) + UnescapeQuotedPart(valuePart)));
+  // /out:C:\build\"my file": \" is an escaped quote. Doubled, the backslashes
+  // stay literal and the quote opens the value.
+  backslashCount := 0;
+  while (backslashCount < Length(prefix)) and (prefix[Length(prefix) - backslashCount] = '\') do
+    Inc(backslashCount);
+  result := prefix + StringOfChar('\', backslashCount) + valuePart;
+end;
+
 function TArgument.ToString: string;
 begin
   // Add('', '') is an explicit empty argument.
@@ -234,10 +291,9 @@ begin
   // or always when QuoteName is set; qtNone leaves it as given.
   if FValue = '' then
     Exit(QuotePart(FName, FQuoted, FQuoteName));
-  result := '';
-  if FName <> '' then
-    result := QuotePart(FName, FQuoted, False) + FNameSeparator;
-  result := result + QuotePart(FValue, FQuoted, True);
+  if FName = '' then
+    Exit(QuotePart(FValue, FQuoted, True));
+  result := JoinNameAndValue(QuotePart(FName, FQuoted, False), FNameSeparator, QuotePart(FValue, FQuoted, True), FQuoted);
 end;
 
 function TArgument.GetNameSep: String;
@@ -309,13 +365,16 @@ begin
       Exit(cMask);
     Exit(QuotePart(FName, FQuoted, FQuoteName));
   end;
-  result := '';
-  if FName <> '' then
-    result := QuotePart(FName, FQuoted, False) + FNameSeparator;
+  if FName = '' then
+  begin
+    if maskValue then
+      Exit(cMask);
+    Exit(QuotePart(FValue, FQuoted, True));
+  end;
   if maskValue then
-    result := result + cMask
+    result := QuotePart(FName, FQuoted, False) + FNameSeparator + cMask
   else
-    result := result + QuotePart(FValue, FQuoted, True);
+    result := JoinNameAndValue(QuotePart(FName, FQuoted, False), FNameSeparator, QuotePart(FValue, FQuoted, True), FQuoted);
 end;
 
 function TSensitiveArgument.Clone : IArgument;
@@ -394,6 +453,11 @@ end;
 function TArgumentsBuilder.AddUnsafeBatchRaw(const text : string) : ICommandLineBuilder;
 begin
   result := Self;
+  // Raw text is passed as given, and no text is nothing at all: as an
+  // argument it would render like Add(''), the explicit empty argument, and
+  // take an argv slot on POSIX.
+  if text = '' then
+    Exit;
   FArgs.Add(TUnsafeBatchRawArgument.Create(text));
 end;
 

@@ -427,7 +427,9 @@ begin
   FreeAndNil(FFileStream);
   if not FileExists(FFileName) then
     raise EVSoftProcessError.Create('Stdin source file not found: ' + FFileName);
-  FFileStream := TFileStream.Create(FFileName, fmOpenRead or fmShareDenyWrite);
+  // Shared with writers, as a shell redirect opens it: the file may be a log
+  // another program is still writing.
+  FFileStream := TFileStream.Create(FFileName, fmOpenRead or fmShareDenyNone);
 end;
 
 procedure TFileStdInPipeSource.Done;
@@ -473,7 +475,9 @@ begin
   FreeAndNil(FFileStream);
   if not FileExists(FFileName) then
     raise EVSoftProcessError.Create('Stdin source file not found: ' + FFileName);
-  FFileStream := TFileStream.Create(FFileName, fmOpenRead or fmShareDenyWrite);
+  // Shared with writers, as a shell redirect opens it: the file may be a log
+  // another program is still writing.
+  FFileStream := TFileStream.Create(FFileName, fmOpenRead or fmShareDenyNone);
 end;
 
 procedure TFilePipeSource.Done;

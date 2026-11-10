@@ -39,9 +39,11 @@ implementation
 uses
   {$IFDEF MSWINDOWS}
   Winapi.Windows,
+  VSoft.Process.Tests.Review.Windows,
   {$ENDIF}
   System.SysUtils,
-  System.Classes;
+  System.Classes,
+  VSoft.Process.Tests.Review.Core;
 
 const
   cHelperSwitch = '--vsp-helper=';
@@ -234,8 +236,13 @@ begin
   if not result then
     Exit;
   mode := Copy(ParamStr(1), Length(cHelperSwitch) + 1, MaxInt);
+  if mode = 'review-core-sync-synchronize' then
+    RunReviewCoreSyncSynchronizeHelper
+  else
   {$IFDEF MSWINDOWS}
-  if mode = 'breakaway-child' then
+  if ReviewWindowsHelper(mode) then
+    Exit
+  else if mode = 'breakaway-child' then
     BreakawayChild
   else if mode = 'in-job-then-breakaway' then
     InJobThenBreakaway

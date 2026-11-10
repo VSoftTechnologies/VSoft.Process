@@ -25,7 +25,10 @@ type
 
   TPipeTargetSlot = record
     Target : IPipeTarget;
-    Faulted : boolean;
+    // Where the target is in the run's started targets. Its fault flag is
+    // kept there, once per target: a target attached to both streams has a
+    // slot in each but must stop receiving both when it raises.
+    StartedIndex : integer;
   end;
 
   TProcessBase = class;
@@ -104,23 +107,44 @@ type
     FRunStdOut : TArray<TPipeTargetSlot>;
     FRunStdErr : TArray<TPipeTargetSlot>;
     FStartedTargets : TList<IPipeTarget>;
+    // One flag per started target (TPipeTargetSlot.StartedIndex), set when
+    // it raises. Only touched under FDeliveryLock once the run has started.
+    FTargetFaulted : TArray<boolean>;
     FRunStdInStarted : boolean;
     FDeliveryLock : TCriticalSection;
 
     // Threads Terminate must never block on (0 = none), because the run can't
     // complete while they are inside a callback:
-    //  FWorkerThreadId     : runs DoWaitForCompletion for the current run.
+    //  FWorkerThreadId     : runs DoWaitForCompletion for the current run. 0
+    //                        while ExecuteAsync is still starting the run;
+    //                        FStartThreadId is the thread to avoid until then.
     //  FDeliveringThreadId : currently inside a pipe target's HandleData
     //                        (delivery is serialised, so there is at most one).
     FWorkerThreadId : TThreadID;
     FDeliveringThreadId : TThreadID;
+
+    // FTerminateEvent is shared by every run of this object. Each run has a
+    // number, and FTerminateLock makes "is it still the run I saw in
+    // progress? then set the event" one step against the next run's "new
+    // number, reset the event", so a Terminate that is overtaken by the end
+    // of its run can't stop the run started after it.
+    FRunGeneration : Integer;
+    FTerminateLock : TCriticalSection;
 
     function StartRun(const cancellationToken : ICancellationToken; const cancellationEvent : TEvent; mode : TProcessStartMode) : boolean;
     procedure RunWorker;
     procedure CompleteRun(const outcome : TProcessOutcome);
     procedure AbortStart;
     procedure DeliverTo(const slots : TArray<TPipeTargetSlot>; isStdErr : boolean; const buffer : TBytes; count : NativeUInt);
+    // Starts a new run generation with no terminate request pending.
+    procedure ResetTerminateRequest;
+    // Sets the terminate event unless a later run than the given one has
+    // started; False when one has.
+    function RequestTerminate(generation : Integer) : boolean;
     function CanWaitForCompletion : boolean;
+    function WaitForCompletion(waitMS : Cardinal) : boolean;
+    // A detached child is out there: ExitCode / TimedOut can't be read.
+    function IsDetachedRun : boolean;
     // Called by a stdin writer as it finishes.
     procedure StdInWriterFinished(threadId : TThreadID);
   protected
@@ -247,6 +271,9 @@ type
     function WithStdOutPipe(const pipeTarget : IPipeTarget) : IProcess;
     function WithStdErrPipe(const pipeTarget : IPipeTarget) : IProcess;
     function WithStdInPipe(const pipeSource : IPipeSource) : IProcess;
+    function ClearStdOutPipes : IProcess;
+    function ClearStdErrPipes : IProcess;
+    function ClearPipes : IProcess;
     function Execute(const cancellationToken : ICancellationToken = nil) : boolean;overload;
     function Execute(const cancellationEvent : TEvent) : boolean;overload;
     function ExecuteAsync(const cancellationToken : ICancellationToken = nil) : boolean;overload;
@@ -278,6 +305,7 @@ function CurrentThreadId : TThreadID;
 implementation
 
 uses
+  System.Diagnostics,
   {$IFDEF MSWINDOWS}
   Winapi.Windows;
   {$ELSE}
@@ -387,7 +415,7 @@ begin
   for i := 0 to list.Count - 1 do
   begin
     result[i].Target := list[i];
-    result[i].Faulted := false;
+    result[i].StartedIndex := -1;
   end;
 end;
 
@@ -405,6 +433,7 @@ begin
   FErrors := TStringList.Create;
   FErrorsLock := TCriticalSection.Create;
   FDeliveryLock := TCriticalSection.Create;
+  FTerminateLock := TCriticalSection.Create;
   FExitCode := $FFFFFFFF;
   SetStatusAtomic(TProcessStatus.Idle);
   FTimedOut := false;
@@ -457,6 +486,7 @@ begin
   FErrors.Free;
   FErrorsLock.Free;
   FDeliveryLock.Free;
+  FTerminateLock.Free;
   FStdOutTargets.Free;
   FStdErrTargets.Free;
   FStartedTargets.Free;
@@ -488,6 +518,7 @@ end;
 function TProcessBase.StartRun(const cancellationToken : ICancellationToken; const cancellationEvent : TEvent; mode : TProcessStartMode) : boolean;
 var
   handedOver : boolean;
+  valid : boolean;
 begin
   ClaimRun;
   handedOver := false;
@@ -508,7 +539,15 @@ begin
         LogError('Cancellation event is signalled');
         exit;
       end;
-      if not ValidateStartUpBuilder then //this logs its own errors
+      valid := ValidateStartUpBuilder; //this logs its own errors
+      // Checked here and not in ValidateStartUpBuilder: ExecuteDetached
+      // ignores the timeout and JobMode.
+      if (not FStartInfoBuilder.TerminateOnTimeout) and (FStartInfoBuilder.JobMode = TProcessJobMode.KillOnRelease) then
+      begin
+        LogError('TerminateOnTimeout = False needs JobMode KillOnTerminate or NoJob: with KillOnRelease the child left running would be killed when the IProcess is released or run again');
+        valid := false;
+      end;
+      if not valid then
         exit;
       // InternalStart / InternalStartAsync release the claim once the run is
       // in progress (or has failed to start).
@@ -614,9 +653,16 @@ begin
   result := FResolvedExecutable;
 end;
 
+function TProcessBase.IsDetachedRun : boolean;
+begin
+  // A detached launch that was refused or failed leaves Status at Idle and
+  // reads like any other failed Execute*.
+  result := (FStartMode = TProcessStartMode.Detached) and (FStatus = TProcessStatus.Running);
+end;
+
 function TProcessBase.GetExitCode: Cardinal;
 begin
-  if FStartMode = TProcessStartMode.Detached then
+  if IsDetachedRun then
     raise EInvalidOpException.Create('Cannot get exit code from detached process');
   result := FExitCode;
 end;
@@ -653,7 +699,7 @@ end;
 
 function TProcessBase.GetTimedOut: boolean;
 begin
-  if FStartMode = TProcessStartMode.Detached then
+  if IsDetachedRun then
     raise EInvalidOpException.Create('Cannot read TimedOut on a detached process');
   result := FTimedOut;
 end;
@@ -677,7 +723,7 @@ begin
   FStartThreadId := CurrentThreadId;
   // The calling thread is the worker for a synchronous run.
   FWorkerThreadId := FStartThreadId;
-  FTerminateEvent.ResetEvent;
+  ResetTerminateRequest;
   FCompletionEvent.ResetEvent;
   // From here the completion event marks the run as in progress.
   ReleaseRunClaim;
@@ -710,7 +756,7 @@ begin
   result := false;
   FStartThreadId := CurrentThreadId;
   FWorkerThreadId := 0;
-  FTerminateEvent.ResetEvent;
+  ResetTerminateRequest;
   FCompletionEvent.ResetEvent;
   // From here the completion event marks the run as in progress.
   ReleaseRunClaim;
@@ -918,7 +964,7 @@ begin
     streamName := 'stdout';
   for i := 0 to High(slots) do
   begin
-    if slots[i].Faulted then
+    if FTargetFaulted[slots[i].StartedIndex] then
       continue;
     try
       // A target attached to both streams keeps each stream's partial line
@@ -930,12 +976,12 @@ begin
     except
       on E : Exception do
       begin
-        slots[i].Faulted := true;
+        FTargetFaulted[slots[i].StartedIndex] := true;
         LogError(streamName + ' pipe target raised ' + E.ClassName + ' - ' + E.Message + ' (it receives no more data this run)');
       end;
       else
       begin
-        slots[i].Faulted := true;
+        FTargetFaulted[slots[i].StartedIndex] := true;
         LogError(streamName + ' pipe target raised a non-Exception object (it receives no more data this run)');
       end;
     end;
@@ -1011,15 +1057,18 @@ procedure TProcessBase.StartPipeTargets;
   procedure StartTargets(const slots : TArray<TPipeTargetSlot>);
   var
     i : integer;
+    startedIndex : integer;
   begin
     for i := 0 to High(slots) do
     begin
       // A target attached to both streams is started (and later Done) once.
-      if FStartedTargets.IndexOf(slots[i].Target) < 0 then
+      startedIndex := FStartedTargets.IndexOf(slots[i].Target);
+      if startedIndex < 0 then
       begin
         slots[i].Target.Start;
-        FStartedTargets.Add(slots[i].Target);
+        startedIndex := FStartedTargets.Add(slots[i].Target);
       end;
+      slots[i].StartedIndex := startedIndex;
     end;
   end;
 
@@ -1027,6 +1076,9 @@ begin
   FStartedTargets.Clear;
   FRunStdOut := SnapshotTargets(FStdOutTargets);
   FRunStdErr := SnapshotTargets(FStdErrTargets);
+  // Emptied first so that every flag starts out False.
+  SetLength(FTargetFaulted, 0);
+  SetLength(FTargetFaulted, Length(FRunStdOut) + Length(FRunStdErr));
   FRunStdIn := FStdInSource;
   FRunStdInStarted := false;
   ApplyDefaultEncodings;
@@ -1075,6 +1127,8 @@ begin
     except
       on E : Exception do
         LogError('Pipe target Done raised ' + E.ClassName + ' - ' + E.Message);
+      else
+        LogError('Pipe target Done raised a non-Exception object');
     end;
   end;
   FStartedTargets.Clear;
@@ -1086,6 +1140,8 @@ begin
     except
       on E : Exception do
         LogError('Stdin pipe source Done raised ' + E.ClassName + ' - ' + E.Message);
+      else
+        LogError('Stdin pipe source Done raised a non-Exception object');
     end;
   end;
   SetLength(FRunStdOut, 0);
@@ -1107,17 +1163,74 @@ end;
 function TProcessBase.CanWaitForCompletion : boolean;
 var
   currentId : TThreadID;
+  workerId : TThreadID;
 begin
   // Never wait on ourselves: from the thread that runs the worker (sync
   // Execute, or an event handler on the async worker), from a pipe target or
-  // stdin source callback, or before the async worker exists (OnStarted).
+  // stdin source callback, or from the thread inside ExecuteAsync before the
+  // async worker exists (OnStarted). Any other thread can wait, also while
+  // ExecuteAsync is still starting the run.
   // The id fields are read without a lock: a thread can only ever find its
   // own id in them if it stored it there itself, and the ids are never 0.
   currentId := CurrentThreadId;
-  result := (FWorkerThreadId <> 0) and
-            (currentId <> FWorkerThreadId) and
+  workerId := FWorkerThreadId;
+  if workerId = 0 then
+    workerId := FStartThreadId;
+  result := (currentId <> workerId) and
             (currentId <> FDeliveringThreadId) and
             (currentId <> FStdInWriterThreadId);
+end;
+
+function TProcessBase.WaitForCompletion(waitMS : Cardinal) : boolean;
+const
+  cSliceMS = 10;
+var
+  clock : TStopwatch;
+  elapsed : Int64;
+  slice : Cardinal;
+begin
+  if CurrentThreadId <> MainThreadID then
+    Exit(FCompletionEvent.WaitFor(waitMS) = wrSignaled);
+  // The main thread has to keep servicing TThread.Synchronize while it
+  // waits, as TThread.WaitFor does: the run can't complete while one of its
+  // pipe targets is blocked in a Synchronize call.
+  clock := TStopwatch.StartNew;
+  repeat
+    CheckSynchronize;
+    slice := cSliceMS;
+    if waitMS <> INFINITE then
+    begin
+      elapsed := clock.ElapsedMilliseconds;
+      if elapsed >= waitMS then
+        slice := 0
+      else if waitMS - elapsed < cSliceMS then
+        slice := Cardinal(waitMS - elapsed);
+    end;
+    result := FCompletionEvent.WaitFor(slice) = wrSignaled;
+  until result or (slice = 0);
+end;
+
+procedure TProcessBase.ResetTerminateRequest;
+begin
+  FTerminateLock.Enter;
+  try
+    TInterlocked.Increment(FRunGeneration);
+    FTerminateEvent.ResetEvent;
+  finally
+    FTerminateLock.Leave;
+  end;
+end;
+
+function TProcessBase.RequestTerminate(generation : Integer) : boolean;
+begin
+  FTerminateLock.Enter;
+  try
+    result := FRunGeneration = generation;
+    if result then
+      FTerminateEvent.SetEvent;
+  finally
+    FTerminateLock.Leave;
+  end;
 end;
 
 function TProcessBase.Terminate: boolean;
@@ -1128,14 +1241,22 @@ begin
 end;
 
 function TProcessBase.Terminate(waitMS : Cardinal) : boolean;
+var
+  generation : Integer;
 begin
+  // Read before the check, so that it is never the number of a run started
+  // after the one the check sees in progress.
+  generation := FRunGeneration;
   if (FStartMode = TProcessStartMode.Detached) or IsReadyForRun then
     Exit(false);
-  FTerminateEvent.SetEvent;
+  // False: that run has completed since and another one has started, which
+  // this call was not aimed at.
+  if not RequestTerminate(generation) then
+    Exit(false);
   // 0 only requests: the thread running the run kills and waits.
   if (waitMS = 0) or (not CanWaitForCompletion) then
     Exit(true);
-  result := FCompletionEvent.WaitFor(waitMS) = wrSignaled;
+  result := WaitForCompletion(waitMS);
 end;
 
 function TProcessBase.ValidateStartUpBuilder: boolean;
@@ -1156,11 +1277,6 @@ begin
   if (FStartInfoBuilder.WorkingDirectory <> '') and (not DirectoryExists(FStartInfoBuilder.WorkingDirectory)) then
   begin
     LogError('WorkingDirectory does not exist');
-    result := false;
-  end;
-  if (not FStartInfoBuilder.TerminateOnTimeout) and (FStartInfoBuilder.JobMode = TProcessJobMode.KillOnRelease) then
-  begin
-    LogError('TerminateOnTimeout = False needs JobMode KillOnTerminate or NoJob: with KillOnRelease the child left running would be killed when the IProcess is released or run again');
     result := false;
   end;
   {$IFDEF MSWINDOWS}
@@ -1228,6 +1344,29 @@ function TProcessBase.WithStdInPipe(const pipeSource: IPipeSource): IProcess;
 begin
   FStdInSource := pipeSource;
   result := self;
+end;
+
+// In the three Clear methods result is assigned first: a target being
+// released may hold the last other reference to this object (a delegate that
+// captured the IProcess).
+function TProcessBase.ClearStdOutPipes : IProcess;
+begin
+  result := Self;
+  FStdOutTargets.Clear;
+end;
+
+function TProcessBase.ClearStdErrPipes : IProcess;
+begin
+  result := Self;
+  FStdErrTargets.Clear;
+end;
+
+function TProcessBase.ClearPipes : IProcess;
+begin
+  result := Self;
+  FStdOutTargets.Clear;
+  FStdErrTargets.Clear;
+  FStdInSource := nil;
 end;
 
 function TProcessBase.WithStdOutPipe(const pipeTarget: IPipeTarget): IProcess;

@@ -45,6 +45,22 @@ type
     FUserModified : boolean;
     FData : TBytes;
     FVariables : TStringList;
+    // The host environment is copied in one piece (NUL terminated entries)
+    // when the builder is created or Reset, and only split into FVariables
+    // when something asks for the variables: most builders are never
+    // touched. False while FVariables has not been filled from FHostBlock.
+    FLoaded : boolean;
+    {$IFDEF MSWINDOWS}
+    FHostBlock : string;
+    {$ELSE}
+    FHostBlock : TBytes;
+    // Host entries that are not valid UTF-8, exactly as found in environ.
+    // FVariables holds a lossy decode of such an entry and, in Objects, its
+    // index here + 1, so the child still gets the original bytes unless the
+    // variable is set again.
+    FRawEntries : TArray<TBytes>;
+    {$ENDIF}
+    procedure EnsureLoaded;
   protected
     function GetCount : integer;
     function HasOverrides : boolean;
@@ -116,6 +132,88 @@ begin
   // Unicode ordinal order, without regard to locale.
   result := CompareNames(EnvName(list[index1]), EnvName(list[index2]));
 end;
+{$ELSE}
+// Decodes one environ entry as UTF-8. Every byte that is not part of a
+// well-formed sequence becomes U+FFFD and clears lossless: the text can then
+// not be encoded back to the bytes it came from.
+function DecodeEnvironEntry(const bytes : TBytes; out lossless : boolean) : string;
+var
+  i : integer;
+  k : integer;
+  extra : integer;
+  count : integer;
+  codePoint : Cardinal;
+  minimum : Cardinal;
+  valid : boolean;
+begin
+  lossless := true;
+  // Never more UTF-16 code units than bytes.
+  SetLength(result, Length(bytes));
+  count := 0;
+  i := 0;
+  while i < Length(bytes) do
+  begin
+    codePoint := bytes[i];
+    minimum := 0;
+    extra := 0;
+    valid := true;
+    if codePoint >= $80 then
+    begin
+      if (codePoint and $E0) = $C0 then
+      begin
+        extra := 1;
+        minimum := $80;
+        codePoint := codePoint and $1F;
+      end
+      else if (codePoint and $F0) = $E0 then
+      begin
+        extra := 2;
+        minimum := $800;
+        codePoint := codePoint and $0F;
+      end
+      else if (codePoint and $F8) = $F0 then
+      begin
+        extra := 3;
+        minimum := $10000;
+        codePoint := codePoint and $07;
+      end
+      else
+        valid := false;
+    end;
+    valid := valid and (i + extra < Length(bytes));
+    k := 1;
+    while valid and (k <= extra) do
+    begin
+      valid := (bytes[i + k] and $C0) = $80;
+      codePoint := (codePoint shl 6) or (bytes[i + k] and $3F);
+      Inc(k);
+    end;
+    // Overlong forms, surrogates and values past U+10FFFF are not UTF-8.
+    valid := valid and (codePoint >= minimum) and (codePoint <= $10FFFF) and
+             ((codePoint < $D800) or (codePoint > $DFFF));
+    if not valid then
+    begin
+      lossless := false;
+      codePoint := $FFFD;
+      extra := 0;
+    end;
+    if codePoint >= $10000 then
+    begin
+      Dec(codePoint, $10000);
+      Inc(count);
+      result[count] := Char($D800 or (codePoint shr 10));
+      Inc(count);
+      result[count] := Char($DC00 or (codePoint and $3FF));
+    end
+    else
+    begin
+      Inc(count);
+      result[count] := Char(codePoint);
+    end;
+    Inc(i, extra + 1);
+  end;
+  SetLength(result, count);
+end;
 {$ENDIF}
 
 procedure ValidateName(const name : string);
@@ -166,10 +264,14 @@ begin
   ValidateName(name);
   ValidateValue(name, value);
   result := Self;
+  EnsureLoaded;
   idx := IndexOfVariable(FVariables, name);
   if idx <> -1 then
+  begin
     // Not ValueFromIndex: assigning '' to it deletes the line.
-    FVariables[idx] := FVariables.Names[idx] + '=' + value
+    FVariables[idx] := FVariables.Names[idx] + '=' + value;
+    FVariables.Objects[idx] := nil;
+  end
   else
     FVariables.Add(name +'=' + value);
   FChanged := True;
@@ -232,8 +334,23 @@ end;
 
 constructor TEnvironmentBuilder.CreateClone(const source: TEnvironmentBuilder);
 begin
-  Create;
-  FVariables.Assign(source.FVariables);
+  // Not Create: that would copy the host environment only to discard it.
+  inherited Create;
+  FVariables := TStringList.Create;
+  {$IFNDEF MSWINDOWS}
+  FVariables.CaseSensitive := True;
+  {$ENDIF}
+  FLoaded := source.FLoaded;
+  if FLoaded then
+  begin
+    FVariables.Assign(source.FVariables);
+    {$IFNDEF MSWINDOWS}
+    FRawEntries := Copy(source.FRawEntries);
+    {$ENDIF}
+  end
+  else
+    // Shared, never changed: the clone splits the same copy when it needs to.
+    FHostBlock := source.FHostBlock;
   FChanged := true;
   // Mirror the source's "user has overridden" state so the platform impl
   // can keep its inherit-parent-env optimisation when cloning an unchanged
@@ -249,6 +366,7 @@ end;
 
 function TEnvironmentBuilder.GetCount: integer;
 begin
+  EnsureLoaded;
   result := FVariables.Count;
 end;
 
@@ -261,6 +379,7 @@ var
   i: Integer;
   sorted : TStringList;
 begin
+  EnsureLoaded;
   //avoid regenerating the block if we already have it and it's not changed.
   if not FChanged  then
   begin
@@ -325,22 +444,21 @@ function TEnvironmentBuilder.LoadCurrentEnvironmentBlock : IEnvironmentBuilder;
 var
   PEnvBlock : PChar;
   pTmp : PChar;
-  sTmp : string;
 begin
   result := Self;
   FVariables.Clear;
   FChanged := True;
+  FLoaded := False;
   SetLength(FData,0);
+  FHostBlock := '';
   PEnvBlock := GetEnvironmentStrings;
+  if PEnvBlock = nil then
+    exit;
   try
     pTmp := PEnvBlock;
     while pTmp^ <> #0 do
-    begin
-      stmp := string(pTmp);
-      pTmp := pTmp + Length(sTmp) + 1;
-      if (Trim(sTmp) <> '') and (Trim(stmp) <> '=::=::\') then
-        FVariables.Add(stmp);
-    end;    // while
+      pTmp := pTmp + StrLen(pTmp) + 1;
+    SetString(FHostBlock, PEnvBlock, pTmp - PEnvBlock);
   finally
     FreeEnvironmentStrings(PEnvBlock);
   end;
@@ -348,29 +466,105 @@ end;
 {$ELSE}
 var
   envPtr: PPAnsiChar;
-  utf8Bytes: TBytes;
-  envStr: string;
   len: Integer;
+  total: Integer;
 begin
   result := Self;
   FVariables.Clear;
+  SetLength(FRawEntries, 0);
   FChanged := True;
+  FLoaded := False;
   SetLength(FData,0);
 
+  total := 0;
   envPtr := PPAnsiChar(environ);
-  while envPtr^ <> nil do
+  while (envPtr <> nil) and (envPtr^ <> nil) do
   begin
     len := 0;
     while envPtr^[len] <> #0 do
       Inc(len);
-    SetLength(utf8Bytes, len);
-    if len > 0 then
-      Move(envPtr^^, utf8Bytes[0], len);
-    envStr := TEncoding.UTF8.GetString(utf8Bytes);
-    if Trim(envStr) <> '' then
-      FVariables.Add(envStr);
+    Inc(total, len + 1);
     Inc(envPtr);
   end;
+  FHostBlock := nil;
+  SetLength(FHostBlock, total);
+  total := 0;
+  envPtr := PPAnsiChar(environ);
+  while (envPtr <> nil) and (envPtr^ <> nil) do
+  begin
+    len := 0;
+    while envPtr^[len] <> #0 do
+      Inc(len);
+    // The environment may have grown since it was measured.
+    if total + len + 1 > Length(FHostBlock) then
+      Break;
+    Move(envPtr^^, FHostBlock[total], len + 1);
+    Inc(total, len + 1);
+    Inc(envPtr);
+  end;
+  SetLength(FHostBlock, total);
+end;
+{$ENDIF}
+
+procedure TEnvironmentBuilder.EnsureLoaded;
+{$IFDEF MSWINDOWS}
+var
+  pTmp : PChar;
+  pEnd : PChar;
+  sTmp : string;
+begin
+  if FLoaded then
+    exit;
+  FLoaded := True;
+  // Not @FHostBlock[1]: that would copy a block shared with a clone.
+  pTmp := PChar(Pointer(FHostBlock));
+  pEnd := pTmp + Length(FHostBlock);
+  while pTmp < pEnd do
+  begin
+    stmp := string(pTmp);
+    pTmp := pTmp + Length(sTmp) + 1;
+    if (Trim(sTmp) <> '') and (Trim(stmp) <> '=::=::\') then
+      FVariables.Add(stmp);
+  end;    // while
+  FHostBlock := '';
+end;
+{$ELSE}
+var
+  utf8Bytes: TBytes;
+  envStr: string;
+  position: Integer;
+  len: Integer;
+  lossless: boolean;
+begin
+  if FLoaded then
+    exit;
+  FLoaded := True;
+  position := 0;
+  while position < Length(FHostBlock) do
+  begin
+    len := 0;
+    while FHostBlock[position + len] <> 0 do
+      Inc(len);
+    SetLength(utf8Bytes, len);
+    if len > 0 then
+      Move(FHostBlock[position], utf8Bytes[0], len);
+    Inc(position, len + 1);
+    // Not TEncoding.UTF8.GetString: it raises on a value that is not valid
+    // UTF-8, and environment values are arbitrary bytes.
+    envStr := DecodeEnvironEntry(utf8Bytes, lossless);
+    if Trim(envStr) <> '' then
+    begin
+      if lossless then
+        FVariables.Add(envStr)
+      else
+      begin
+        SetLength(FRawEntries, Length(FRawEntries) + 1);
+        FRawEntries[High(FRawEntries)] := utf8Bytes;
+        FVariables.AddObject(envStr, TObject(NativeInt(Length(FRawEntries))));
+      end;
+    end;
+  end;
+  FHostBlock := nil;
 end;
 {$ENDIF}
 
@@ -379,6 +573,7 @@ var
   idx : integer;
 begin
   result := Self;
+  EnsureLoaded;
   idx := IndexOfVariable(FVariables, name);
   if idx <> -1 then
   begin
@@ -392,6 +587,9 @@ function TEnvironmentBuilder.Clear : IEnvironmentBuilder;
 begin
   result := Self;
   FVariables.Clear;
+  // Nothing of the host environment is wanted any more.
+  FLoaded := True;
+  SetLength(FHostBlock, 0);
   FChanged := true;
   FUserModified := True;
 end;
@@ -400,6 +598,7 @@ function TEnvironmentBuilder.TryGetValue(const name : string; out value : string
 var
   idx : integer;
 begin
+  EnsureLoaded;
   idx := IndexOfVariable(FVariables, name);
   result := idx <> -1;
   if result then
@@ -410,6 +609,7 @@ end;
 
 function TEnvironmentBuilder.Exists(const name : string) : boolean;
 begin
+  EnsureLoaded;
   // IndexOfVariable never matches an empty name, so Windows drive entries
   // such as "=C:=C:\dir" are not found.
   result := IndexOfVariable(FVariables, name) <> -1;
@@ -417,6 +617,7 @@ end;
 
 function TEnvironmentBuilder.ToString: string;
 begin
+  EnsureLoaded;
   result := FVariables.Text;
 end;
 
@@ -425,7 +626,11 @@ var
   i, j: Integer;
   utf8Bytes: TBytes;
   len: Integer;
+  {$IFNDEF MSWINDOWS}
+  rawIndex: NativeInt;
+  {$ENDIF}
 begin
+  EnsureLoaded;
   SetLength(result, FVariables.Count + 1);
   // Pre-nil every slot so that on an exception in the loop below we can
   // free only the ones we actually allocated, without reading garbage.
@@ -435,7 +640,13 @@ begin
   try
     for i := 0 to FVariables.Count - 1 do
     begin
-      utf8Bytes := TEncoding.UTF8.GetBytes(FVariables.Strings[i]);
+      {$IFNDEF MSWINDOWS}
+      rawIndex := NativeInt(FVariables.Objects[i]);
+      if rawIndex > 0 then
+        utf8Bytes := FRawEntries[rawIndex - 1]
+      else
+      {$ENDIF}
+        utf8Bytes := TEncoding.UTF8.GetBytes(FVariables.Strings[i]);
       len := Length(utf8Bytes);
       GetMem(result[i], len + 1);
       if len > 0 then

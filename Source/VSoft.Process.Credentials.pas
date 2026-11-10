@@ -194,6 +194,17 @@ begin
     errorProc('If you use the UPN format for username (user@domain), the Domain property must be empty');
     result := false;
   end;
+  // A down-level name (DOMAIN\user) is never split: with no Domain the logon
+  // would look for an account of that whole name in the local account
+  // database, and with a Domain it names two.
+  if Pos('\', FUserName) > 0 then
+  begin
+    if FDomain = '' then
+      errorProc('The DOMAIN\user format is not supported for UserName: set the Domain property and give UserName without the domain, or use the UPN format (user@domain)')
+    else
+      errorProc('The UserName must not contain a domain (DOMAIN\user) when the Domain property is set');
+    result := false;
+  end;
   // CreateProcessWithLogonW requires both a username AND a password.
   if (FUserName <> '') and (FPassword = '') then
   begin

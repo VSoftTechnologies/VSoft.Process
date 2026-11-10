@@ -28,6 +28,26 @@
 
 unit VSoft.Process.Posix;
 
+// The record layouts, constants and system call numbers below are those of
+// the targets named here. Anything else must fail to compile rather than
+// misbehave at run time.
+{$IF NOT (DEFINED(LINUX) OR DEFINED(MACOS))}
+  {$MESSAGE FATAL 'VSoft.Process.Posix supports Linux and macOS only'}
+{$IFEND}
+// MACOS is also defined by the iOS compilers; an iOS app may not fork.
+{$IF DEFINED(IOS)}
+  {$MESSAGE FATAL 'VSoft.Process.Posix does not support iOS'}
+{$IFEND}
+// struct epoll_event is packed only on x86-64, and the system call numbers
+// are the x86-64 ones.
+{$IF DEFINED(LINUX) AND NOT DEFINED(CPUX64)}
+  {$MESSAGE FATAL 'VSoft.Process.Posix supports Linux on x86-64 only'}
+{$IFEND}
+// x86-64 and arm64 share the layouts used here (struct kevent, timespec).
+{$IF DEFINED(MACOS) AND NOT DEFINED(CPU64BITS)}
+  {$MESSAGE FATAL 'VSoft.Process.Posix supports 64-bit macOS only'}
+{$IFEND}
+
 interface
 
 uses
@@ -108,8 +128,11 @@ type
     EmptyMask : sigset_t;
     NiceValue : Integer;
     UseProcessGroup : boolean;
+    // Last descriptor of the close loop that is used only when the open
+    // descriptors cannot be listed.
     MaxFd : Integer;
     {$IFDEF LINUX}
+    FdDir : TBytes;
     CpuSet : cpu_set_t;
     ApplyAffinity : boolean;
     {$ENDIF}
@@ -123,6 +146,11 @@ type
     FStdErrReadFd: Integer;
     FEventFd: Integer;
     FPidFd: Integer;
+    // The child's exit wakes WaitForEvents (pidfd / EVFILT_PROC). When it
+    // does not, the wait loop polls for the exit.
+    FExitWatched : boolean;
+    // macOS: NOTE_EXIT has been received.
+    FExitNotified : boolean;
     FStdInWriter : IStdInWriter;
     FReadBuffer : TBytes;
     // After a normal exit: bytes that were in each pipe when the child was
@@ -143,7 +171,7 @@ type
     procedure WaitForEvents(timeoutMs : Integer);
     procedure DrainFd(var fd : Integer; isStdErr : boolean);
     function HasUnreadOutput : boolean;
-    function TryReap(var status : Integer; out unknownStatus : boolean) : boolean;
+    function TryReap(var status : Integer; out unknownStatus : boolean; out stopSignal : Integer) : boolean;
     procedure SignalChild(sig : Integer);
     function GetPipeBufferSize: NativeUInt;
   protected
@@ -163,8 +191,10 @@ implementation
 {$IF DEFINED(LINUX) OR DEFINED(MACOS)}
 
 {$IFDEF LINUX}
+// Guards the declaration (a dropped "packed" would give 16 bytes); that the
+// target really is x86-64 is checked at the top of the unit.
 {$IF SizeOf(TPlatformEvent) <> 12}
-  {$MESSAGE ERROR 'TPlatformEvent must match the packed 12 byte struct epoll_event'}
+  {$MESSAGE FATAL 'TPlatformEvent must be the packed 12 byte struct epoll_event of x86-64'}
 {$IFEND}
 
 const
@@ -175,12 +205,16 @@ const
   EPOLL_CTL_ADD = 1;
   EPOLL_CTL_DEL = 2;
   O_CLOEXEC = $80000;
+  O_DIRECTORY = $10000;
   F_DUPFD_CLOEXEC = 1030;
-  // x86-64 syscall numbers (the only Linux target Delphi supports). Called
+  // x86-64 syscall numbers (see the guard at the top of the unit). Called
   // through syscall() so the binary still loads on older glibc versions.
+  cSysGetDents64 = 217;
   cSysPidfdOpen = 434;
   cSysCloseRange = 436;
   CLOSE_RANGE_CLOEXEC = 4;
+  cWaitExited = 4;          // WEXITED
+  cWaitNoWait = $01000000;  // WNOWAIT
 
 function epoll_create1(flags: Integer): Integer; cdecl; external libc name 'epoll_create1';
 function epoll_ctl(epfd: Integer; op: Integer; fd: Integer; event: Pointer): Integer; cdecl; external libc name 'epoll_ctl';
@@ -193,6 +227,10 @@ function sched_setaffinity(pid: pid_t; cpusetsize: NativeUInt; mask: Pointer): I
 {$ENDIF}
 
 {$IFDEF MACOS}
+{$IF SizeOf(TPlatformEvent) <> 32}
+  {$MESSAGE FATAL 'TPlatformEvent must be the 32 byte struct kevent of 64-bit macOS'}
+{$IFEND}
+
 const
   EVFILT_READ = -1;
   EVFILT_PROC = -5;
@@ -201,6 +239,9 @@ const
   EV_ONESHOT = $0010;
   NOTE_EXIT = $80000000;
   F_DUPFD_CLOEXEC = 67;
+  cWaitExited = 4;      // WEXITED
+  cWaitNoWait = $20;    // WNOWAIT
+  cProcPidListFds = 1;  // PROC_PIDLISTFDS
 
 type
   TKTimeSpec = record
@@ -208,13 +249,23 @@ type
     tv_nsec: Int64;
   end;
 
+  // struct proc_fdinfo (sys/proc_info.h)
+  TProcFdInfo = record
+    proc_fd : Integer;
+    proc_fdtype : Cardinal;
+  end;
+
 function kqueue: Integer; cdecl; external libc name 'kqueue';
 function kevent(kq: Integer; changelist: Pointer; nchanges: Integer; eventlist: Pointer; nevents: Integer; timeout: Pointer): Integer; cdecl; external libc name 'kevent';
+// libproc.h. Both are plain system call wrappers: no allocation, no locks.
+function proc_pidinfo(pid: Integer; flavor: Integer; arg: UInt64; buffer: Pointer; bufferSize: Integer): Integer; cdecl; external libc name 'proc_pidinfo';
+function proc_listpgrppids(pgrpId: pid_t; buffer: Pointer; bufferSize: Integer): Integer; cdecl; external libc name 'proc_listpgrppids';
 {$ENDIF}
 
 const
   POLLOUT = $0004;
   PRIO_PROCESS = 0;
+  cWaitIdPid = 1; // P_PID
 
 type
   TPollFd = record
@@ -232,12 +283,13 @@ function poll(fds: Pointer; nfds: NativeUInt; timeout: Integer): Integer; cdecl;
 {$ELSE}
 function poll(fds: Pointer; nfds: Cardinal; timeout: Integer): Integer; cdecl; external libc name 'poll';
 {$ENDIF}
+function waitid(idType: Integer; id: Cardinal; info: Pointer; options: Integer): Integer; cdecl; external libc name 'waitid';
 
-var
-  // Held from pipe creation until the parent has closed the child's pipe
-  // ends, so our own concurrent spawns never inherit each other's pipes
-  // (macOS has no pipe2, so the CLOEXEC flag is set in a second step).
-  GSpawnLock : TCriticalSection;
+// Concurrent launches need no lock. The parent's ends of every running
+// child's pipes are open in the host for the whole run, so any later fork
+// copies them whatever was locked while they were created. What keeps them
+// (and every other descriptor of the host) out of the new program is the
+// child itself: RunChild marks or closes everything from 3 up before execve.
 
 // Child-process initialization failure reporting. The child writes one of
 // these records into the error self-pipe before _exit() so the parent can
@@ -283,6 +335,117 @@ begin
     __write(errFd, @report, SizeOf(report));
   _exit(255);
 end;
+
+{$IFDEF LINUX}
+type
+  // Reads a directory with getdents64 itself: opendir / readdir allocate, so
+  // they cannot be used between fork and exec.
+  TDirReader = record
+    Fd : Integer;
+    Count : NativeInt;
+    Offset : NativeInt;
+    Failed : boolean;
+    Buffer : array[0..2047] of Byte;
+  end;
+
+// The next entry whose name is a decimal number (a pid in /proc, a
+// descriptor in /proc/self/fd). False at the end of the directory, and with
+// reader.Failed set when it could not be read. Async-signal-safe.
+function NextNumericEntry(var reader : TDirReader; out value : Integer) : boolean;
+var
+  name : PByte;
+  recordLength : Word;
+  number : Int64;
+begin
+  value := 0;
+  while true do
+  begin
+    if reader.Offset >= reader.Count then
+    begin
+      reader.Count := syscall(cSysGetDents64, NativeInt(reader.Fd), NativeInt(@reader.Buffer[0]), NativeInt(SizeOf(reader.Buffer)));
+      reader.Offset := 0;
+      if reader.Count <= 0 then
+      begin
+        reader.Failed := reader.Count < 0;
+        Exit(false);
+      end;
+    end;
+    // struct linux_dirent64: d_ino (8 bytes), d_off (8), d_reclen (2),
+    // d_type (1), d_name.
+    recordLength := PWord(@reader.Buffer[reader.Offset + 16])^;
+    name := @reader.Buffer[reader.Offset + 19];
+    if recordLength = 0 then
+    begin
+      reader.Failed := true;
+      Exit(false);
+    end;
+    Inc(reader.Offset, recordLength);
+    if (name^ < Ord('0')) or (name^ > Ord('9')) then
+      continue;
+    number := 0;
+    while (name^ >= Ord('0')) and (name^ <= Ord('9')) and (number <= MaxInt) do
+    begin
+      number := number * 10 + (name^ - Ord('0'));
+      Inc(name);
+    end;
+    if (name^ = 0) and (number <= MaxInt) then
+    begin
+      value := Integer(number);
+      Exit(true);
+    end;
+  end;
+end;
+{$ENDIF}
+
+// Child side, when close_range is not available: closes every descriptor
+// from 3 up except keepFd by listing the ones that are open, so the cost
+// does not depend on RLIMIT_NOFILE and no descriptor number is out of reach.
+// False when they could not be listed. Async-signal-safe.
+function CloseOpenFds(const setup : TChildSetup; keepFd : Integer) : boolean;
+{$IFDEF LINUX}
+var
+  reader : TDirReader;
+  fd : Integer;
+begin
+  reader.Fd := open(MarshaledAString(@setup.FdDir[0]), O_RDONLY or O_DIRECTORY or O_CLOEXEC);
+  if reader.Fd < 0 then
+    Exit(false);
+  reader.Count := 0;
+  reader.Offset := 0;
+  reader.Failed := false;
+  while NextNumericEntry(reader, fd) do
+    if (fd >= 3) and (fd <> keepFd) and (fd <> reader.Fd) then
+      __close(fd);
+  __close(reader.Fd);
+  result := not reader.Failed;
+end;
+{$ELSE}
+var
+  fds : array[0..255] of TProcFdInfo;
+  byteCount : Integer;
+  count : Integer;
+  closed : Integer;
+  i : Integer;
+begin
+  result := false;
+  repeat
+    byteCount := proc_pidinfo(getpid, cProcPidListFds, 0, @fds[0], SizeOf(fds));
+    if byteCount <= 0 then
+      Exit;
+    count := byteCount div SizeOf(TProcFdInfo);
+    closed := 0;
+    for i := 0 to count - 1 do
+      if (fds[i].proc_fd >= 3) and (fds[i].proc_fd <> keepFd) then
+      begin
+        __close(fds[i].proc_fd);
+        Inc(closed);
+      end;
+    // A full buffer may not be the whole list (it is in ascending order):
+    // list again until there is nothing left to close.
+  until (count < Length(fds)) or (closed = 0);
+  result := true;
+end;
+{$ENDIF}
 
 // The child side of fork(). Async-signal-safe calls only; never returns.
 procedure RunChild(const setup : TChildSetup; stdinFd, stdoutFd, stderrFd, errFd : Integer; detached : boolean);
@@ -337,13 +500,17 @@ begin
 
   // Nothing else of ours may leak into the child: the host's own fds are
   // frequently not CLOEXEC (TFileStream, sockets). errFd is CLOEXEC already
-  // and must stay open until exec.
+  // and must stay open until exec. This step is also what keeps the pipes of
+  // other runs out of this child.
   {$IFDEF LINUX}
   failed := syscall(cSysCloseRange, NativeInt(3), NativeInt($FFFFFFFF), NativeInt(CLOSE_RANGE_CLOEXEC)) <> 0;
   {$ELSE}
   failed := true;
   {$ENDIF}
-  if failed then
+  // No close_range (macOS, Linux before 5.11, seccomp profiles): close the
+  // descriptors that are open; only when they cannot be listed, every
+  // number up to the limit.
+  if failed and (not CloseOpenFds(setup, errFd)) then
     for fd := 3 to setup.MaxFd do
       if fd <> errFd then
         __close(fd);
@@ -422,6 +589,108 @@ begin
     result := waitpid(pid, status, options);
   until (result <> -1) or (errno <> EINTR);
 end;
+
+// True once the child has exited, without reaping it: as a zombie it keeps
+// its pid, and with that the id of the process group it leads, from being
+// given to anything else.
+function HasExited(pid : pid_t) : boolean;
+var
+  // siginfo_t: 128 bytes on Linux, 104 on macOS.
+  info : array[0..15] of UInt64;
+  waitResult : Integer;
+begin
+  repeat
+    FillChar(info, SizeOf(info), 0);
+    waitResult := waitid(cWaitIdPid, Cardinal(pid), @info[0], cWaitExited or cWaitNoWait or WNOHANG);
+  until (waitResult <> -1) or (errno <> EINTR);
+  // Still running: 0 with si_signo and si_pid left at 0 (both are within the
+  // first 24 bytes on either platform). ECHILD: reaped elsewhere, which
+  // TryReap reports.
+  if waitResult = 0 then
+    result := (info[0] <> 0) or (info[1] <> 0) or (info[2] <> 0)
+  else
+    result := errno = ECHILD;
+end;
+
+// True when a process other than its leader is still running in the process
+// group, or when that cannot be told.
+function GroupHasOtherMembers(groupId : pid_t) : boolean;
+{$IFDEF LINUX}
+var
+  reader : TDirReader;
+  path : TBytes;
+  stat : array[0..511] of Byte;
+  pid : Integer;
+  statFd : Integer;
+  count : NativeInt;
+  i : NativeInt;
+  state : Byte;
+  memberGroup : Int64;
+begin
+  result := true;
+  path := Utf8Z('/proc');
+  reader.Fd := open(MarshaledAString(@path[0]), O_RDONLY or O_DIRECTORY or O_CLOEXEC);
+  if reader.Fd < 0 then
+    Exit;
+  try
+    reader.Count := 0;
+    reader.Offset := 0;
+    reader.Failed := false;
+    while NextNumericEntry(reader, pid) do
+    begin
+      if pid = groupId then
+        continue;
+      path := Utf8Z('/proc/' + IntToStr(pid) + '/stat');
+      statFd := open(MarshaledAString(@path[0]), O_RDONLY or O_CLOEXEC);
+      if statFd < 0 then
+        continue; // gone since it was listed
+      count := ReadRetry(statFd, @stat[0], SizeOf(stat));
+      __close(statFd);
+      // "pid (comm) state ppid pgrp ...": comm may hold spaces and brackets,
+      // so start from the last ')'.
+      i := count - 1;
+      while (i >= 0) and (stat[i] <> Ord(')')) do
+        Dec(i);
+      if (i < 0) or (i + 4 >= count) then
+        continue;
+      state := stat[i + 2];
+      Inc(i, 4);
+      while (i < count) and (stat[i] <> Ord(' ')) do
+        Inc(i);
+      Inc(i);
+      memberGroup := 0;
+      while (i < count) and (stat[i] >= Ord('0')) and (stat[i] <= Ord('9')) do
+      begin
+        memberGroup := memberGroup * 10 + (stat[i] - Ord('0'));
+        Inc(i);
+      end;
+      // A zombie member only waits for its parent; no signal reaches it.
+      if (memberGroup = groupId) and (state <> Ord('Z')) and (state <> Ord('X')) then
+        Exit;
+    end;
+    result := reader.Failed;
+  finally
+    __close(reader.Fd);
+  end;
+end;
+{$ELSE}
+var
+  pids : array[0..63] of Integer;
+  count : Integer;
+  i : Integer;
+begin
+  FillChar(pids, SizeOf(pids), 0);
+  count := proc_listpgrppids(groupId, @pids[0], SizeOf(pids));
+  if count < 0 then
+    Exit(true);
+  if count > Length(pids) then
+    count := Length(pids);
+  for i := 0 to count - 1 do
+    if (pids[i] > 0) and (pids[i] <> groupId) then
+      Exit(true);
+  result := false;
+end;
+{$ENDIF}
 
 // A child left running (TerminateOnTimeout = False) is reaped by a thread of
 // its own once it exits, so it does not stay a zombie.
@@ -794,6 +1063,7 @@ begin
   setup.MaxFd := maxFd - 1;
 
   {$IFDEF LINUX}
+  setup.FdDir := Utf8Z('/proc/self/fd');
   setup.ApplyAffinity := StartInfo.ProcessorAffinity <> 0;
   FillChar(setup.CpuSet, SizeOf(cpu_set_t), 0);
   if setup.ApplyAffinity then
@@ -853,7 +1123,9 @@ var
 {$ENDIF}
 begin
   // Wake the wait loop the moment the child exits. When this isn't
-  // available (Linux < 5.3) the loop still notices within one time slice.
+  // available (Linux < 5.3, seccomp profiles) the loop polls for the exit.
+  FExitWatched := false;
+  FExitNotified := false;
   if FEventFd = -1 then
     Exit;
   {$IFDEF LINUX}
@@ -862,6 +1134,7 @@ begin
   begin
     fcntl(FPidFd, F_SETFD, FD_CLOEXEC);
     WatchFd(FPidFd);
+    FExitWatched := true;
   end
   else
     FPidFd := -1;
@@ -873,7 +1146,7 @@ begin
   event.flags := EV_ADD or EV_ONESHOT;
   event.fflags := NOTE_EXIT;
   // ESRCH just means it has already exited; waitpid will tell us.
-  kevent(FEventFd, @event, 1, nil, 0, nil);
+  FExitWatched := kevent(FEventFd, @event, 1, nil, 0, nil) = 0;
   {$ENDIF}
 end;
 
@@ -986,7 +1259,12 @@ begin
     {$ENDIF}
     {$IFDEF MACOS}
     if events[i].filter <> EVFILT_READ then
-      continue; // child exit - picked up by TryReap
+    begin
+      // Child exit - picked up by TryReap. The event is one-shot, and it
+      // may be posted before the child can be reaped.
+      FExitNotified := true;
+      continue;
+    end;
     fd := Integer(events[i].ident);
     {$ENDIF}
     if (fd = FStdOutReadFd) and (fd <> -1) then
@@ -996,14 +1274,24 @@ begin
   end;
 end;
 
-function TPosixProcess.TryReap(var status : Integer; out unknownStatus : boolean) : boolean;
+function TPosixProcess.TryReap(var status : Integer; out unknownStatus : boolean; out stopSignal : Integer) : boolean;
 var
   waitResult : pid_t;
 begin
   unknownStatus := false;
-  waitResult := WaitPidRetry(FProcessId, @status, WNOHANG);
+  stopSignal := 0;
+  // WUNTRACED: a stopped child would otherwise look like one that is still
+  // running, for as long as nothing continues it.
+  waitResult := WaitPidRetry(FProcessId, @status, WNOHANG or WUNTRACED);
   if waitResult = FProcessId then
+  begin
+    if WIFSTOPPED(status) then
+    begin
+      stopSignal := WSTOPSIG(status);
+      Exit(false);
+    end;
     Exit(true);
+  end;
   if waitResult = -1 then
   begin
     // ECHILD: reaped by someone else (or SIGCHLD is SIG_IGN in the host).
@@ -1015,8 +1303,10 @@ end;
 
 procedure TPosixProcess.SignalChild(sig : Integer);
 begin
-  // Only ever called while the child is unreaped, so its pid (and process
-  // group id) cannot have been recycled.
+  // Only ever called while the child is unreaped (a child that has exited is
+  // kept as a zombie until its group has been signalled), so its pid (and
+  // process group id) cannot have been recycled. Never 0 or -1: those would
+  // signal our own group / every process.
   if FProcessId <= 1 then
     Exit;
   if FUseProcessGroup and (kill(-FProcessId, sig) = 0) then
@@ -1060,58 +1350,53 @@ begin
   redirectErr := ShouldRedirectStdErr;
   redirectIn := ShouldRedirectStdIn;
   try
-    GSpawnLock.Enter;
     try
-      try
-        if redirectOut then
-          CreatePipe(outRead, outWrite);
-        if redirectErr then
-          CreatePipe(errRead, errWrite);
-        if redirectIn then
+      if redirectOut then
+        CreatePipe(outRead, outWrite);
+      if redirectErr then
+        CreatePipe(errRead, errWrite);
+      if redirectIn then
+      begin
+        // TPipeSource.FileAsStdIn: the child's fd 0 is the file itself, a
+        // CLOEXEC copy (at 3 or above, as for the pipe ends) of the fd the
+        // source opened, closed like inRead once the child has its own.
+        if Supports(FRunStdIn, IFileStdInPipeSource, fileSource) then
         begin
-          // TPipeSource.FileAsStdIn: the child's fd 0 is the file itself, a
-          // CLOEXEC copy (at 3 or above, as for the pipe ends) of the fd the
-          // source opened, closed like inRead once the child has its own.
-          if Supports(FRunStdIn, IFileStdInPipeSource, fileSource) then
-          begin
-            inRead := fcntl(Integer(fileSource.FileHandle), F_DUPFD_CLOEXEC, 3);
-            if inRead < 0 then
-              raise EOSError.Create('Failed to duplicate the stdin file: ' + SysErrorMessage(errno));
-          end
-          else
-            CreatePipe(inRead, inWrite);
-        end;
-        // Child-error self-pipe: CLOEXEC, so a successful execve closes the
-        // write end and the parent's read sees EOF.
-        CreatePipe(errPipeRead, errPipeWrite);
-        PrepareChildSetup(setup, false);
-        setupBuilt := true;
-
-        childPid := fork();
-        if childPid = 0 then
-          RunChild(setup, inRead, outWrite, errWrite, errPipeWrite, false);
-        if childPid = -1 then
-        begin
-          FLastError := errno;
-          LogError('Failed to fork process: ' + SysErrorMessage(FLastError));
-          Exit;
-        end;
-        FProcessId := childPid;
-        FUseProcessGroup := setup.UseProcessGroup;
-        // Also from the parent, so the group exists before we could signal it.
-        if FUseProcessGroup then
-          setpgid(childPid, childPid);
-      finally
-        // The child has its own copies of its pipe ends.
-        CloseFd(outWrite);
-        CloseFd(errWrite);
-        CloseFd(inRead);
-        CloseFd(errPipeWrite);
-        if setupBuilt then
-          FreeChildSetup(setup);
+          inRead := fcntl(Integer(fileSource.FileHandle), F_DUPFD_CLOEXEC, 3);
+          if inRead < 0 then
+            raise EOSError.Create('Failed to duplicate the stdin file: ' + SysErrorMessage(errno));
+        end
+        else
+          CreatePipe(inRead, inWrite);
       end;
+      // Child-error self-pipe: CLOEXEC, so a successful execve closes the
+      // write end and the parent's read sees EOF.
+      CreatePipe(errPipeRead, errPipeWrite);
+      PrepareChildSetup(setup, false);
+      setupBuilt := true;
+
+      childPid := fork();
+      if childPid = 0 then
+        RunChild(setup, inRead, outWrite, errWrite, errPipeWrite, false);
+      if childPid = -1 then
+      begin
+        FLastError := errno;
+        LogError('Failed to fork process: ' + SysErrorMessage(FLastError));
+        Exit;
+      end;
+      FProcessId := childPid;
+      FUseProcessGroup := setup.UseProcessGroup;
+      // Also from the parent, so the group exists before we could signal it.
+      if FUseProcessGroup then
+        setpgid(childPid, childPid);
     finally
-      GSpawnLock.Leave;
+      // The child has its own copies of its pipe ends.
+      CloseFd(outWrite);
+      CloseFd(errWrite);
+      CloseFd(inRead);
+      CloseFd(errPipeWrite);
+      if setupBuilt then
+        FreeChildSetup(setup);
     end;
 
     // read() returns 0 iff execve succeeded; otherwise the child reports
@@ -1225,6 +1510,7 @@ const
   cSliceMs = 100;        // longest single wait - bounds cancel / terminate latency
   cTermGraceMs = 500;    // SIGTERM -> SIGKILL
   cKillGiveUpMs = 5000;  // SIGKILL -> stop waiting (process stuck in the kernel)
+  cGroupPollMaxMs = 50;  // longest wait between two looks at the group of a child that has exited
 type
   TKillReason = (krNone, krTimeout, krTerminate);
 var
@@ -1244,10 +1530,21 @@ var
   drainMs : Cardinal;
   nowMs : Int64;
   waitMs : Int64;
+  stopSignal : Integer;
+  ttyStopped : boolean;
+  leaderExited : boolean;
+  groupPollMs : Int64;
+  exitPollMs : Int64;
+  pipesWereOpen : boolean;
 begin
   status := 0;
   reaped := false;
   unknownStatus := false;
+  stopSignal := 0;
+  ttyStopped := false;
+  leaderExited := false;
+  groupPollMs := 1;
+  exitPollMs := 1;
   reason := krNone;
   abandoned := false;
   gaveUp := false;
@@ -1277,16 +1574,83 @@ begin
         waitMs := killAt - nowMs;
       if (drainUntil >= 0) and (drainUntil - nowMs < waitMs) then
         waitMs := drainUntil - nowMs;
+      if not reaped then
+      begin
+        // Nothing wakes the wait for these, so they are polled: the rest of
+        // the group of a child that has exited, and the exit itself when
+        // there is no exit watch.
+        if leaderExited then
+        begin
+          if groupPollMs < waitMs then
+            waitMs := groupPollMs;
+        end
+        else if (not FExitWatched) and (exitPollMs < waitMs) then
+          waitMs := exitPollMs;
+      end;
       if waitMs < 0 then
         waitMs := 0;
+      pipesWereOpen := (FStdOutReadFd <> -1) or (FStdErrReadFd <> -1);
       WaitForEvents(Integer(waitMs));
       nowMs := clock.ElapsedMilliseconds;
 
+      // Without an exit watch the exit is looked for after 1, 2, 4 ... ms,
+      // up to the full slice: a short-lived child is not kept waiting for a
+      // whole slice and a long-lived one costs a handful of wake-ups. The
+      // steps start again when the exit is known to be close.
+      if FExitNotified then
+      begin
+        // macOS posts the one-shot NOTE_EXIT before the child can be reaped.
+        FExitNotified := false;
+        FExitWatched := false;
+        exitPollMs := 1;
+      end
+      else if pipesWereOpen and (FStdOutReadFd = -1) and (FStdErrReadFd = -1) then
+        // A process closes its descriptors just before it can be reaped.
+        exitPollMs := 1
+      else if exitPollMs < cSliceMs then
+        exitPollMs := exitPollMs * 2;
+
       if not reaped then
       begin
-        reaped := TryReap(status, unknownStatus);
-        if reaped then
-          UnwatchChildExit;
+        if FUseProcessGroup and (reason <> krNone) and (not sigKillSent) then
+        begin
+          // Between SIGTERM and SIGKILL the child is not reaped when it
+          // exits: its group may hold members that ignore or outlive
+          // SIGTERM, and only an unreaped leader keeps the group id from
+          // being reused before they get their SIGKILL.
+          if not leaderExited then
+          begin
+            leaderExited := HasExited(FProcessId);
+            // Its pidfd stays readable from now on.
+            if leaderExited then
+              UnwatchChildExit;
+          end;
+          // SIGKILL once the grace period is over - or at once when nobody
+          // else is left in the group, so that the usual Terminate does not
+          // wait for it.
+          if leaderExited then
+          begin
+            if (nowMs >= killAt) or (not GroupHasOtherMembers(FProcessId)) then
+            begin
+              SignalChild(SIGKILL);
+              sigKillSent := true;
+              giveUpAt := nowMs + cKillGiveUpMs;
+              reaped := TryReap(status, unknownStatus, stopSignal);
+            end
+            else if groupPollMs < cGroupPollMaxMs then
+              groupPollMs := groupPollMs * 2;
+          end;
+        end
+        else
+        begin
+          reaped := TryReap(status, unknownStatus, stopSignal);
+          if reaped then
+            UnwatchChildExit
+          // Only in a group of its own: in our group we were stopped with it,
+          // and the shell continues the whole job.
+          else if FUseProcessGroup and ((stopSignal = SIGTTIN) or (stopSignal = SIGTTOU)) then
+            ttyStopped := true;
+        end;
       end;
 
       if not reaped then
@@ -1305,10 +1669,22 @@ begin
             end;
           end
           else if IsStopRequested then
+            reason := krTerminate
+          else if ttyStopped then
+          begin
+            // In its own (background) process group the child may not use
+            // the controlling terminal: the kernel stops it, and nothing
+            // would ever continue it.
+            LogError('The process was stopped because it tried to use the terminal (SIGTTIN / SIGTTOU): its stdin is redirected, ' +
+                     'so it runs in a background process group. It cannot continue and was terminated');
             reason := krTerminate;
+          end;
           if reason <> krNone then
           begin
             SignalChild(SIGTERM);
+            // A stopped process only acts on SIGTERM once it is continued.
+            if ttyStopped then
+              SignalChild(SIGCONT);
             killAt := nowMs + cTermGraceMs;
           end;
         end
@@ -1363,10 +1739,11 @@ begin
       end;
     end;
   finally
-    if (not reaped) and (reason = krNone) then
+    if (not reaped) and (not abandoned) and (not gaveUp) then
     begin
       // Only reached via an exception: don't leave the child behind.
-      reason := krTerminate;
+      if reason = krNone then
+        reason := krTerminate;
       SignalChild(SIGKILL);
       WaitPidRetry(FProcessId, @status, 0);
     end;
@@ -1439,7 +1816,6 @@ begin
   errPipeRead := -1;
   errPipeWrite := -1;
   setupBuilt := false;
-  GSpawnLock.Enter;
   try
     CreatePipe(errPipeRead, errPipeWrite);
     try
@@ -1474,7 +1850,6 @@ begin
     CloseFd(errPipeWrite);
     if setupBuilt then
       FreeChildSetup(setup);
-    GSpawnLock.Leave;
   end;
 
   // Reap the first child (it exits right after forking the grandchild).
@@ -1515,10 +1890,6 @@ initialization
   // contract we want: a SIGPIPE would kill the host. Set once for the whole
   // process (children get SIG_DFL back before exec).
   signal(SIGPIPE, TSignalHandler(SIG_IGN));
-  GSpawnLock := TCriticalSection.Create;
-
-finalization
-  GSpawnLock.Free;
 
 {$IFEND}
 
