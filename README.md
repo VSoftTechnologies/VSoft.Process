@@ -438,9 +438,16 @@ The run then completes at the timeout with `Status = TimedOut`, `TimedOut = True
 
 | `JobMode` | Terminate / timeout / cancellation | Releasing or re-running the `IProcess` |
 |-----------|-------------------------------------|----------------------------------------|
-| `KillOnRelease` (default) | kills the job: the child and everything it started | kills whatever the child left running (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) |
-| `KillOnTerminate` | kills the job | leftovers keep running (job without `KILL_ON_JOB_CLOSE`) |
-| `NoJob` | kills the child's process tree (`TSystemUtils.TerminateProcessTree`) | leftovers keep running |
+| `KillOnRelease` (default) | kills the job and the child's process tree: the child and everything it started | kills whatever the child left running (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) |
+| `KillOnTerminate` | kills the job and the child's process tree | leftovers keep running (job without `KILL_ON_JOB_CLOSE`) |
+| `NoJob` | kills the child's process tree | leftovers keep running |
+
+How Terminate, a timeout or cancellation ends the child (Windows):
+
+- **Process tree.** The child's process tree is killed even when there is a job, because a program the child starts with `CREATE_BREAKAWAY_FROM_JOB` isn't in the job.
+- **Order.** Every program in the tree is found and opened before anything is killed, so nothing links a program to the tree only through a parent that has already gone, and no process id can be reused meanwhile. Then the job is killed, then the tree (deepest first, the child last).
+- **Waiting.** The thread completing the run then waits, up to 5 s in all, for the child and every program it killed to have gone. So when `Execute` returns (or `Status` leaves `Running`) after a kill, what the child started has gone too.
+- **`Terminate(0)`.** It only requests the kill; the waiting is done by the thread running the run.
 
 If the child can't be assigned to the job (a host job that doesn't allow nesting on Windows 7, a Run-As child), the library falls back to the `NoJob` behaviour and logs it to `Errors`. POSIX has no job objects: leftovers always survive the `IProcess`, and Terminate / timeout / cancellation signal the child's process group, whatever the mode. The exception is a child that inherits the host's terminal as its stdin: it stays in the host's process group, so only the child itself is signalled and programs it started keep running (see [Platform Support](#platform-support)). Redirect stdin (`TPipeSource.FromString('')` is enough) when the whole tree must stop.
 
@@ -805,6 +812,7 @@ The [Tests/](Tests/) directory contains a DUnitX test project (`VSoft.Process.Te
 - **Unit tests** for each builder (`Tests/VSoft.Process.Tests.CommandLine.pas`, `Environment.pas`, `Credentials.pas`, `StartInfo.pas`), every pipe source and target (`PipeSource.pas`, `PipeTarget.pas`), and the string-quoting utilities (`Utils.pas`).
 - **End-to-end tests** ([Tests/VSoft.Process.Tests.Process.pas](Tests/VSoft.Process.Tests.Process.pas), [Tests/VSoft.Process.Tests.ProcessE2E.pas](Tests/VSoft.Process.Tests.ProcessE2E.pas) and [Tests/VSoft.Process.Tests.Lifecycle.pas](Tests/VSoft.Process.Tests.Lifecycle.pas)) that spawn real child processes and assert on captured output, exit codes, environment propagation, cancellation, timeouts, process re-use, failing pipe targets, concurrent launches and pipe draining.
 - **Process lifetime and lookup tests** ([Tests/VSoft.Process.Tests.Lifetime.pas](Tests/VSoft.Process.Tests.Lifetime.pas), [Tests/VSoft.Process.Tests.ExecutableSearch.pas](Tests/VSoft.Process.Tests.ExecutableSearch.pas)) for `JobMode`, `TerminateOnTimeout`, handle leaks and the `PATH` search.
+- **A helper child process**: started as `VSoft.Process.Tests.exe --vsp-helper=<mode>`, the test exe runs one job instead of the tests ([Tests/VSoft.Process.Tests.Helper.pas](Tests/VSoft.Process.Tests.Helper.pas), Windows). The jobs are things a script can't do, such as starting a program with `CREATE_BREAKAWAY_FROM_JOB` or starting programs non-stop from several threads.
 - **Credentials launch tests** ([Tests/VSoft.Process.Tests.Logon.pas](Tests/VSoft.Process.Tests.Logon.pas), Windows). They never log on to a real account: the launcher is stubbed, or the logon is `LOGON_NETCREDENTIALS_ONLY` with a made-up user, which Windows doesn't check locally.
 - **Deterministic script fixtures** in [Tests/scripts/](Tests/scripts/), one `.cmd` and one `.sh` per scenario (echo-args, echo-stdin, print-env, print-cwd, print-large, print-stderr, print-both, print-then-sleep, print-invalid-utf8, exit-with, sleep, spawn-and-wait, spawn-background-and-exit). Each script has a fixed, known output so the E2E tests can compare against exact bytes rather than whatever the host's `ping` / `find` / etc. happens to print. Platform differences live in [Tests/VSoft.Process.Tests.Common.pas](Tests/VSoft.Process.Tests.Common.pas).
 

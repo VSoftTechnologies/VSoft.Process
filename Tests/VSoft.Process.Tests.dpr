@@ -41,6 +41,7 @@ uses
   VSoft.Process.Tests.Lifetime in 'VSoft.Process.Tests.Lifetime.pas',
   VSoft.Process.Tests.ExecutableSearch in 'VSoft.Process.Tests.ExecutableSearch.pas',
   VSoft.Process.Tests.Logon in 'VSoft.Process.Tests.Logon.pas',
+  VSoft.Process.Tests.Helper in 'VSoft.Process.Tests.Helper.pas',
   VSoft.Process.WinAPI in '..\Source\VSoft.Process.WinAPI.pas';
 
 {$R *.RES}
@@ -51,6 +52,9 @@ var
   logger : ITestLogger;
   nunitLogger : ITestLogger;
 begin
+  // Started by a test as a child process to do one job (see the unit).
+  if RunTestHelperMode then
+    Exit;
   ReportMemoryLeaksOnShutdown := True;
   try
     // Pull --teamcity, --xml, etc. out of the command line.

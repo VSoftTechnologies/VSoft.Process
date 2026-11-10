@@ -1188,19 +1188,20 @@ begin
 end;
 
 function TWindowsProcess.KillChild(exitCode : Cardinal) : boolean;
+const
+  // How long the thread completing the run waits for the child and what it
+  // started to have gone, in all.
+  cKillWaitMs = 5000;
 begin
   // Exited on its own between the wait returning and now: nothing to kill
   // (and its real exit code should be reported).
   if WaitForSingleObject(FProcessInfo.hProcess, 0) = WAIT_OBJECT_0 then
     Exit(false);
   result := true;
-  if FJobHandle <> 0 then
-    TerminateJobObject(FJobHandle, exitCode)
-  else
-    TSystemUtils.TerminateProcessTree(FProcessInfo.dwProcessId, exitCode, FProcessInfo.hProcess);
-  // The child itself, whatever happened above.
-  TerminateProcess(FProcessInfo.hProcess, exitCode);
-  WaitForSingleObject(FProcessInfo.hProcess, 5000);
+  // The job, the tree (a program started with CREATE_BREAKAWAY_FROM_JOB is
+  // not in the job) and the child itself. Waiting here means what the child
+  // started has gone by the time the run completes.
+  TSystemUtils.TerminateProcessTreeAndWait(FProcessInfo.dwProcessId, FProcessInfo.hProcess, FJobHandle, exitCode, cKillWaitMs);
 end;
 
 procedure TWindowsProcess.ReleaseRunResources(killed : boolean; abandoned : boolean);

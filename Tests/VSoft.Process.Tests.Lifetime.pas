@@ -62,6 +62,25 @@ type
     {$IFDEF MSWINDOWS}
     [Test]
     procedure KillOnTerminate_TerminateDuringDrain_EndsGrandchild;
+
+    // Terminate ends a program the child started with
+    // CREATE_BREAKAWAY_FROM_JOB, which the job doesn't hold.
+    [Test]
+    procedure Terminate_EndsBreakawayGrandchild;
+    // ... and one started that way by a program the child started, which
+    // the job kills (so it is gone before the tree can be walked through it).
+    [Test]
+    procedure Terminate_EndsBreakawayChildOfAnInJobGrandchild;
+    // Without a job, programs started while the tree is being killed are
+    // ended too. (A guard only: the single-snapshot kill before the tree
+    // kill was reworked passed it too, in 25 runs with 4 and 16 threads
+    // starting programs, so the walk is not repeated.)
+    [Test]
+    procedure NoJob_Terminate_EndsProgramsStartedDuringTheKill;
+    // Once the run has completed after Terminate, what the child started has
+    // gone.
+    [Test]
+    procedure Terminate_DescendantsGoneWhenRunCompletes;
     {$ENDIF}
 
     {$IFDEF MSWINDOWS}
@@ -75,6 +94,10 @@ type
 implementation
 
 uses
+  {$IFDEF MSWINDOWS}
+  Winapi.Windows,
+  VSoft.Process.Tests.Helper,
+  {$ENDIF}
   VSoft.CancellationToken,
   VSoft.Process.Utils,
   VSoft.Process.Tests.Common;
@@ -793,6 +816,181 @@ begin
     RunAbandoned;
   after := TTestHelpers.HandleCount;
   Assert.IsTrue(after < before + 5, Format('5 runs that timed out without killing grew the handle count from %d to %d', [before, after]));
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+// Starts the test exe in a helper mode (VSoft.Process.Tests.Helper), with its
+// stdout lines going to collector.
+function StartHelper(const mode : string; const args : array of string; jobMode : TProcessJobMode;
+                     collector : TLineCollector) : IProcess;
+begin
+  result := TProcess.Create;
+  result.StartInfo.Executable := ParamStr(0);
+  result.StartInfo.JobMode := jobMode;
+  result.StartInfo.TimeoutInMSec := 120000;
+  result.CommandLine.Add(HelperCommandLine(mode, args), TQuoted.qtNone);
+  result.WithStdOutPipe(TPipeTarget.ToLineMethod(collector.OnLine, TEncoding.UTF8));
+  Assert.IsTrue(result.ExecuteAsync, result.Errors.Text);
+end;
+
+// Waits for a line starting with one of prefixes; returns the prefix seen.
+function WaitForLine(collector : TLineCollector; const prefixes : array of string; timeoutMs : Cardinal) : string;
+var
+  deadline : Int64;
+  i : integer;
+begin
+  deadline := TTestHelpers.TickMs + timeoutMs;
+  repeat
+    for i := 0 to High(prefixes) do
+      if Pos(#10 + prefixes[i], #10 + collector.Text) > 0 then
+        Exit(prefixes[i]);
+    Sleep(20);
+  until TTestHelpers.TickMs >= deadline;
+  result := '';
+end;
+
+procedure CheckTerminateEndsBreakaway(const mode : string);
+var
+  proc : IProcess;
+  collector : TLineCollector;
+  pid : Cardinal;
+  watch : NativeUInt;
+  seen : string;
+begin
+  watch := 0;
+  collector := TLineCollector.Create;
+  try
+    proc := StartHelper(mode, ['60'], TProcessJobMode.KillOnRelease, collector);
+    seen := WaitForLine(collector, ['PID=', 'BREAKAWAY-FAILED=', 'START-FAILED='], 15000);
+    if seen = 'BREAKAWAY-FAILED=' then
+      Assert.Pass('NOT RUN: the host''s job does not allow CREATE_BREAKAWAY_FROM_JOB (' + collector.Text + ')');
+    pid := StrToIntDef(collector.ValueAfter('PID='), 0);
+    Assert.IsTrue(pid <> 0, 'the helper did not report the program it started: ' + collector.Text);
+    watch := TTestHelpers.WatchProcess(pid);
+    Assert.IsTrue(watch <> 0, 'could not open the program the helper started');
+
+    Assert.IsTrue(proc.Terminate, 'Terminate');
+    Assert.AreEqual(TProcessStatus.Terminated, proc.Status);
+    Assert.IsTrue(TTestHelpers.HasEndedWithin(watch, cKilledMs),
+                  'Terminate did not end the program started with CREATE_BREAKAWAY_FROM_JOB');
+  finally
+    if proc <> nil then
+      proc.Terminate;
+    proc := nil;
+    TTestHelpers.KillWatched(watch);
+    collector.Free;
+  end;
+end;
+
+procedure TProcessLifetimeTests.Terminate_EndsBreakawayGrandchild;
+begin
+  CheckTerminateEndsBreakaway('breakaway-child');
+end;
+
+procedure TProcessLifetimeTests.Terminate_EndsBreakawayChildOfAnInJobGrandchild;
+begin
+  CheckTerminateEndsBreakaway('in-job-then-breakaway');
+end;
+
+procedure TProcessLifetimeTests.NoJob_Terminate_EndsProgramsStartedDuringTheKill;
+var
+  proc : IProcess;
+  collector : TLineCollector;
+  helperPid : Cardinal;
+  helperCreated : Int64;
+  helperWatch : NativeUInt;
+  survivors : TArray<Cardinal>;
+  deadline : Int64;
+  before : integer;
+begin
+  helperWatch := 0;
+  helperPid := 0;
+  helperCreated := 0;
+  collector := TLineCollector.Create;
+  try
+    // 8 threads starting pings (20 s each) non-stop, 600 at most.
+    proc := StartHelper('spawn-loop', ['8', '600', '20'], TProcessJobMode.NoJob, collector);
+    Assert.AreEqual('SPAWNING', WaitForLine(collector, ['SPAWNING'], 15000), 'the helper did not start: ' + collector.Text);
+    helperPid := proc.ProcessId;
+    // Held so its id is not reused once it has gone.
+    helperWatch := TTestHelpers.WatchProcess(helperPid);
+    helperCreated := TTestHelpers.ProcessCreationTime(helperPid);
+    Assert.IsTrue((helperWatch <> 0) and (helperCreated <> 0), 'could not open the helper');
+    before := Length(TTestHelpers.DescendantsOf(helperPid, helperCreated));
+    Assert.IsTrue(before > 0, 'the programs the helper started were not found');
+
+    Assert.IsTrue(proc.Terminate, 'Terminate');
+    // What was killed may take a moment to go; anything left after that was
+    // never killed.
+    deadline := TTestHelpers.TickMs + 2000;
+    repeat
+      survivors := TTestHelpers.DescendantsOf(helperPid, helperCreated);
+      if Length(survivors) = 0 then
+        Break;
+      Sleep(50);
+    until TTestHelpers.TickMs >= deadline;
+    Assert.AreEqual(0, Length(survivors), IntToStr(Length(survivors)) +
+                    ' programs started by the child were still running 2 s after Terminate (' + IntToStr(before) + ' before it)');
+  finally
+    if proc <> nil then
+      proc.Terminate;
+    proc := nil;
+    if helperPid <> 0 then
+    begin
+      TTestHelpers.KillDescendants(helperPid, helperCreated);
+      Sleep(200);
+      TTestHelpers.KillDescendants(helperPid, helperCreated);
+    end;
+    TTestHelpers.KillWatched(helperWatch);
+    collector.Free;
+  end;
+end;
+
+procedure TProcessLifetimeTests.Terminate_DescendantsGoneWhenRunCompletes;
+var
+  proc : IProcess;
+  collector : TLineCollector;
+  lines : TStringList;
+  watches : TArray<NativeUInt>;
+  i : integer;
+  pid : Cardinal;
+  running : integer;
+begin
+  collector := TLineCollector.Create;
+  lines := TStringList.Create;
+  try
+    proc := StartHelper('spawn-n', ['20', '60'], TProcessJobMode.KillOnRelease, collector);
+    Assert.AreEqual('READY', WaitForLine(collector, ['READY'], 30000), 'the helper did not start: ' + collector.Text);
+    lines.Text := collector.Text;
+    for i := 0 to lines.Count - 1 do
+      if Copy(lines[i], 1, 4) = 'PID=' then
+      begin
+        pid := StrToIntDef(Copy(lines[i], 5, MaxInt), 0);
+        if pid <> 0 then
+        begin
+          SetLength(watches, Length(watches) + 1);
+          watches[High(watches)] := TTestHelpers.WatchProcess(pid);
+        end;
+      end;
+    Assert.AreEqual(20, Length(watches), collector.Text);
+
+    // Returns once the run has completed, as Execute would.
+    Assert.IsTrue(proc.Terminate, 'Terminate');
+    running := 0;
+    for i := 0 to High(watches) do
+      if (watches[i] <> 0) and (WaitForSingleObject(watches[i], 0) = WAIT_TIMEOUT) then
+        Inc(running);
+    Assert.AreEqual(0, running, IntToStr(running) + ' of the programs the child started were still running when the run completed');
+  finally
+    if proc <> nil then
+      proc.Terminate;
+    proc := nil;
+    for i := 0 to High(watches) do
+      TTestHelpers.KillWatched(watches[i]);
+    lines.Free;
+    collector.Free;
+  end;
 end;
 {$ENDIF}
 

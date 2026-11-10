@@ -63,6 +63,15 @@ type
     class function FindChildProcess(parentId : Cardinal; const exeName : string) : Cardinal; static;
     // Number of handles this process has open.
     class function HandleCount : Cardinal; static;
+    // When the process started (FILETIME ticks), 0 when it can't be opened.
+    class function ProcessCreationTime(processId : Cardinal) : Int64; static;
+    // The live processes started by rootPid, by those, and so on. A process
+    // only counts as a child when it started after its parent, so a parent
+    // id that has been reused is never followed. rootPid may have exited, as
+    // long as a handle to it is held (so its id is not reused).
+    class function DescendantsOf(rootPid : Cardinal; rootCreated : Int64) : TArray<Cardinal>; static;
+    // Test cleanup: ends whatever DescendantsOf finds.
+    class procedure KillDescendants(rootPid : Cardinal; rootCreated : Int64); static;
     // Configure proc to print text plus CRLF as exact UTF-8 bytes: the text
     // is written to a new temp file (returned; the caller deletes it), which
     // the print-file fixture copies to stdout byte for byte. Unlike
@@ -90,6 +99,9 @@ uses
 
 {$IFDEF MSWINDOWS}
 function GetProcessHandleCount(hProcess : THandle; var pdwHandleCount : DWORD) : BOOL; stdcall; external kernel32 name 'GetProcessHandleCount';
+
+const
+  cProcessQueryLimitedInformation = $1000;
 {$ENDIF}
 
 var
@@ -324,6 +336,107 @@ begin
   if not GetProcessHandleCount(GetCurrentProcess, count) then
     RaiseLastOSError;
   result := count;
+end;
+class function TTestHelpers.ProcessCreationTime(processId : Cardinal) : Int64;
+var
+  handle : THandle;
+  createdAt, exitedAt, kernelTime, userTime : TFileTime;
+begin
+  result := 0;
+  handle := OpenProcess(cProcessQueryLimitedInformation, False, processId);
+  if handle = 0 then
+    Exit;
+  try
+    if GetProcessTimes(handle, createdAt, exitedAt, kernelTime, userTime) then
+      result := Int64(createdAt.dwHighDateTime) shl 32 or createdAt.dwLowDateTime;
+  finally
+    CloseHandle(handle);
+  end;
+end;
+
+class function TTestHelpers.DescendantsOf(rootPid : Cardinal; rootCreated : Int64) : TArray<Cardinal>;
+var
+  snapshot : THandle;
+  entry : TProcessEntry32;
+  more : boolean;
+  pids : TArray<Cardinal>;
+  parents : TArray<Cardinal>;
+  known : TArray<Cardinal>;
+  knownCreated : TArray<Int64>;
+  count : integer;
+  next : integer;
+  i : integer;
+  j : integer;
+  created : Int64;
+  seen : boolean;
+begin
+  SetLength(result, 0);
+  snapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if snapshot = INVALID_HANDLE_VALUE then
+    Exit;
+  count := 0;
+  try
+    entry.dwSize := SizeOf(entry);
+    more := Process32First(snapshot, entry);
+    while more do
+    begin
+      SetLength(pids, count + 1);
+      SetLength(parents, count + 1);
+      pids[count] := entry.th32ProcessID;
+      parents[count] := entry.th32ParentProcessID;
+      Inc(count);
+      more := Process32Next(snapshot, entry);
+    end;
+  finally
+    CloseHandle(snapshot);
+  end;
+  SetLength(known, 1);
+  SetLength(knownCreated, 1);
+  known[0] := rootPid;
+  knownCreated[0] := rootCreated;
+  next := 0;
+  while next < Length(known) do
+  begin
+    for i := 0 to count - 1 do
+    begin
+      if (parents[i] <> known[next]) or (pids[i] = known[next]) or (pids[i] = 0) then
+        Continue;
+      seen := false;
+      for j := 0 to High(known) do
+        if known[j] = pids[i] then
+          seen := true;
+      if seen then
+        Continue;
+      created := ProcessCreationTime(pids[i]);
+      if (created = 0) or (created < knownCreated[next]) then
+        Continue;
+      SetLength(known, Length(known) + 1);
+      SetLength(knownCreated, Length(knownCreated) + 1);
+      known[High(known)] := pids[i];
+      knownCreated[High(knownCreated)] := created;
+      SetLength(result, Length(result) + 1);
+      result[High(result)] := pids[i];
+    end;
+    Inc(next);
+  end;
+end;
+
+class procedure TTestHelpers.KillDescendants(rootPid : Cardinal; rootCreated : Int64);
+var
+  pids : TArray<Cardinal>;
+  i : integer;
+  handle : THandle;
+begin
+  pids := DescendantsOf(rootPid, rootCreated);
+  for i := 0 to High(pids) do
+  begin
+    handle := OpenProcess(PROCESS_TERMINATE, False, pids[i]);
+    if handle <> 0 then
+    begin
+      TerminateProcess(handle, 1);
+      CloseHandle(handle);
+    end;
+  end;
 end;
 {$ELSE}
 class function TTestHelpers.WatchProcess(processId : Cardinal) : NativeUInt;

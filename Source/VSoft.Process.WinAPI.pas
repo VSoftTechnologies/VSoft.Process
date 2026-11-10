@@ -59,6 +59,7 @@ function VProcCancelIoEx(hFile : THandle; lpOverlapped : POverlapped) : BOOL; st
 function VProcCancelSynchronousIo(hThread : THandle) : BOOL; stdcall;
 // ReadFile with a nullable bytes-read pointer (must be nil for overlapped I/O).
 function VProcReadFile(hFile : THandle; lpBuffer : Pointer; nNumberOfBytesToRead : DWORD; lpNumberOfBytesRead : PDWORD; lpOverlapped : POverlapped) : BOOL; stdcall;
+function VProcTerminateJobObject(hJob : THandle; uExitCode : UINT) : BOOL; stdcall;
 
 
 {$IF CompilerVersion < 32.0} //10.2
@@ -177,6 +178,7 @@ function VProcCreateProcessW; external kernel32 name 'CreateProcessW';
 function VProcCancelIoEx; external kernel32 name 'CancelIoEx';
 function VProcCancelSynchronousIo; external kernel32 name 'CancelSynchronousIo';
 function VProcReadFile; external kernel32 name 'ReadFile';
+function VProcTerminateJobObject; external kernel32 name 'TerminateJobObject';
 {$ENDIF}
 
 end.
