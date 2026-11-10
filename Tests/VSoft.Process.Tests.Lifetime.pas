@@ -930,7 +930,7 @@ begin
         Break;
       Sleep(50);
     until TTestHelpers.TickMs >= deadline;
-    Assert.AreEqual(0, Length(survivors), IntToStr(Length(survivors)) +
+    Assert.AreEqual<integer>(0, Length(survivors), IntToStr(Length(survivors)) +
                     ' programs started by the child were still running 2 s after Terminate (' + IntToStr(before) + ' before it)');
   finally
     if proc <> nil then
@@ -973,7 +973,7 @@ begin
           watches[High(watches)] := TTestHelpers.WatchProcess(pid);
         end;
       end;
-    Assert.AreEqual(20, Length(watches), collector.Text);
+    Assert.AreEqual<integer>(20, Length(watches), collector.Text);
 
     // Returns once the run has completed, as Execute would.
     Assert.IsTrue(proc.Terminate, 'Terminate');
