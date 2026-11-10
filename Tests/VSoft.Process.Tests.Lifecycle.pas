@@ -1758,15 +1758,20 @@ end;
 procedure TProcessLifecycleTests.FileAsStdIn_MissingFile_ExecuteRaises;
 var
   proc : IProcess;
+  raised : boolean;
 begin
   proc := TProcess.Create;
   TTestHelpers.SetupShellCommand(proc, 'echo-stdin', []);
   proc.WithStdInPipe(TPipeSource.FileAsStdIn(TTestHelpers.TempFileName('vsoft_proc_missing_', '.txt')));
-  Assert.WillRaise(
-    procedure
-    begin
-      proc.Execute;
-    end, EVSoftProcessError);
+  // Not Assert.WillRaise: XE2 can't pass an anonymous method to it.
+  raised := false;
+  try
+    proc.Execute;
+  except
+    on EVSoftProcessError do
+      raised := true;
+  end;
+  Assert.IsTrue(raised, 'a missing file raises EVSoftProcessError');
 end;
 
 { TThreadRecordingTarget }
