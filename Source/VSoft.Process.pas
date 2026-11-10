@@ -282,6 +282,8 @@ type
     procedure SetDetachedNewConsole(value : boolean);
     function GetInheritHostStdHandles : boolean;
     procedure SetInheritHostStdHandles(value : boolean);
+    function GetShareHostConsole : boolean;
+    procedure SetShareHostConsole(value : boolean);
     function GetDeliverOnRunThread : boolean;
     procedure SetDeliverOnRunThread(value : boolean);
 
@@ -311,6 +313,7 @@ type
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
     function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
     function WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
+    function WithShareHostConsole(value : boolean) : IStartInfoBuilder;
     function WithDeliverOnRunThread(value : boolean) : IStartInfoBuilder;
 
     //non fluent config
@@ -392,16 +395,29 @@ type
     property DetachedNewConsole : boolean read GetDetachedNewConsole write SetDetachedNewConsole;
     // Windows: a stream (stdin, stdout, stderr) that is not redirected gets
     // a copy of this process's own std handle (GetStdHandle), so a child's
-    // unredirected stderr, say, goes where this process's stderr goes (the
-    // console, a file, a CI agent's log). Default False: such a stream gets
-    // NUL when another stream is redirected, and the child's own console
+    // unredirected stderr, say, goes where this process's stderr goes (a
+    // file, a CI agent's log). Default False: such a stream gets NUL when another stream is redirected, and the child's own console
     // otherwise. When this process has no such handle (a GUI program) the
     // stream gets NUL, as without the option; when the handle can't be
-    // given to the child (it can't be duplicated, or is a Windows 7 console
-    // pseudo-handle) it gets NUL and Errors says why. Applies to launches
-    // with credentials too. Ignored by ExecuteDetached and on POSIX, where
-    // a stream that is not redirected is always inherited.
+    // given to the child (it can't be duplicated) it gets NUL and Errors
+    // says why. A handle that is this process's console is only given with
+    // ShareHostConsole; without it that stream is treated as one this
+    // process has no handle for. Applies to launches with credentials too.
+    // Ignored by ExecuteDetached and on POSIX, where a stream that is not
+    // redirected is always inherited.
     property InheritHostStdHandles : boolean read GetInheritHostStdHandles write SetInheritHostStdHandles;
+    // Windows, with InheritHostStdHandles: a std handle of this process
+    // that is its console is given to the child too. A console handle only
+    // works in a process attached to that console, so the child is then
+    // started without a console of its own and shares this process's: it
+    // writes to it and reads from it, and Ctrl+C / Ctrl+Break in that
+    // console reach the child (and what it starts) as well as this process.
+    // Default False: the child always gets its own console, so the host
+    // alone sees Ctrl+C and decides what to stop. Not possible with
+    // credentials (that stream gets NUL and Errors says so) or on Windows 7
+    // and earlier (likewise). Ignored without InheritHostStdHandles, by
+    // ExecuteDetached and on POSIX.
+    property ShareHostConsole : boolean read GetShareHostConsole write SetShareHostConsole;
     // Windows: pipe targets are called on the thread running the run (the
     // caller of a synchronous Execute, the worker thread of ExecuteAsync)
     // instead of on threadpool threads (default False). That thread is in

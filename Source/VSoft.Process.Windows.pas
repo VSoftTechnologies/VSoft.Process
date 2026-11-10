@@ -1143,6 +1143,9 @@ var
     // set), which the handle list and the Secondary Logon service reject.
     if (host and 3) = 3 then
     begin
+      // A console handle is only wanted with ShareHostConsole (see below).
+      if not StartInfo.ShareHostConsole then
+        Exit;
       LogError('The host''s ' + streamName + ' is a console pseudo-handle (Windows 7 or earlier), which can''t be given ' +
                'to the child; its ' + streamName + ' is NUL instead');
       Exit;
@@ -1156,10 +1159,15 @@ var
       Exit;
     end;
     // A console handle only works in a process attached to that console, so
-    // the child has to share ours instead of getting one of its own.
+    // the child has to share ours instead of getting one of its own. Our
+    // console's Ctrl+C / Ctrl+Break then reach the child too, so that is
+    // only done when asked for (ShareHostConsole); otherwise the stream is
+    // handled as one we have no handle for.
     if GetConsoleMode(result, consoleMode) then
     begin
-      if Credentials.UserName = '' then
+      if not StartInfo.ShareHostConsole then
+        SafeCloseHandle(result)
+      else if Credentials.UserName = '' then
         shareConsole := true
       else
       begin
@@ -1261,8 +1269,8 @@ begin
     // Suspended so the job is assigned before the child can create children.
     creationFlags := CREATE_UNICODE_ENVIRONMENT or CREATE_SUSPENDED or PriorityClass(StartInfo.Priority);
     // A console of its own, except when it was given a console handle of
-    // ours (InheritHostStdHandles): then it shares our console, and with it
-    // the console's Ctrl+C and Ctrl+Break.
+    // ours (InheritHostStdHandles with ShareHostConsole): then it shares our
+    // console, and with it the console's Ctrl+C and Ctrl+Break.
     if not shareConsole then
       creationFlags := creationFlags or CREATE_NEW_CONSOLE;
     // Before Windows 8 a process already in a job cannot be put in a second

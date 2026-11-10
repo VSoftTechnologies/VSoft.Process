@@ -54,6 +54,7 @@ type
     FTerminateOnTimeout : boolean;
     FDetachedNewConsole : boolean;
     FInheritHostStdHandles : boolean;
+    FShareHostConsole : boolean;
     FDeliverOnRunThread : boolean;
   protected
     function GetHideWindow : boolean;
@@ -92,6 +93,8 @@ type
     procedure SetDetachedNewConsole(value : boolean);
     function GetInheritHostStdHandles : boolean;
     procedure SetInheritHostStdHandles(value : boolean);
+    function GetShareHostConsole : boolean;
+    procedure SetShareHostConsole(value : boolean);
     function GetDeliverOnRunThread : boolean;
     procedure SetDeliverOnRunThread(value : boolean);
 
@@ -114,6 +117,7 @@ type
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
     function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
     function WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
+    function WithShareHostConsole(value : boolean) : IStartInfoBuilder;
     function WithDeliverOnRunThread(value : boolean) : IStartInfoBuilder;
 
 
@@ -149,6 +153,7 @@ begin
   FTerminateOnTimeout := true;
   FDetachedNewConsole := false;
   FInheritHostStdHandles := false;
+  FShareHostConsole := false;
   FDeliverOnRunThread := false;
 end;
 
@@ -173,6 +178,7 @@ begin
   FPipeDrainTimeoutMS := source.FPipeDrainTimeoutMS;
   FDetachedNewConsole := source.FDetachedNewConsole;
   FInheritHostStdHandles := source.FInheritHostStdHandles;
+  FShareHostConsole := source.FShareHostConsole;
   FDeliverOnRunThread := source.FDeliverOnRunThread;
 end;
 
@@ -245,6 +251,11 @@ end;
 function TStartInfoBuilder.GetInheritHostStdHandles : boolean;
 begin
   result := FInheritHostStdHandles;
+end;
+
+function TStartInfoBuilder.GetShareHostConsole : boolean;
+begin
+  result := FShareHostConsole;
 end;
 
 function TStartInfoBuilder.GetDeliverOnRunThread : boolean;
@@ -340,6 +351,11 @@ end;
 procedure TStartInfoBuilder.SetInheritHostStdHandles(value : boolean);
 begin
   FInheritHostStdHandles := value;
+end;
+
+procedure TStartInfoBuilder.SetShareHostConsole(value : boolean);
+begin
+  FShareHostConsole := value;
 end;
 
 procedure TStartInfoBuilder.SetDeliverOnRunThread(value : boolean);
@@ -447,6 +463,12 @@ end;
 function TStartInfoBuilder.WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
 begin
   FInheritHostStdHandles := value;
+  result := Self;
+end;
+
+function TStartInfoBuilder.WithShareHostConsole(value : boolean) : IStartInfoBuilder;
+begin
+  FShareHostConsole := value;
   result := Self;
 end;
 

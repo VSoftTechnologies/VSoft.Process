@@ -44,6 +44,9 @@ type
     procedure InheritHostStdHandles_DefaultsFluentAndClone;
 
     [Test]
+    procedure ShareHostConsole_DefaultsFluentAndClone;
+
+    [Test]
     procedure DeliverOnRunThread_DefaultsFluentAndClone;
 
     // SetProcessAffinityMask takes a DWORD_PTR, so on Win64 a mask can name
@@ -220,6 +223,21 @@ begin
   Assert.IsTrue(dst.InheritHostStdHandles);
   src.InheritHostStdHandles := false;
   Assert.IsTrue(dst.InheritHostStdHandles, 'the clone is independent');
+end;
+
+procedure TStartInfoTests.ShareHostConsole_DefaultsFluentAndClone;
+var
+  src, dst, ret : IStartInfoBuilder;
+begin
+  src := MakeBuilder;
+  Assert.IsFalse(src.ShareHostConsole, 'off by default');
+  ret := src.WithShareHostConsole(true);
+  Assert.AreSame(src, ret);
+  Assert.IsTrue(src.ShareHostConsole);
+  dst := src.Clone;
+  Assert.IsTrue(dst.ShareHostConsole);
+  src.ShareHostConsole := false;
+  Assert.IsTrue(dst.ShareHostConsole, 'the clone is independent');
 end;
 
 procedure TStartInfoTests.DeliverOnRunThread_DefaultsFluentAndClone;

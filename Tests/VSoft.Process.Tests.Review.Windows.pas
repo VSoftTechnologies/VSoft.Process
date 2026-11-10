@@ -27,12 +27,20 @@ type
     [Setup]
     procedure SetUp;
 
-    // WIN-1: with InheritHostStdHandles a stderr that is not redirected goes
-    // where the host's stderr goes, also when that is the host's console.
-    // A failure means the child could not use the host's console handle (it
-    // is started with a console of its own), so its stderr is lost.
+    // WIN-1: with InheritHostStdHandles and ShareHostConsole a stderr that
+    // is not redirected goes where the host's stderr goes, also when that is
+    // the host's console. A failure means the child could not use the host's
+    // console handle (it is started with a console of its own), so its
+    // stderr is lost.
     [Test]
     procedure WIN1_InheritHostStdHandles_ConsoleStdErr_ReachesHostConsole;
+
+    // Without ShareHostConsole the child never shares the host's console
+    // (whose Ctrl+C would reach it): a host std handle that is the console
+    // is not given to it, and nothing is reported. A failure means the
+    // child wrote to the host's console, so it was attached to it.
+    [Test]
+    procedure InheritHostStdHandles_ConsoleStdErr_NotSharedByDefault;
 
     // WIN-2: TimeoutInMSec ends the run with DeliverOnRunThread while the
     // child keeps writing to stdout and stderr. A failure means the timeout
@@ -575,7 +583,10 @@ begin
   TTestHelpers.ScriptsDir;
 end;
 
-procedure TReviewWindowsTests.WIN1_InheritHostStdHandles_ConsoleStdErr_ReachesHostConsole;
+// Runs a child whose stdout is captured and whose stderr is not redirected,
+// with InheritHostStdHandles, while this process's stderr is a screen buffer
+// of its console, and checks whether the child's stderr reached that buffer.
+procedure CheckConsoleStdErr(shareHostConsole : boolean);
 var
   allocated : boolean;
   controlBuffer : THandle;
@@ -607,6 +618,7 @@ begin
     try
       proc := TProcess.Create;
       proc.StartInfo.InheritHostStdHandles := True;
+      proc.StartInfo.ShareHostConsole := shareHostConsole;
       proc.StartInfo.TimeoutInMSec := 20000;
       TTestHelpers.SetupInlineCommand(proc, 'echo VSP_STDOUT& echo VSP_MARKER 1>&2', '');
       proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
@@ -618,9 +630,16 @@ begin
     Assert.IsTrue(proc.Status = TProcessStatus.Exited, 'status ' + StatusName(proc.Status) + ' ' + proc.Errors.Text);
     Assert.Contains(output.ToString, 'VSP_STDOUT', 'stdout is still redirected');
     screen := Trim(ReadScreenStart(hostBuffer));
-    Assert.IsTrue(Pos('VSP_MARKER', screen) > 0,
-                  'the child''s stderr did not reach the host''s console: the console shows "' + screen + '", child exit code ' +
-                  IntToStr(proc.ExitCode) + ', Errors "' + Trim(proc.Errors.Text) + '"');
+    if shareHostConsole then
+      Assert.IsTrue(Pos('VSP_MARKER', screen) > 0,
+                    'the child''s stderr did not reach the host''s console: the console shows "' + screen + '", child exit code ' +
+                    IntToStr(proc.ExitCode) + ', Errors "' + Trim(proc.Errors.Text) + '"')
+    else
+    begin
+      Assert.IsTrue(Pos('VSP_MARKER', screen) = 0,
+                    'the child wrote to the host''s console, so it shares it: the console shows "' + screen + '"');
+      Assert.AreEqual('', Trim(proc.Errors.Text), 'leaving the console handle out is not an error');
+    end;
   finally
     proc := nil;
     output.Free;
@@ -631,6 +650,16 @@ begin
     if allocated then
       FreeConsole;
   end;
+end;
+
+procedure TReviewWindowsTests.WIN1_InheritHostStdHandles_ConsoleStdErr_ReachesHostConsole;
+begin
+  CheckConsoleStdErr(true);
+end;
+
+procedure TReviewWindowsTests.InheritHostStdHandles_ConsoleStdErr_NotSharedByDefault;
+begin
+  CheckConsoleStdErr(false);
 end;
 
 // Runs a child that writes to stdout and stderr without pause, with a 1 s
