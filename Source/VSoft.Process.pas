@@ -282,6 +282,8 @@ type
     procedure SetDetachedNewConsole(value : boolean);
     function GetInheritHostStdHandles : boolean;
     procedure SetInheritHostStdHandles(value : boolean);
+    function GetDeliverOnRunThread : boolean;
+    procedure SetDeliverOnRunThread(value : boolean);
 
     function GetInputEncoding: TEncoding;
     procedure SetInputEncoding(const value: TEncoding);
@@ -309,6 +311,7 @@ type
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
     function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
     function WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
+    function WithDeliverOnRunThread(value : boolean) : IStartInfoBuilder;
 
     //non fluent config
     // On Windows a .bat / .cmd executable is run by cmd.exe, which re-parses
@@ -399,6 +402,15 @@ type
     // with credentials too. Ignored by ExecuteDetached and on POSIX, where
     // a stream that is not redirected is always inherited.
     property InheritHostStdHandles : boolean read GetInheritHostStdHandles write SetInheritHostStdHandles;
+    // Windows: pipe targets are called on the thread running the run (the
+    // caller of a synchronous Execute, the worker thread of ExecuteAsync)
+    // instead of on threadpool threads (default False). That thread is in
+    // the run's wait loop anyway; it delivers each read and only then starts
+    // the next one, so a slow target holds the child back (the pipe fills)
+    // rather than output piling up in memory. The calls, their order per
+    // stream and Done coming last are the same either way. Ignored on POSIX,
+    // which always delivers on the thread running the run.
+    property DeliverOnRunThread : boolean read GetDeliverOnRunThread write SetDeliverOnRunThread;
   end;
 {$ENDREGION}
 
@@ -447,7 +459,8 @@ type
   //  * Start is called once per run before the child is created; Done once per
   //    run after the last HandleData (also when the launch fails). Neither is
   //    called when validation fails or for ExecuteDetached.
-  //  * HandleData is called on a threadpool thread on Windows, and on the
+  //  * HandleData is called on a threadpool thread on Windows (on the thread
+  //    running the run with StartInfo.DeliverOnRunThread), and on the
   //    thread running the run on POSIX (the caller of a synchronous Execute,
   //    the worker thread of ExecuteAsync). Calls for all of a process's
   //    targets are serialised (never concurrent).

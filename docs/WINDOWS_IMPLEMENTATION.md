@@ -33,7 +33,11 @@ All `HandleData` calls go through `TProcessBase.ProcessStdOut` / `ProcessStdErr`
 Each redirected output stream has a `TIOInfo`:
 
 - `QueueAsyncPipeRead` holds `Lock`, refuses to start a read once `Closing` is set, and calls `StartThreadpoolIo` + `ReadFile`. Transient out-of-resource errors are retried a few times inline.
-- `IoCompletionCallback` delivers the data and queues the next read. When no read is pending (EOF, error, `Closing`) it sets `DoneEvent` as its very last action. The callback **never** calls `CloseThreadpoolIo`; the worker owns the lifetime.
+- `IoCompletionCallback` pays off `Unread`, then `CompleteRead` delivers the data and queues the next read. When no read is pending (EOF, error, `Closing`) it sets `DoneEvent` as its very last action. The callback **never** calls `CloseThreadpoolIo`; the worker owns the lifetime.
+- **`StartInfo.DeliverOnRunThread` (`HandOver`).** Here the callback only stores the byte count and result and sets `DataReady` (manual reset), as its very last action. The thread running the run calls `DispatchHandedOver` from its waits: the main wait in `DoWaitForCompletion` (whose `DataReady` events come after the process, terminate and cancellation handles, so those win) and `WaitForDrain`. It resets `DataReady`, then calls `CompleteRead` itself.
+  - **Back-pressure.** The next read is queued only after delivery, so one buffer per stream is in flight, and a slow target backs up into the pipe rather than into memory.
+  - **Done events.** Only `CompleteRead` (on that thread) sets `DoneEvent` in this mode, so once both are set nothing is left handed over.
+  - **Close.** `CloseIO` delivers a buffer handed over but not yet delivered (an abandoned run, a drain that timed out).
 - `IsMultiThread` is set in the unit initialization: callbacks run Delphi code on threadpool threads, and FastMM only locks when `IsMultiThread` is set.
 
 ## Teardown (`DoWaitForCompletion` → `ReleaseRunResources`)

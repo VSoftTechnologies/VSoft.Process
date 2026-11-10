@@ -54,6 +54,7 @@ type
     FTerminateOnTimeout : boolean;
     FDetachedNewConsole : boolean;
     FInheritHostStdHandles : boolean;
+    FDeliverOnRunThread : boolean;
   protected
     function GetHideWindow : boolean;
     procedure SetHideWindow(value : boolean);
@@ -91,6 +92,8 @@ type
     procedure SetDetachedNewConsole(value : boolean);
     function GetInheritHostStdHandles : boolean;
     procedure SetInheritHostStdHandles(value : boolean);
+    function GetDeliverOnRunThread : boolean;
+    procedure SetDeliverOnRunThread(value : boolean);
 
 
     function WithTimeout(timeoutMs : Cardinal) : IStartInfoBuilder;
@@ -111,6 +114,7 @@ type
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
     function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
     function WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
+    function WithDeliverOnRunThread(value : boolean) : IStartInfoBuilder;
 
 
     function Clone : IStartInfoBuilder;
@@ -145,6 +149,7 @@ begin
   FTerminateOnTimeout := true;
   FDetachedNewConsole := false;
   FInheritHostStdHandles := false;
+  FDeliverOnRunThread := false;
 end;
 
 constructor TStartInfoBuilder.CreateClone(const source: TStartInfoBuilder);
@@ -168,6 +173,7 @@ begin
   FPipeDrainTimeoutMS := source.FPipeDrainTimeoutMS;
   FDetachedNewConsole := source.FDetachedNewConsole;
   FInheritHostStdHandles := source.FInheritHostStdHandles;
+  FDeliverOnRunThread := source.FDeliverOnRunThread;
 end;
 
 destructor TStartInfoBuilder.Destroy;
@@ -239,6 +245,11 @@ end;
 function TStartInfoBuilder.GetInheritHostStdHandles : boolean;
 begin
   result := FInheritHostStdHandles;
+end;
+
+function TStartInfoBuilder.GetDeliverOnRunThread : boolean;
+begin
+  result := FDeliverOnRunThread;
 end;
 
 function TStartInfoBuilder.GetTimedOutExitCode: Cardinal;
@@ -329,6 +340,11 @@ end;
 procedure TStartInfoBuilder.SetInheritHostStdHandles(value : boolean);
 begin
   FInheritHostStdHandles := value;
+end;
+
+procedure TStartInfoBuilder.SetDeliverOnRunThread(value : boolean);
+begin
+  FDeliverOnRunThread := value;
 end;
 
 procedure TStartInfoBuilder.SetTimedOutExitCode(value: Cardinal);
@@ -431,6 +447,12 @@ end;
 function TStartInfoBuilder.WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
 begin
   FInheritHostStdHandles := value;
+  result := Self;
+end;
+
+function TStartInfoBuilder.WithDeliverOnRunThread(value : boolean) : IStartInfoBuilder;
+begin
+  FDeliverOnRunThread := value;
   result := Self;
 end;
 

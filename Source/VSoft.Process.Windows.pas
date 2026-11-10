@@ -66,6 +66,15 @@ type
     Unread : Int64;
     CountReads : boolean;
     ReadCounted : boolean;
+    // StartInfo.DeliverOnRunThread: the callback hands a completed read to
+    // the thread running the run (PendingBytes / PendingResult, then
+    // DataReady, a manual-reset event) instead of delivering it. That thread
+    // delivers it and only then queues the next read (DispatchHandedOver), so
+    // one buffer per stream is in flight.
+    HandOver : boolean;
+    DataReady : THandle;
+    PendingBytes : ULONG_PTR;
+    PendingResult : ULONG;
   end;
 
   TWindowsProcess = class(TProcessBase, IProcess)
@@ -95,6 +104,12 @@ type
     procedure CreateInputPipe(out readHandle : THandle; out writeHandle : THandle);
     procedure InitIOInfo(info : PIOInfo; handle : THandle; isStdErr : boolean);
     procedure CloseIO(info : PIOInfo);
+    // DeliverOnRunThread, on the thread running the run: delivers each read
+    // the callback handed over and queues the next. True when there was one.
+    function DispatchHandedOver : boolean;
+    // Adds the DataReady events of the streams handing reads over to handles
+    // from index first; returns the index after the last one added.
+    function HandOverEvents(var handles : array of THandle; first : integer) : integer;
     procedure StopStdInWriter(waitMs : Cardinal);
     // abandoned: the child was left running (TerminateOnTimeout = False).
     procedure ReleaseRunResources(killed : boolean; abandoned : boolean);
@@ -303,24 +318,18 @@ begin
   result := false;
 end;
 
-//called when the overlapped read completes
-procedure IoCompletionCallback(instance : PTP_CALLBACK_INSTANCE; context : Pointer; overlapped : Pointer; ioResult : ULONG; numBytesRead : ULONG_PTR; io : PTP_IO);stdcall;
+// Delivers a completed read and queues the next one. When no read is pending
+// any more (EOF, an error, Closing) it sets DoneEvent, as its very last
+// action.
+procedure CompleteRead(info : PIOInfo; ioResult : ULONG; numBytesRead : ULONG_PTR);
 var
-  info : PIOInfo;
   readMore : boolean;
   streamName : string;
 begin
-  info := PIOInfo(context);
   readMore := false;
   try
     if numBytesRead > 0 then
-    begin
-      EnterCriticalSection(info.Lock);
-      if info.ReadCounted then
-        Dec(info.Unread, Int64(numBytesRead));
-      LeaveCriticalSection(info.Lock);
       info.Owner.DeliverOutput(info.IsStdErr, info.Buffer, numBytesRead);
-    end;
     if ioResult = NO_ERROR then
       readMore := QueueAsyncPipeRead(info)
     else if (ioResult <> ERROR_BROKEN_PIPE) and (ioResult <> ERROR_HANDLE_EOF) and (ioResult <> ERROR_OPERATION_ABORTED) then
@@ -349,6 +358,31 @@ begin
   end;
   if not readMore then
     SetEvent(info.DoneEvent);
+end;
+
+//called when the overlapped read completes
+procedure IoCompletionCallback(instance : PTP_CALLBACK_INSTANCE; context : Pointer; overlapped : Pointer; ioResult : ULONG; numBytesRead : ULONG_PTR; io : PTP_IO);stdcall;
+var
+  info : PIOInfo;
+begin
+  info := PIOInfo(context);
+  if numBytesRead > 0 then
+  begin
+    EnterCriticalSection(info.Lock);
+    if info.ReadCounted then
+      Dec(info.Unread, Int64(numBytesRead));
+    LeaveCriticalSection(info.Lock);
+  end;
+  if info.HandOver then
+  begin
+    info.PendingBytes := numBytesRead;
+    info.PendingResult := ioResult;
+    // Last: from here the run's thread may reuse the buffer and the
+    // overlapped for the next read.
+    SetEvent(info.DataReady);
+  end
+  else
+    CompleteRead(info, ioResult, numBytesRead);
 end;
 
 type
@@ -602,6 +636,17 @@ begin
   info.DoneEvent := CreateEvent(nil, True, False, nil);
   if info.DoneEvent = 0 then
     RaiseLastOSError;
+  info.HandOver := StartInfo.DeliverOnRunThread;
+  info.PendingBytes := 0;
+  info.PendingResult := 0;
+  info.DataReady := 0;
+  if info.HandOver then
+  begin
+    // Closed by CloseIO, which the caller runs when this raises.
+    info.DataReady := CreateEvent(nil, True, False, nil);
+    if info.DataReady = 0 then
+      RaiseLastOSError;
+  end;
   info.IO := CreateThreadpoolIo(handle, @IoCompletionCallback, info, nil);
   if info.IO = nil then
   begin
@@ -624,10 +669,61 @@ begin
     WaitForThreadpoolIoCallbacks(info.IO, False);
     CloseThreadpoolIo(info.IO);
     info.IO := nil;
+    // DeliverOnRunThread: a read handed over but not delivered yet (the run
+    // was abandoned, or the drain timed out) is delivered, not dropped.
+    if info.HandOver and (info.DataReady <> 0) and (WaitForSingleObject(info.DataReady, 0) = WAIT_OBJECT_0) then
+    begin
+      ResetEvent(info.DataReady);
+      try
+        if info.PendingBytes > 0 then
+          DeliverOutput(info.IsStdErr, info.Buffer, info.PendingBytes);
+      except
+        // DeliverOutput isolates target exceptions; anything else (out of
+        // memory) must not stop the handles being closed.
+        on Exception do
+          info.PendingBytes := 0;
+      end;
+    end;
   end;
   SafeCloseHandle(info.Handle);
   SafeCloseHandle(info.DoneEvent);
+  SafeCloseHandle(info.DataReady);
+  info.HandOver := false;
   info.Owner := nil;
+end;
+
+function TWindowsProcess.DispatchHandedOver : boolean;
+
+  function DispatchOne(info : PIOInfo) : boolean;
+  begin
+    result := info.HandOver and (info.IO <> nil) and (WaitForSingleObject(info.DataReady, 0) = WAIT_OBJECT_0);
+    if result then
+    begin
+      // Before the next read can be queued, so its completion is never lost.
+      ResetEvent(info.DataReady);
+      CompleteRead(info, info.PendingResult, info.PendingBytes);
+    end;
+  end;
+
+begin
+  result := DispatchOne(@FStdOutIO);
+  if DispatchOne(@FStdErrIO) then
+    result := true;
+end;
+
+function TWindowsProcess.HandOverEvents(var handles : array of THandle; first : integer) : integer;
+begin
+  result := first;
+  if FStdOutIO.HandOver and (FStdOutIO.IO <> nil) then
+  begin
+    handles[result] := FStdOutIO.DataReady;
+    Inc(result);
+  end;
+  if FStdErrIO.HandOver and (FStdErrIO.IO <> nil) then
+  begin
+    handles[result] := FStdErrIO.DataReady;
+    Inc(result);
+  end;
 end;
 
 procedure TWindowsProcess.StopStdInWriter(waitMs : Cardinal);
@@ -1380,14 +1476,21 @@ var
   clock : TStopwatch;
   deadline : Int64;
   waitMs : Int64;
+  readyEvents : array[0..1] of THandle;
+  readyCount : integer;
 begin
   // Waits in slices: the deadline only starts once the child's own output
   // has been delivered, and a stop request must be noticed.
   stopped := false;
   clock := TStopwatch.StartNew;
   deadline := -1;
+  // DeliverOnRunThread: this thread delivers the reads meanwhile, so it
+  // wakes for each one handed over.
+  readyCount := HandOverEvents(readyEvents, 0);
   while true do
   begin
+    if readyCount > 0 then
+      DispatchHandedOver;
     if (deadline < 0) and (drainMs <> INFINITE) and (not HasUnreadOutput) then
       deadline := clock.ElapsedMilliseconds + drainMs;
     waitMs := cSliceMs;
@@ -1395,7 +1498,15 @@ begin
       waitMs := deadline - clock.ElapsedMilliseconds;
     if waitMs < 0 then
       waitMs := 0;
-    if WaitForMultipleObjects(count, @handles[0], True, DWORD(waitMs)) <> WAIT_TIMEOUT then
+    if readyCount > 0 then
+    begin
+      // Only CompleteRead, on this thread, ends a stream, so once every one
+      // has ended there is nothing handed over left to deliver.
+      if WaitForMultipleObjects(count, @handles[0], True, 0) <> WAIT_TIMEOUT then
+        Exit(true);
+      WaitForMultipleObjects(readyCount, @readyEvents[0], False, DWORD(waitMs));
+    end
+    else if WaitForMultipleObjects(count, @handles[0], True, DWORD(waitMs)) <> WAIT_TIMEOUT then
       Exit(true);
     if canStop and IsStopRequested then
     begin
@@ -1410,13 +1521,18 @@ end;
 procedure TWindowsProcess.DoWaitForCompletion(var outcome : TProcessOutcome);
 const
   // Wait sources: process handle, FTerminateEvent, optional FCancellationEvent,
-  // optional FCancellationToken.
-  cMaxWaitHandles = 4;
+  // optional FCancellationToken, and with DeliverOnRunThread the DataReady
+  // events of stdout and stderr.
+  cMaxWaitHandles = 6;
 var
   timeOutDuration: Cardinal;
   waitRes: Cardinal;
   objHandles: array [0..cMaxWaitHandles - 1] of THandle;
   handleCount: integer;
+  readyFirst : integer;
+  clock : TStopwatch;
+  waitMs : Cardinal;
+  handedOver : boolean;
   killed : boolean;
   abandoned : boolean;
   resolved : boolean;
@@ -1446,8 +1562,24 @@ begin
       objHandles[handleCount] := FCancellationToken.Handle;
       Inc(handleCount);
     end;
+    // Last, so the process exiting, Terminate and cancellation come first.
+    readyFirst := handleCount;
+    handleCount := HandOverEvents(objHandles, handleCount);
 
-    waitRes := WaitForMultipleObjects(handleCount, @objHandles, False, timeOutDuration);
+    clock := TStopwatch.StartNew;
+    repeat
+      if timeOutDuration = INFINITE then
+        waitMs := INFINITE
+      else if clock.ElapsedMilliseconds >= timeOutDuration then
+        waitMs := 0
+      else
+        waitMs := timeOutDuration - Cardinal(clock.ElapsedMilliseconds);
+      waitRes := WaitForMultipleObjects(handleCount, @objHandles, False, waitMs);
+      // DeliverOnRunThread: a read handed over; deliver it and wait on.
+      handedOver := (waitRes >= WAIT_OBJECT_0 + Cardinal(readyFirst)) and (waitRes < WAIT_OBJECT_0 + Cardinal(handleCount));
+      if handedOver then
+        DispatchHandedOver;
+    until not handedOver;
     case waitRes of
       WAIT_OBJECT_0: // Process has exited
         begin

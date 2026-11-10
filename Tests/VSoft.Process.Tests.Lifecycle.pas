@@ -127,6 +127,21 @@ type
     [Test]
     procedure TerminateNoWait_ReturnsAtOnce_RunEndsTerminated;
 
+    // StartInfo.DeliverOnRunThread: pipe targets are called on the thread
+    // running the run (POSIX always does), with the same data in the same
+    // order, Done last, a slow target still getting everything, and
+    // Terminate / timeout working as before.
+    [Test]
+    procedure DeliverOnRunThread_SyncExecute_TargetsRunOnCallingThread;
+    [Test]
+    procedure DeliverOnRunThread_Async_TargetsRunOnWorkerThread;
+    [Test]
+    procedure DeliverOnRunThread_SameBytesAsThreadpoolDelivery;
+    [Test]
+    procedure DeliverOnRunThread_SlowTarget_GetsAllOutput;
+    [Test]
+    procedure DeliverOnRunThread_TimeoutAndTerminate;
+
     // H13 - a long UTF-8 line read through a 4 KB buffer arrives intact.
     [Test]
     procedure Utf8LongLine_StringBuilderTarget_SmallBuffer_Intact;
@@ -295,10 +310,28 @@ uses
   {$IFDEF MSWINDOWS}
   VSoft.Process.Tests.Helper,
   {$ENDIF}
+  System.Generics.Collections,
   VSoft.CancellationToken,
+  VSoft.Process.Base,
   VSoft.Process.Tests.Common;
 
 type
+  // Records the thread of every HandleData call and of Done, and the bytes.
+  // HandleData calls for one process never overlap, so no lock is needed.
+  TThreadRecordingTarget = class(TInterfacedObject, IPipeTarget)
+  public
+    Threads : TList<TThreadID>;
+    DoneThread : TThreadID;
+    DoneCalls : integer;
+    DataAfterDone : boolean;
+    Bytes : TMemoryStream;
+    constructor Create;
+    destructor Destroy; override;
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
+  end;
+
   TLines = class
   private
     FLock : TCriticalSection;
@@ -1635,6 +1668,205 @@ begin
   Assert.AreEqual(TProcessStatus.Terminated, proc.Status);
   Assert.AreEqual<Cardinal>(4242, proc.ExitCode);
   Assert.IsFalse(proc.Terminate(0), 'no run in progress any more');
+end;
+
+{ TThreadRecordingTarget }
+
+constructor TThreadRecordingTarget.Create;
+begin
+  inherited Create;
+  Threads := TList<TThreadID>.Create;
+  Bytes := TMemoryStream.Create;
+end;
+
+destructor TThreadRecordingTarget.Destroy;
+begin
+  Bytes.Free;
+  Threads.Free;
+  inherited;
+end;
+
+procedure TThreadRecordingTarget.Start;
+begin
+  Threads.Clear;
+  Bytes.Clear;
+  DoneCalls := 0;
+  DoneThread := 0;
+  DataAfterDone := false;
+end;
+
+procedure TThreadRecordingTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+begin
+  if DoneCalls > 0 then
+    DataAfterDone := true;
+  Threads.Add(CurrentThreadId);
+  if dataLength > 0 then
+    Bytes.WriteBuffer(data[0], dataLength);
+end;
+
+procedure TThreadRecordingTarget.Done;
+begin
+  Inc(DoneCalls);
+  DoneThread := CurrentThreadId;
+end;
+
+// True when every recorded HandleData call was on thread.
+function AllOnThread(const target : TThreadRecordingTarget; thread : TThreadID) : boolean;
+var
+  i : integer;
+begin
+  result := target.Threads.Count > 0;
+  for i := 0 to target.Threads.Count - 1 do
+    if target.Threads[i] <> thread then
+      Exit(false);
+end;
+
+procedure TProcessLifecycleTests.DeliverOnRunThread_SyncExecute_TargetsRunOnCallingThread;
+var
+  proc : IProcess;
+  target : TThreadRecordingTarget;
+  targetRef : IPipeTarget;
+begin
+  target := TThreadRecordingTarget.Create;
+  targetRef := target;
+  proc := TProcess.Create;
+  proc.StartInfo.DeliverOnRunThread := True;
+  TTestHelpers.SetupShellCommand(proc, 'print-both', ['200']);
+  proc.WithStdOutPipe(targetRef);
+  proc.WithStdErrPipe(targetRef);
+  Assert.IsTrue(proc.Execute, proc.Errors.Text);
+  Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+  Assert.IsTrue(AllOnThread(target, CurrentThreadId),
+                IntToStr(target.Threads.Count) + ' calls, not all on the thread that called Execute');
+  Assert.AreEqual(1, target.DoneCalls);
+  Assert.AreEqual<TThreadID>(CurrentThreadId, target.DoneThread);
+  Assert.IsFalse(target.DataAfterDone, 'Done comes last');
+end;
+
+procedure TProcessLifecycleTests.DeliverOnRunThread_Async_TargetsRunOnWorkerThread;
+var
+  proc : IProcess;
+  target : TThreadRecordingTarget;
+  targetRef : IPipeTarget;
+begin
+  target := TThreadRecordingTarget.Create;
+  targetRef := target;
+  proc := TProcess.Create;
+  proc.StartInfo.DeliverOnRunThread := True;
+  TTestHelpers.SetupShellCommand(proc, 'print-both', ['200']);
+  proc.WithStdOutPipe(targetRef);
+  proc.WithStdErrPipe(targetRef);
+  Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+  Assert.IsTrue(TTestHelpers.WaitWhileRunning(proc, 30000), 'the run did not complete');
+  Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+  // Done is called on the worker thread, after the last HandleData.
+  Assert.AreEqual(1, target.DoneCalls);
+  Assert.AreNotEqual<TThreadID>(CurrentThreadId, target.DoneThread, 'the worker, not this thread');
+  Assert.IsTrue(AllOnThread(target, target.DoneThread),
+                IntToStr(target.Threads.Count) + ' calls, not all on the worker thread');
+  Assert.IsFalse(target.DataAfterDone, 'Done comes last');
+end;
+
+procedure TProcessLifecycleTests.DeliverOnRunThread_SameBytesAsThreadpoolDelivery;
+
+  procedure Run(onRunThread : boolean; outBytes : TStream; errBytes : TStream);
+  var
+    proc : IProcess;
+  begin
+    proc := TProcess.Create;
+    proc.StartInfo.DeliverOnRunThread := onRunThread;
+    // Small reads, so there are many of them.
+    proc.StartInfo.PipeBufferSize := 4096;
+    TTestHelpers.SetupShellCommand(proc, 'print-both', ['2000']);
+    proc.WithStdOutPipe(TPipeTarget.ToStream(outBytes));
+    proc.WithStdErrPipe(TPipeTarget.ToStream(errBytes));
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+  end;
+
+  function SameContent(a, b : TMemoryStream) : boolean;
+  begin
+    result := (a.Size = b.Size) and CompareMem(a.Memory, b.Memory, a.Size);
+  end;
+
+var
+  outPool, errPool, outRun, errRun : TMemoryStream;
+begin
+  outPool := TMemoryStream.Create;
+  errPool := TMemoryStream.Create;
+  outRun := TMemoryStream.Create;
+  errRun := TMemoryStream.Create;
+  try
+    Run(false, outPool, errPool);
+    Run(true, outRun, errRun);
+    Assert.IsTrue(outPool.Size > 100000, 'expected plenty of output');
+    Assert.IsTrue(SameContent(outPool, outRun), 'stdout differs: ' + IntToStr(outPool.Size) + ' / ' + IntToStr(outRun.Size) + ' bytes');
+    Assert.IsTrue(SameContent(errPool, errRun), 'stderr differs: ' + IntToStr(errPool.Size) + ' / ' + IntToStr(errRun.Size) + ' bytes');
+  finally
+    errRun.Free;
+    outRun.Free;
+    errPool.Free;
+    outPool.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.DeliverOnRunThread_SlowTarget_GetsAllOutput;
+const
+  cLines = 1500;
+var
+  proc : IProcess;
+  target : TSlowTarget;
+  targetRef : IPipeTarget;
+begin
+  target := TSlowTarget.Create;
+  targetRef := target;
+  target.SleepMs := 5;
+  proc := TProcess.Create;
+  proc.StartInfo.DeliverOnRunThread := True;
+  proc.StartInfo.PipeBufferSize := 4096;
+  proc.StartInfo.TimeoutInMSec := 60000;
+  TTestHelpers.SetupShellCommand(proc, 'print-large', [IntToStr(cLines)]);
+  proc.WithStdOutPipe(targetRef);
+  Assert.IsTrue(proc.Execute, proc.Errors.Text);
+  Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+  Assert.AreEqual(cLines, target.LineFeeds, 'every line reaches the slow target: ' + proc.Errors.Text);
+  Assert.AreEqual(1, target.DoneCount);
+end;
+
+procedure TProcessLifecycleTests.DeliverOnRunThread_TimeoutAndTerminate;
+var
+  proc : IProcess;
+  output : TStringBuilder;
+  started : Int64;
+begin
+  output := TStringBuilder.Create;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.DeliverOnRunThread := True;
+    proc.StartInfo.TimeoutInMSec := 1500;
+    TTestHelpers.SetupShellCommand(proc, 'print-then-sleep', ['30']);
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    started := TTestHelpers.TickMs;
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.AreEqual(TProcessStatus.TimedOut, proc.Status, proc.Errors.Text);
+    Assert.IsTrue(TTestHelpers.TickMs - started < 10000, 'the timeout took ' + IntToStr(TTestHelpers.TickMs - started) + 'ms');
+    Assert.IsTrue(output.Length > 0, 'output before the timeout is delivered');
+
+    proc := TProcess.Create;
+    proc.StartInfo.DeliverOnRunThread := True;
+    proc.StartInfo.TerminateExitCode := 4343;
+    TTestHelpers.SetupShellCommand(proc, 'print-then-sleep', ['30']);
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    Sleep(300);
+    Assert.IsTrue(proc.Terminate(0));
+    Assert.IsTrue(TTestHelpers.WaitWhileRunning(proc, 10000), 'Terminate did not end the run');
+    Assert.AreEqual(TProcessStatus.Terminated, proc.Status, proc.Errors.Text);
+    Assert.AreEqual<Cardinal>(4343, proc.ExitCode);
+  finally
+    proc := nil;
+    output.Free;
+  end;
 end;
 
 procedure TProcessLifecycleTests.Utf8LongLine_StringBuilderTarget_SmallBuffer_Intact;

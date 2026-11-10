@@ -43,6 +43,9 @@ type
     [Test]
     procedure InheritHostStdHandles_DefaultsFluentAndClone;
 
+    [Test]
+    procedure DeliverOnRunThread_DefaultsFluentAndClone;
+
     // SetProcessAffinityMask takes a DWORD_PTR, so on Win64 a mask can name
     // CPUs 32-63. The property must not truncate it.
     [Test]
@@ -217,6 +220,21 @@ begin
   Assert.IsTrue(dst.InheritHostStdHandles);
   src.InheritHostStdHandles := false;
   Assert.IsTrue(dst.InheritHostStdHandles, 'the clone is independent');
+end;
+
+procedure TStartInfoTests.DeliverOnRunThread_DefaultsFluentAndClone;
+var
+  src, dst, ret : IStartInfoBuilder;
+begin
+  src := MakeBuilder;
+  Assert.IsFalse(src.DeliverOnRunThread, 'off by default');
+  ret := src.WithDeliverOnRunThread(true);
+  Assert.AreSame(src, ret);
+  Assert.IsTrue(src.DeliverOnRunThread);
+  dst := src.Clone;
+  Assert.IsTrue(dst.DeliverOnRunThread);
+  src.DeliverOnRunThread := false;
+  Assert.IsTrue(dst.DeliverOnRunThread, 'the clone is independent');
 end;
 
 procedure TStartInfoTests.ProcessorAffinity_HoldsHighCpuBits;
