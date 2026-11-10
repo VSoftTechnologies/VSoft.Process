@@ -39,6 +39,11 @@ type
     // of another launch at that moment does not leak into it.
     [Test]
     procedure NetOnlyLogon_ChildInheritsNoOtherHandle;
+
+    // A launch the Secondary Logon service refuses reports the Windows error
+    // in LastError and Errors (with no %1 left in the message).
+    [Test]
+    procedure NetOnlyLogon_LaunchFails_ReportsTheOsError;
   end;
 {$ENDIF}
 
@@ -284,6 +289,38 @@ begin
   finally
     proc := nil;
     ClosePipe;
+  end;
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_LaunchFails_ReportsTheOsError;
+var
+  proc : IProcess;
+  exeName : string;
+  textFile : TStringList;
+begin
+  exeName := TTestHelpers.TempFileName('vsoft_proc_notexe_', '.exe');
+  textFile := TStringList.Create;
+  try
+    textFile.Add('This is a text file, not a program.');
+    textFile.SaveToFile(exeName);
+  finally
+    textFile.Free;
+  end;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := exeName;
+    SetNetOnlyCredentials(proc);
+    Assert.IsFalse(proc.Execute, 'a text file is not a program');
+    IgnoreWhenNoSecondaryLogon(proc);
+    // The code is the service's (ERROR_FILE_NOT_FOUND here, for a file
+    // CreateProcess calls not a valid application), but never 0.
+    Assert.AreNotEqual<Cardinal>(0, proc.LastError, 'LastError: ' + proc.Errors.Text);
+    Assert.AreEqual(0, Pos(SysErrorMessage(ERROR_SUCCESS), proc.Errors.Text), proc.Errors.Text);
+    Assert.AreEqual(0, Pos('%1', proc.Errors.Text), proc.Errors.Text);
+  finally
+    proc := nil;
+    if FileExists(exeName) then
+      DeleteFile(exeName);
   end;
 end;
 

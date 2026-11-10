@@ -746,7 +746,8 @@ begin
     else
       result := CreateProcessWithLogonW(PChar(userName), PChar(domain), PChar(password), logonFlags, PChar(FResolvedExecutable), PChar(command),
                                         creationFlags, pEnvironment, pWorkingDir, startupInfo, processInfo);
-    error := GetLastError;
+    // Qualified: a bare GetLastError here is IProcess.GetLastError.
+    error := Winapi.Windows.GetLastError;
   finally
     ScrubString(password);
   end;
