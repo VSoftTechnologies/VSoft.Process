@@ -91,8 +91,6 @@ type
     // of its %1 placeholder. Never the arguments: they can hold secrets.
     function LaunchErrorText(error : DWORD) : string;
     function GetEnvironmentBlock : Pointer;
-    function LaunchWithLogon(const command : string; creationFlags : DWORD; pEnvironment : Pointer; pWorkingDir : PChar;
-                             const startupInfo : TStartupInfoW; var processInfo : TProcessInformation) : BOOL;
     procedure CreateOutputPipe(out readHandle : THandle; out writeHandle : THandle);
     procedure CreateInputPipe(out readHandle : THandle; out writeHandle : THandle);
     procedure InitIOInfo(info : PIOInfo; handle : THandle; isStdErr : boolean);
@@ -113,6 +111,10 @@ type
     procedure KeepForReleaseKill;
   protected
     procedure DeliverOutput(isStdErr : boolean; const buffer : TBytes; count : NativeUInt);
+    // CreateProcessWithLogonW with Credentials. Virtual so a test can stand
+    // in for the logon (it cannot log on to a real account).
+    function LaunchWithLogon(const command : string; creationFlags : DWORD; pEnvironment : Pointer; pWorkingDir : PChar;
+                             const startupInfo : TStartupInfoW; var processInfo : TProcessInformation) : BOOL;virtual;
 
     // Sets resolved to the program to launch (see IStartInfoBuilder.Executable).
     function ResolveExecutable(out resolved : string) : boolean;
@@ -974,61 +976,79 @@ begin
        HostJobAllowsBreakaway then
       creationFlags := creationFlags or VPROCESS_CREATE_BREAKAWAY_FROM_JOB;
 
-    GSpawnLock.Enter;
-    try
-      inheritCount := 0;
-      if anyRedirect then
-      begin
-        AddInheritable(startupInfoEx.StartupInfo.hStdInput);
-        AddInheritable(startupInfoEx.StartupInfo.hStdOutput);
-        AddInheritable(startupInfoEx.StartupInfo.hStdError);
-      end;
-
-      if Credentials.UserName <> '' then
-        // CreateProcessWithLogonW cannot take an attribute list; GSpawnLock
-        // still keeps other VSoft.Process spawns' pipes out of this child.
-        success := LaunchWithLogon(command, creationFlags, pEnvironment, pWorkingDir, startupInfoEx.StartupInfo, FProcessInfo)
-      else if inheritCount > 0 then
-      begin
-        // Inherit exactly the child's three std handles and nothing else.
-        attrSize := 0;
-        VProcInitializeProcThreadAttributeList(nil, 1, 0, attrSize);
-        GetMem(attrList, attrSize);
-        if not VProcInitializeProcThreadAttributeList(attrList, 1, 0, attrSize) then
-        begin
-          // Read before FreeMem, which may change it.
+    if Credentials.UserName <> '' then
+    begin
+      // The Secondary Logon service is not the child's real parent: it
+      // duplicates the three STARTUPINFO handles from this process into the
+      // child, and the child inherits nothing else from us. So the child's
+      // ends stay non-inheritable and GSpawnLock is not taken: a logon (a
+      // user profile to load) can take seconds, and every other launch in
+      // this process would wait for it.
+      try
+        success := LaunchWithLogon(command, creationFlags, pEnvironment, pWorkingDir, startupInfoEx.StartupInfo, FProcessInfo);
+        if not success then
           error := Winapi.Windows.GetLastError;
-          FreeMem(attrList);
-          attrList := nil;
-          RaiseLastOSError(error);
-        end;
-        if not VProcUpdateProcThreadAttribute(attrList, 0, VPROC_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, @inheritList[0],
-                                              NativeUInt(inheritCount) * SizeOf(THandle), nil, nil) then
-          RaiseLastOSError;
-        startupInfoEx.StartupInfo.cb := SizeOf(TVProcStartupInfoExW);
-        startupInfoEx.lpAttributeList := attrList;
-        success := VProcCreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, True,
-                                       creationFlags or VPROC_EXTENDED_STARTUPINFO_PRESENT, pEnvironment, pWorkingDir,
-                                       @startupInfoEx, FProcessInfo);
-      end
-      else
-        success := VProcCreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, False,
-                                       creationFlags, pEnvironment, pWorkingDir, @startupInfoEx, FProcessInfo);
-      if not success then
-        error := Winapi.Windows.GetLastError;
-    finally
-      // The child has its own copies now. Closing ours inside the lock means
-      // no other spawn can ever see them inheritable.
-      SafeCloseHandle(childOut);
-      SafeCloseHandle(childErr);
-      SafeCloseHandle(childIn);
-      SafeCloseHandle(nulHandle);
-      if attrList <> nil then
-      begin
-        VProcDeleteProcThreadAttributeList(attrList);
-        FreeMem(attrList);
+      finally
+        SafeCloseHandle(childOut);
+        SafeCloseHandle(childErr);
+        SafeCloseHandle(childIn);
+        SafeCloseHandle(nulHandle);
       end;
-      GSpawnLock.Leave;
+    end
+    else
+    begin
+      GSpawnLock.Enter;
+      try
+        inheritCount := 0;
+        if anyRedirect then
+        begin
+          AddInheritable(startupInfoEx.StartupInfo.hStdInput);
+          AddInheritable(startupInfoEx.StartupInfo.hStdOutput);
+          AddInheritable(startupInfoEx.StartupInfo.hStdError);
+        end;
+
+        if inheritCount > 0 then
+        begin
+          // Inherit exactly the child's three std handles and nothing else.
+          attrSize := 0;
+          VProcInitializeProcThreadAttributeList(nil, 1, 0, attrSize);
+          GetMem(attrList, attrSize);
+          if not VProcInitializeProcThreadAttributeList(attrList, 1, 0, attrSize) then
+          begin
+            // Read before FreeMem, which may change it.
+            error := Winapi.Windows.GetLastError;
+            FreeMem(attrList);
+            attrList := nil;
+            RaiseLastOSError(error);
+          end;
+          if not VProcUpdateProcThreadAttribute(attrList, 0, VPROC_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, @inheritList[0],
+                                                NativeUInt(inheritCount) * SizeOf(THandle), nil, nil) then
+            RaiseLastOSError;
+          startupInfoEx.StartupInfo.cb := SizeOf(TVProcStartupInfoExW);
+          startupInfoEx.lpAttributeList := attrList;
+          success := VProcCreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, True,
+                                         creationFlags or VPROC_EXTENDED_STARTUPINFO_PRESENT, pEnvironment, pWorkingDir,
+                                         @startupInfoEx, FProcessInfo);
+        end
+        else
+          success := VProcCreateProcessW(PChar(FResolvedExecutable), PChar(command), nil, nil, False,
+                                         creationFlags, pEnvironment, pWorkingDir, @startupInfoEx, FProcessInfo);
+        if not success then
+          error := Winapi.Windows.GetLastError;
+      finally
+        // The child has its own copies now. Closing ours inside the lock means
+        // no other spawn can ever see them inheritable.
+        SafeCloseHandle(childOut);
+        SafeCloseHandle(childErr);
+        SafeCloseHandle(childIn);
+        SafeCloseHandle(nulHandle);
+        if attrList <> nil then
+        begin
+          VProcDeleteProcThreadAttributeList(attrList);
+          FreeMem(attrList);
+        end;
+        GSpawnLock.Leave;
+      end;
     end;
 
     if not success then

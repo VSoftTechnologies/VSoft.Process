@@ -40,6 +40,7 @@ uses
   VSoft.Process.Tests.Lifecycle in 'VSoft.Process.Tests.Lifecycle.pas',
   VSoft.Process.Tests.Lifetime in 'VSoft.Process.Tests.Lifetime.pas',
   VSoft.Process.Tests.ExecutableSearch in 'VSoft.Process.Tests.ExecutableSearch.pas',
+  VSoft.Process.Tests.Logon in 'VSoft.Process.Tests.Logon.pas',
   VSoft.Process.WinAPI in '..\Source\VSoft.Process.WinAPI.pas';
 
 {$R *.RES}

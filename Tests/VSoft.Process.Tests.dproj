@@ -232,6 +232,7 @@
         <DCCReference Include="VSoft.Process.Tests.Lifecycle.pas"/>
         <DCCReference Include="VSoft.Process.Tests.Lifetime.pas"/>
         <DCCReference Include="VSoft.Process.Tests.ExecutableSearch.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.Logon.pas"/>
         <DCCReference Include="..\Source\VSoft.Process.WinAPI.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
