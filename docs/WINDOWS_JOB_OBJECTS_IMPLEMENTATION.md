@@ -1,4 +1,12 @@
 > **Historical design notes.** This describes an earlier version of the implementation and is no longer accurate; see [WINDOWS_IMPLEMENTATION.md](WINDOWS_IMPLEMENTATION.md) for the current design.
+>
+> **What the job does now (`StartInfo.JobMode`).** The job is no longer always `KILL_ON_JOB_CLOSE`:
+>
+> - **`KillOnRelease` (default).** `JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Releasing or re-running the `IProcess` closes the job, which kills what the child left running. When the child can't be put in a job (Windows 7 nested jobs, Run-As children), a handle to the child is kept instead, and the child's process tree is killed at release.
+> - **`KillOnTerminate`.** `JOB_OBJECT_LIMIT_BREAKAWAY_OK` only. Leftovers survive release.
+> - **`NoJob`.** No job at all.
+>
+> Terminate, a timeout or cancellation kill the job (if any) and the child's process tree, which also reaches a program started with `CREATE_BREAKAWAY_FROM_JOB`. Then the thread completing the run waits up to 5 s in all for them to have gone (`TSystemUtils.TerminateProcessTreeAndWait`). The sections below that say otherwise are out of date.
 
 # Windows Job Objects Implementation - Summary
 
@@ -44,8 +52,8 @@ function SetInformationJobObject(hJob: THandle; JobObjectInfoClass: Integer;
    - Returns success/failure
 
 2. **ConfigureJobObject()**
-   - Sets JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag (automatic cleanup)
-   - Sets JOB_OBJECT_LIMIT_BREAKAWAY_OK for flexibility
+   - Sets JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (automatic cleanup), with `JobMode = KillOnRelease` only
+   - Sets JOB_OBJECT_LIMIT_BREAKAWAY_OK for flexibility, in every mode that has a job
    - Applies configuration via SetInformationJobObject
 
 3. **AssignProcessToJob()**
@@ -55,16 +63,11 @@ function SetInformationJobObject(hJob: THandle; JobObjectInfoClass: Integer;
 
 4. **CloseJobObject()**
    - Safely closes job handle
-   - Triggers automatic process termination via KILL_ON_JOB_CLOSE
+   - With `KillOnRelease`, triggers automatic process termination via KILL_ON_JOB_CLOSE (or kills the child's tree when the child could not be put in the job)
    - Sets handle to 0 for safety
 
-5. **GetUseJobObject(): Boolean**
-   - Returns whether job objects should be used
-   - Currently always True (can be extended for configuration)
-
-6. **SetUseJobObject(value: Boolean)**
-   - Placeholder for future job object configuration
-   - Can be extended to allow disabling jobs if needed
+5. **GetUseJobObject() / SetUseJobObject()** (historical)
+   - Replaced by `StartInfo.JobMode`: `NoJob` creates no job
 
 ### Integration Points
 
@@ -73,20 +76,20 @@ function SetInformationJobObject(hJob: THandle; JobObjectInfoClass: Integer;
 - Handles job creation failure gracefully
 
 **DoWaitForCompletion**
-- On termination event or timeout: Uses TerminateJobObject if job exists
-- Falls back to snapshot method if job termination fails
+- On termination event or timeout: terminates the job if one exists, and walks the child's process tree too (a program started with CREATE_BREAKAWAY_FROM_JOB is not in the job), then waits up to 5 s in all
+- Without a job: the process tree only
 - Sets appropriate exit code based on termination scenario
 
 **Destructor (TWindowsProcess.Destroy)**
 - Calls CloseJobObject for cleanup
-- Automatic process termination triggered via KILL_ON_JOB_CLOSE flag
+- With `KillOnRelease`, automatic process termination triggered via KILL_ON_JOB_CLOSE flag
 
 ## Key Benefits
 
 ### Reliability
 - **No Race Conditions**: Children spawned after parent automatically included in job
 - **Atomic Termination**: All processes terminated in single API call
-- **Guaranteed Cleanup**: KILL_ON_JOB_CLOSE ensures no orphans even on crash
+- **Guaranteed Cleanup**: with `KillOnRelease`, KILL_ON_JOB_CLOSE ensures no orphans even on crash
 
 ### Performance
 - **O(1) Termination**: Single API call vs O(n) process enumeration
@@ -152,7 +155,7 @@ The implementation works on all Windows versions via fallback mechanism.
 
 **No Resource Leaks:**
 - Job handle closed in destructor
-- KILL_ON_JOB_CLOSE ensures process cleanup even on abnormal termination
+- With `KillOnRelease`, KILL_ON_JOB_CLOSE ensures process cleanup even on abnormal termination
 - All job objects are unnamed (no registry cluttering)
 - Job handles properly disposed via CloseHandle()
 
