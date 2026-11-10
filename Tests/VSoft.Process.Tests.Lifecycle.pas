@@ -175,6 +175,16 @@ type
     [Test]
     procedure BatchFile_MetaCharsQuoted_UnsafeRejected;
 
+    // AddUnsafeBatchRaw: the batch file receives exactly what it receives
+    // from CreateProcess(nil, '"<bat>" ' + text), byte for byte (%* and
+    // %1..%9), for a batch path with and without a space.
+    [Test]
+    procedure BatchFile_UnsafeRaw_MatchesDirectCreateProcess;
+
+    // ... while the batch path and every other argument are still checked.
+    [Test]
+    procedure BatchFile_UnsafeRaw_PathAndOtherArgumentsStillChecked;
+
     // A launch that passes validation but that CreateProcess rejects reports
     // the OS error in LastError and Errors, for every Execute* call.
     [Test]
@@ -1857,6 +1867,155 @@ begin
     Assert.Contains(proc.Errors.Text, 'cannot be passed safely');
   finally
     output.Free;
+  end;
+end;
+
+// A batch file that writes %* and %1..%9, as received, to out.txt next to
+// itself. The values are taken with "set" before delayed expansion is on and
+// written with !var!, so & ( ) ! in them reach the file untouched.
+procedure WriteRecordArgsBatch(const fileName : string);
+var
+  text : string;
+  i : integer;
+  bytes : TBytes;
+  fs : TFileStream;
+begin
+  text := '@echo off'#13#10 + 'set "all=%*"'#13#10;
+  for i := 1 to 9 do
+    text := text + 'set "a' + IntToStr(i) + '=%' + IntToStr(i) + '"'#13#10;
+  text := text + 'setlocal EnableDelayedExpansion'#13#10 + '> "%~dp0out.txt" ('#13#10 + '  echo(*=[!all!]'#13#10;
+  for i := 1 to 9 do
+    text := text + '  echo(' + IntToStr(i) + '=[!a' + IntToStr(i) + '!]'#13#10;
+  text := text + ')'#13#10;
+  bytes := TEncoding.ANSI.GetBytes(text);
+  fs := TFileStream.Create(fileName, fmCreate);
+  try
+    fs.WriteBuffer(bytes[0], Length(bytes));
+  finally
+    fs.Free;
+  end;
+end;
+
+// What the record-args batch wrote, after deleting it for the next run.
+function TakeRecordedArgs(const outFile : string) : TBytes;
+begin
+  SetLength(result, 0);
+  if FileExists(outFile) then
+  begin
+    result := TTestHelpers.ReadFileBytes(outFile);
+    DeleteFile(outFile);
+  end;
+end;
+
+// The reference: the batch file run the way FinalBuilder runs one, with no
+// application name and the parameters appended as one string.
+function RunBatchDirectly(const batPath : string; const raw : string) : TBytes;
+var
+  startup : TStartupInfo;
+  info : TProcessInformation;
+  command : string;
+begin
+  ZeroMemory(@startup, SizeOf(startup));
+  startup.cb := SizeOf(startup);
+  startup.dwFlags := STARTF_USESHOWWINDOW;
+  startup.wShowWindow := SW_HIDE;
+  command := '"' + batPath + '" ' + raw;
+  UniqueString(command);
+  Win32Check(CreateProcess(nil, PChar(command), nil, nil, False, CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT,
+                           nil, nil, startup, info));
+  try
+    Assert.AreEqual<Cardinal>(WAIT_OBJECT_0, WaitForSingleObject(info.hProcess, 20000), 'the batch file did not finish');
+  finally
+    CloseHandle(info.hThread);
+    CloseHandle(info.hProcess);
+  end;
+  result := TakeRecordedArgs(ExtractFilePath(batPath) + 'out.txt');
+end;
+
+procedure TProcessLifecycleTests.BatchFile_UnsafeRaw_MatchesDirectCreateProcess;
+const
+  cInputs : array[0..8] of string = ('a b c', '"x y" z', '%PATH%', '!x!', 'a&b', 'a^b', '(a)', '"unclosed', '""');
+
+  procedure CheckFolder(const folder : string; const batName : string);
+  var
+    batPath : string;
+    i : integer;
+    expected : TBytes;
+    actual : TBytes;
+    proc : IProcess;
+  begin
+    ForceDirectories(folder);
+    batPath := IncludeTrailingPathDelimiter(folder) + batName;
+    try
+      WriteRecordArgsBatch(batPath);
+      for i := 0 to High(cInputs) do
+      begin
+        expected := RunBatchDirectly(batPath, cInputs[i]);
+        Assert.IsTrue(Length(expected) > 0, 'the reference run recorded nothing for [' + cInputs[i] + ']');
+
+        proc := TProcess.Create;
+        proc.StartInfo.Executable := batPath;
+        proc.StartInfo.TimeoutInMSec := 20000;
+        proc.CommandLine.AddUnsafeBatchRaw(cInputs[i]);
+        Assert.IsTrue(proc.Execute, '[' + cInputs[i] + ']: ' + proc.Errors.Text);
+        actual := TakeRecordedArgs(IncludeTrailingPathDelimiter(folder) + 'out.txt');
+        Assert.AreEqual(TEncoding.ANSI.GetString(expected), TEncoding.ANSI.GetString(actual),
+                        'what ' + batName + ' received for [' + cInputs[i] + ']');
+        Assert.IsTrue((Length(expected) = Length(actual)) and CompareMem(@expected[0], @actual[0], Length(expected)),
+                      'byte for byte, for [' + cInputs[i] + ']');
+      end;
+    finally
+      proc := nil;
+      if FileExists(batPath) then
+        DeleteFile(batPath);
+      if FileExists(IncludeTrailingPathDelimiter(folder) + 'out.txt') then
+        DeleteFile(IncludeTrailingPathDelimiter(folder) + 'out.txt');
+      RemoveDir(folder);
+    end;
+  end;
+
+begin
+  CheckFolder(TTestHelpers.TempFileName('vsoft_proc_bat_', ''), 'recordargs.bat');
+  CheckFolder(TTestHelpers.TempFileName('vsoft proc bat ', ''), 'record args.cmd');
+end;
+
+procedure TProcessLifecycleTests.BatchFile_UnsafeRaw_PathAndOtherArgumentsStillChecked;
+var
+  proc : IProcess;
+  folder : string;
+  batPath : string;
+begin
+  // Another argument is still validated.
+  proc := TProcess.Create;
+  proc.StartInfo.Executable := TTestHelpers.ScriptPath('echo-args');
+  proc.CommandLine.AddUnsafeBatchRaw('"%TEMP%" a&b');
+  proc.CommandLine.Add('%PATH%');
+  Assert.IsFalse(proc.Execute, 'the ordinary argument holds %');
+  Assert.Contains(proc.Errors.Text, 'Argument 2 cannot be passed safely');
+
+  // The batch file's own path is still checked.
+  folder := TTestHelpers.TempFileName('vproc-%TEMP%-', '');
+  ForceDirectories(folder);
+  batPath := IncludeTrailingPathDelimiter(folder) + 'recordargs.cmd';
+  try
+    WriteRecordArgsBatch(batPath);
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := batPath;
+    proc.CommandLine.AddUnsafeBatchRaw('a b');
+    Assert.IsFalse(proc.Execute, 'the batch path holds %');
+    Assert.Contains(proc.Errors.Text, 'contains % or !');
+
+    // Detected by the name Windows opens, too.
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := batPath + '.';
+    proc.CommandLine.AddUnsafeBatchRaw('a b');
+    Assert.IsFalse(proc.Execute, 'the batch path (with a trailing dot) holds %');
+    Assert.Contains(proc.Errors.Text, 'contains % or !');
+  finally
+    proc := nil;
+    if FileExists(batPath) then
+      DeleteFile(batPath);
+    RemoveDir(folder);
   end;
 end;
 

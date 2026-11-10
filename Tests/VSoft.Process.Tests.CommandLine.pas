@@ -104,6 +104,11 @@ type
     // to its name by a non-space separator.
     [Test]
     procedure Add_NameOnly_SingleQuoteStyles;
+
+    // AddUnsafeBatchRaw renders the text verbatim, is the only kind of
+    // argument flagged UnsafeBatchRaw, and a clone keeps the flag.
+    [Test]
+    procedure AddUnsafeBatchRaw_VerbatimFlaggedAndCloned;
   end;
 
 implementation
@@ -115,6 +120,29 @@ uses
 function MakeBuilder : ICommandLineBuilder;
 begin
   result := TArgumentsBuilder.Create;
+end;
+
+procedure TCommandLineTests.AddUnsafeBatchRaw_VerbatimFlaggedAndCloned;
+const
+  cRaw = '"x y" %PATH% a&b';
+var
+  cmd : ICommandLineBuilder;
+  copy : ICommandLineBuilder;
+begin
+  cmd := MakeBuilder;
+  cmd.Add('-v').AddUnsafeBatchRaw(cRaw).AddSensitive('--password', 'secret');
+  Assert.AreEqual(3, cmd.Count);
+  Assert.AreEqual(cRaw, cmd.Arguments[1].ToString);
+  Assert.AreEqual(cRaw, cmd.Arguments[1].ToLogString);
+  Assert.IsTrue(cmd.Arguments[1].UnsafeBatchRaw);
+  Assert.IsFalse(cmd.Arguments[0].UnsafeBatchRaw);
+  Assert.IsFalse(cmd.Arguments[2].UnsafeBatchRaw);
+  Assert.AreEqual('-v ' + cRaw + ' --password "secret"', cmd.ToString);
+
+  copy := cmd.Clone;
+  Assert.IsTrue(copy.Arguments[1].UnsafeBatchRaw, 'a clone stays raw');
+  Assert.AreEqual(cRaw, copy.Arguments[1].ToString);
+  Assert.IsFalse(copy.Arguments[0].UnsafeBatchRaw);
 end;
 
 procedure TCommandLineTests.Add_NameOnly_AppearsInToString;

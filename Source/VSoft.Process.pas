@@ -106,6 +106,7 @@ type
     procedure SetQuoted(const avalue : TQuoted);
     function GetQuoteName : boolean;
     procedure SetQuoteName(const value : boolean);
+    function GetUnsafeBatchRaw : boolean;
 
     function ToString : string;
     function ToLogString : string;
@@ -120,6 +121,8 @@ type
     property NameValueSeparator : string read GetNameSep write SetNameSep;
     //determines if the parameter name should be quoted or not.
     property QuoteName : boolean read GetQuoteName write SetQuoteName;
+    //True for an argument added with ICommandLineBuilder.AddUnsafeBatchRaw.
+    property UnsafeBatchRaw : boolean read GetUnsafeBatchRaw;
   end;
   {$M-}
 
@@ -155,6 +158,20 @@ type
     function AddSensitive(const name : string; //the argument name
                          const Quoted : TQuoted = TQuoted.qtDouble //quoting on the argument, doublequotes by default
                          ) : ICommandLineBuilder;overload;
+
+    //UNSAFE WITH UNTRUSTED INPUT. Adds text exactly as given, for a .bat /
+    //.cmd executable as well: this argument (only this one) is not checked
+    //for % ! " CR LF and is not quoted for cmd.exe, so cmd.exe expands
+    //%VAR% in it, and quotes, & | < > ^ ( ) in it are cmd syntax. It exists
+    //for a caller passing its own trusted script its own trusted parameters
+    //as one string (with their own quotes and %VAR%), as
+    //CreateProcess(nil, '"x.bat" ' + parameters) would. Text from anyone
+    //else can run arbitrary commands through cmd.exe (the "BatBadBut" class
+    //of problem, CVE-2024-24576), which the default batch-file rules
+    //prevent. The batch-file path itself is still checked, and so are all
+    //the other arguments. For an .exe (or on POSIX, one argv slot) it is
+    //the same as Add(text, TQuoted.qtNone).
+    function AddUnsafeBatchRaw(const text : string) : ICommandLineBuilder;
 
     //removes an argument from the command line
     function Remove(const arg : IArgument) : ICommandLineBuilder;overload;

@@ -688,7 +688,13 @@ begin
       begin
         if i > 0 then
           tail := tail + CommandLine.DefaultArgumentSeparator;
-        tail := tail + RenderBatchArgument(CommandLine.Arguments[i]);
+        // The caller's own trusted text, as CreateProcess(nil, '"x.bat" ' +
+        // text) would pass it: the outer quotes added below make cmd.exe
+        // receive the same /c line.
+        if CommandLine.Arguments[i].UnsafeBatchRaw then
+          tail := tail + CommandLine.Arguments[i].ToString
+        else
+          tail := tail + RenderBatchArgument(CommandLine.Arguments[i]);
       end;
       result := result + ' ' + tail;
     end;
@@ -841,6 +847,9 @@ begin
     for i := 0 to CommandLine.Count - 1 do
     begin
       arg := CommandLine.Arguments[i];
+      // AddUnsafeBatchRaw: the caller vouches for this one (and only this one).
+      if arg.UnsafeBatchRaw then
+        Continue;
       if TStringUtils.ContainsCmdUnsafeChars(TStringUtils.StripQuotes(arg.Name)) or
          TStringUtils.ContainsCmdUnsafeChars(TStringUtils.StripQuotes(arg.Value)) or
          TStringUtils.ContainsCmdUnsafeChars(arg.NameValueSeparator) then

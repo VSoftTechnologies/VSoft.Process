@@ -56,6 +56,7 @@ type
     procedure SetValue(const avalue: String);
     function GetQuoteName : boolean;
     procedure SetQuoteName(const Value : boolean);
+    function GetUnsafeBatchRaw : boolean; virtual;
 
     function ToLogString: string; virtual; // Overriden to hide passwords from the log
 
@@ -80,6 +81,15 @@ type
     function Clone : IArgument; override;
   public
     function ToString : string; override;
+  end;
+
+  // Text passed exactly as given (ICommandLineBuilder.AddUnsafeBatchRaw).
+  TUnsafeBatchRawArgument = class(TArgument)
+  protected
+    function GetUnsafeBatchRaw : boolean; override;
+    function Clone : IArgument; override;
+  public
+    constructor Create(const text : string);
   end;
 
   TArgumentsBuilder = class(TInterfacedObject, ICommandLineBuilder)
@@ -118,6 +128,8 @@ type
     function AddSensitive(const name : string; //the argument name
                          const Quoted : TQuoted = TQuoted.qtDouble //quoting on the argument, doublequotes by default
                          ) : ICommandLineBuilder;overload;
+
+    function AddUnsafeBatchRaw(const text : string) : ICommandLineBuilder;
 
     //removes an argument from the command line
     function Remove(const arg : IArgument) : ICommandLineBuilder;overload;
@@ -182,6 +194,11 @@ end;
 function TArgument.ToLogString: String;
 begin
   Result := ToString;
+end;
+
+function TArgument.GetUnsafeBatchRaw : boolean;
+begin
+  result := false;
 end;
 
 function EmptyArgument(quoted : TQuoted) : string;
@@ -353,6 +370,31 @@ begin
   result := Self;
   arg := CreateSensitiveArgument(name,'',Quoted);
   FArgs.Add(arg);
+end;
+
+{ TUnsafeBatchRawArgument }
+
+constructor TUnsafeBatchRawArgument.Create(const text : string);
+begin
+  inherited Create(text, '');
+  SetQuoted(TQuoted.qtNone);
+end;
+
+function TUnsafeBatchRawArgument.GetUnsafeBatchRaw : boolean;
+begin
+  result := true;
+end;
+
+function TUnsafeBatchRawArgument.Clone : IArgument;
+begin
+  // A clone must stay raw, or a cloned process would refuse (or re-quote) it.
+  result := TUnsafeBatchRawArgument.CreateClone(self);
+end;
+
+function TArgumentsBuilder.AddUnsafeBatchRaw(const text : string) : ICommandLineBuilder;
+begin
+  result := Self;
+  FArgs.Add(TUnsafeBatchRawArgument.Create(text));
 end;
 
 function TArgumentsBuilder.Clear : ICommandLineBuilder;
