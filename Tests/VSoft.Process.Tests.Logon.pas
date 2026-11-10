@@ -44,6 +44,11 @@ type
     // in LastError and Errors (with no %1 left in the message).
     [Test]
     procedure NetOnlyLogon_LaunchFails_ReportsTheOsError;
+
+    // StartInfo.InheritHostStdHandles with credentials: the copy of our
+    // stderr reaches the logon child (the service duplicates it in).
+    [Test]
+    procedure NetOnlyLogon_InheritHostStdHandles_StdErrGoesToHostStdErr;
   end;
 {$ENDIF}
 
@@ -321,6 +326,47 @@ begin
     proc := nil;
     if FileExists(exeName) then
       DeleteFile(exeName);
+  end;
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_InheritHostStdHandles_StdErrGoesToHostStdErr;
+var
+  fileName : string;
+  fileHandle : THandle;
+  oldStdErr : THandle;
+  proc : IProcess;
+  output : TStringBuilder;
+  launched : boolean;
+begin
+  fileName := TTestHelpers.TempFileName('vsoft_proc_logonerr_', '.txt');
+  fileHandle := CreateFile(PChar(fileName), GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  Win32Check(fileHandle <> INVALID_HANDLE_VALUE);
+  output := TStringBuilder.Create;
+  try
+    // Only stderr is swapped: the test logger writes to stdout.
+    oldStdErr := GetStdHandle(STD_ERROR_HANDLE);
+    SetStdHandle(STD_ERROR_HANDLE, fileHandle);
+    try
+      proc := TProcess.Create;
+      proc.StartInfo.InheritHostStdHandles := True;
+      proc.StartInfo.TimeoutInMSec := 30000;
+      TTestHelpers.SetupShellCommand(proc, 'print-stderr', []);
+      SetNetOnlyCredentials(proc);
+      proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+      launched := proc.Execute;
+    finally
+      SetStdHandle(STD_ERROR_HANDLE, oldStdErr);
+      CloseHandle(fileHandle);
+    end;
+    IgnoreWhenNoSecondaryLogon(proc);
+    Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
+    Assert.Contains(output.ToString, 'this-is-stdout', proc.Errors.Text);
+    Assert.Contains(TEncoding.ANSI.GetString(TTestHelpers.ReadFileBytes(fileName)), 'this-is-stderr', proc.Errors.Text);
+  finally
+    proc := nil;
+    output.Free;
+    if FileExists(fileName) then
+      DeleteFile(fileName);
   end;
 end;
 

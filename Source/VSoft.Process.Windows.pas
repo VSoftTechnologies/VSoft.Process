@@ -871,7 +871,7 @@ var
   redirectOut : boolean;
   redirectErr : boolean;
   redirectIn : boolean;
-  anyRedirect : boolean;
+  useStdHandles : boolean;
   outRead : THandle;
   errRead : THandle;
   childOut : THandle;
@@ -917,6 +917,35 @@ var
       result := nulHandle;
   end;
 
+  // A non-inheritable copy of this process's std handle for the child, or
+  // 0 (the child gets NUL) when there is none or it can't be given.
+  function HostStdHandle(stdHandle : DWORD; const streamName : string) : THandle;
+  var
+    host : THandle;
+    dupError : DWORD;
+  begin
+    result := 0;
+    host := GetStdHandle(stdHandle);
+    // No such handle (a GUI host): NUL, as without the option.
+    if (host = 0) or (host = INVALID_HANDLE_VALUE) then
+      Exit;
+    // Before Windows 8 a console handle is a pseudo-handle (the low two bits
+    // set), which the handle list and the Secondary Logon service reject.
+    if (host and 3) = 3 then
+    begin
+      LogError('The host''s ' + streamName + ' is a console pseudo-handle (Windows 7 or earlier), which can''t be given ' +
+               'to the child; its ' + streamName + ' is NUL instead');
+      Exit;
+    end;
+    if not DuplicateHandle(GetCurrentProcess, host, GetCurrentProcess, @result, 0, False, DUPLICATE_SAME_ACCESS) then
+    begin
+      dupError := Winapi.Windows.GetLastError;
+      result := 0;
+      LogError('Could not duplicate the host''s ' + streamName + ' handle (' + SysErrorMessage(dupError) + '); the child''s ' +
+               streamName + ' is NUL instead');
+    end;
+  end;
+
 begin
   result := false;
   created := false;
@@ -938,7 +967,6 @@ begin
   redirectOut := ShouldRedirectStdOut;
   redirectErr := ShouldRedirectStdErr;
   redirectIn  := ShouldRedirectStdIn;
-  anyRedirect := redirectOut or redirectErr or redirectIn;
 
   try
     if redirectOut then
@@ -947,9 +975,24 @@ begin
       CreateOutputPipe(errRead, childErr);
     if redirectIn then
       CreateInputPipe(childIn, FStdInWriteHandle);
-    // Streams that are not redirected get NUL rather than an invalid handle
+    // InheritHostStdHandles: a stream that is not redirected gets a copy of
+    // our own std handle. Like the pipe ends it is created non-inheritable,
+    // made inheritable only under GSpawnLock and closed after the spawn.
+    if StartInfo.InheritHostStdHandles then
+    begin
+      if not redirectIn then
+        childIn := HostStdHandle(STD_INPUT_HANDLE, 'stdin');
+      if not redirectOut then
+        childOut := HostStdHandle(STD_OUTPUT_HANDLE, 'stdout');
+      if not redirectErr then
+        childErr := HostStdHandle(STD_ERROR_HANDLE, 'stderr');
+    end;
+    // With no handle to give at all, STARTF_USESTDHANDLES is not set and the
+    // child uses its own console.
+    useStdHandles := (childIn <> 0) or (childOut <> 0) or (childErr <> 0);
+    // The other streams get NUL rather than an invalid handle
     // (INVALID_HANDLE_VALUE is the current-process pseudo handle).
-    if anyRedirect and not (redirectOut and redirectErr and redirectIn) then
+    if useStdHandles and ((childIn = 0) or (childOut = 0) or (childErr = 0)) then
       nulHandle := OpenNulDevice;
 
     ZeroMemory(@startupInfoEx, SizeOf(startupInfoEx));
@@ -959,7 +1002,7 @@ begin
       startupInfoEx.StartupInfo.wShowWindow := SW_HIDE
     else
       startupInfoEx.StartupInfo.wShowWindow := SW_SHOWNORMAL;
-    if anyRedirect then
+    if useStdHandles then
     begin
       startupInfoEx.StartupInfo.dwFlags := startupInfoEx.StartupInfo.dwFlags or STARTF_USESTDHANDLES;
       startupInfoEx.StartupInfo.hStdInput := ChildHandle(childIn);
@@ -1010,7 +1053,7 @@ begin
       GSpawnLock.Enter;
       try
         inheritCount := 0;
-        if anyRedirect then
+        if useStdHandles then
         begin
           AddInheritable(startupInfoEx.StartupInfo.hStdInput);
           AddInheritable(startupInfoEx.StartupInfo.hStdOutput);
@@ -1173,6 +1216,11 @@ begin
       SafeCloseHandle(FStdInWriteHandle);
       SafeCloseHandle(outRead);
       SafeCloseHandle(errRead);
+      // The child's ends, when something raised before the spawn closed them.
+      SafeCloseHandle(childOut);
+      SafeCloseHandle(childErr);
+      SafeCloseHandle(childIn);
+      SafeCloseHandle(nulHandle);
       SafeCloseHandle(FProcessInfo.hThread);
       SafeCloseHandle(FProcessInfo.hProcess);
       CloseJobObject;

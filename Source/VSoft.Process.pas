@@ -280,6 +280,8 @@ type
     procedure SetTerminateOnTimeout(value : boolean);
     function GetDetachedNewConsole : boolean;
     procedure SetDetachedNewConsole(value : boolean);
+    function GetInheritHostStdHandles : boolean;
+    procedure SetInheritHostStdHandles(value : boolean);
 
     function GetInputEncoding: TEncoding;
     procedure SetInputEncoding(const value: TEncoding);
@@ -306,6 +308,7 @@ type
     function WithJobMode(value : TProcessJobMode) : IStartInfoBuilder;
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
     function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
+    function WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
 
     //non fluent config
     // On Windows a .bat / .cmd executable is run by cmd.exe, which re-parses
@@ -384,6 +387,18 @@ type
     // Ignored by Execute / ExecuteAsync and with credentials (a new console
     // either way), and on POSIX.
     property DetachedNewConsole : boolean read GetDetachedNewConsole write SetDetachedNewConsole;
+    // Windows: a stream (stdin, stdout, stderr) that is not redirected gets
+    // a copy of this process's own std handle (GetStdHandle), so a child's
+    // unredirected stderr, say, goes where this process's stderr goes (the
+    // console, a file, a CI agent's log). Default False: such a stream gets
+    // NUL when another stream is redirected, and the child's own console
+    // otherwise. When this process has no such handle (a GUI program) the
+    // stream gets NUL, as without the option; when the handle can't be
+    // given to the child (it can't be duplicated, or is a Windows 7 console
+    // pseudo-handle) it gets NUL and Errors says why. Applies to launches
+    // with credentials too. Ignored by ExecuteDetached and on POSIX, where
+    // a stream that is not redirected is always inherited.
+    property InheritHostStdHandles : boolean read GetInheritHostStdHandles write SetInheritHostStdHandles;
   end;
 {$ENDREGION}
 

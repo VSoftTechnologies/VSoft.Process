@@ -195,6 +195,18 @@ type
     [Test]
     procedure LaunchFails_ErrorNamesTheProgramNotItsArguments;
 
+    // StartInfo.InheritHostStdHandles: a stream that is not redirected gets
+    // this process's own std handle (here a temp file set with SetStdHandle);
+    // by default it gets NUL.
+    [Test]
+    procedure InheritHostStdHandles_StdErrGoesToHostStdErr;
+    [Test]
+    procedure Default_UnredirectedStdErrIsNul;
+    [Test]
+    procedure InheritHostStdHandles_StdInComesFromHostStdIn;
+    [Test]
+    procedure Default_UnredirectedStdInIsNul;
+
     // ExecuteDetached gives the child no console by default; with
     // StartInfo.DetachedNewConsole it gets one of its own (hidden here).
     [Test]
@@ -2091,6 +2103,117 @@ begin
     if FileExists(exeName) then
       DeleteFile(exeName);
   end;
+end;
+
+// Runs print-stderr with only stdout redirected while this process's
+// STD_ERROR_HANDLE is a temp file (stdout is left alone: the test logger
+// writes to it), and returns what reached the file.
+function RunWithHostStdErrInFile(inheritHost : boolean; out stdOutText : string) : string;
+var
+  fileName : string;
+  fileHandle : THandle;
+  oldStdErr : THandle;
+  proc : IProcess;
+  output : TStringBuilder;
+begin
+  fileName := TTestHelpers.TempFileName('vsoft_proc_hosterr_', '.txt');
+  fileHandle := CreateFile(PChar(fileName), GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  Win32Check(fileHandle <> INVALID_HANDLE_VALUE);
+  output := TStringBuilder.Create;
+  try
+    oldStdErr := GetStdHandle(STD_ERROR_HANDLE);
+    SetStdHandle(STD_ERROR_HANDLE, fileHandle);
+    try
+      proc := TProcess.Create;
+      proc.StartInfo.InheritHostStdHandles := inheritHost;
+      TTestHelpers.SetupShellCommand(proc, 'print-stderr', []);
+      proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+      Assert.IsTrue(proc.Execute, proc.Errors.Text);
+      Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+      Assert.AreEqual('', Trim(proc.Errors.Text), 'no errors expected');
+    finally
+      SetStdHandle(STD_ERROR_HANDLE, oldStdErr);
+      CloseHandle(fileHandle);
+    end;
+    stdOutText := output.ToString;
+    result := TEncoding.ANSI.GetString(TTestHelpers.ReadFileBytes(fileName));
+  finally
+    output.Free;
+    if FileExists(fileName) then
+      DeleteFile(fileName);
+  end;
+end;
+
+// Runs echo-stdin with only stdout redirected while this process's
+// STD_INPUT_HANDLE is a temp file holding a line, and returns what the child
+// echoed.
+function RunWithHostStdInFromFile(inheritHost : boolean) : string;
+var
+  fileName : string;
+  fileHandle : THandle;
+  oldStdIn : THandle;
+  proc : IProcess;
+  output : TStringBuilder;
+  lines : TStringList;
+begin
+  fileName := TTestHelpers.TempFileName('vsoft_proc_hostin_', '.txt');
+  lines := TStringList.Create;
+  try
+    lines.Add('line-from-host-stdin');
+    lines.SaveToFile(fileName);
+  finally
+    lines.Free;
+  end;
+  output := TStringBuilder.Create;
+  try
+    fileHandle := CreateFile(PChar(fileName), GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    Win32Check(fileHandle <> INVALID_HANDLE_VALUE);
+    oldStdIn := GetStdHandle(STD_INPUT_HANDLE);
+    SetStdHandle(STD_INPUT_HANDLE, fileHandle);
+    try
+      proc := TProcess.Create;
+      proc.StartInfo.InheritHostStdHandles := inheritHost;
+      proc.StartInfo.TimeoutInMSec := 20000;
+      TTestHelpers.SetupShellCommand(proc, 'echo-stdin', []);
+      proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+      Assert.IsTrue(proc.Execute, proc.Errors.Text);
+      Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    finally
+      SetStdHandle(STD_INPUT_HANDLE, oldStdIn);
+      CloseHandle(fileHandle);
+    end;
+    result := output.ToString;
+  finally
+    output.Free;
+    if FileExists(fileName) then
+      DeleteFile(fileName);
+  end;
+end;
+
+procedure TProcessLifecycleTests.InheritHostStdHandles_StdErrGoesToHostStdErr;
+var
+  stdOutText : string;
+begin
+  Assert.Contains(RunWithHostStdErrInFile(true, stdOutText), 'this-is-stderr', 'the child''s stderr should reach the host''s stderr');
+  Assert.Contains(stdOutText, 'this-is-stdout', 'stdout is still redirected');
+end;
+
+procedure TProcessLifecycleTests.Default_UnredirectedStdErrIsNul;
+var
+  stdOutText : string;
+begin
+  Assert.AreEqual('', RunWithHostStdErrInFile(false, stdOutText), 'by default the child''s stderr is NUL');
+  Assert.Contains(stdOutText, 'this-is-stdout');
+end;
+
+procedure TProcessLifecycleTests.InheritHostStdHandles_StdInComesFromHostStdIn;
+begin
+  Assert.Contains(RunWithHostStdInFromFile(true), 'line-from-host-stdin', 'the child should read the host''s stdin');
+end;
+
+procedure TProcessLifecycleTests.Default_UnredirectedStdInIsNul;
+begin
+  Assert.AreEqual('', Trim(RunWithHostStdInFromFile(false)), 'by default the child''s stdin is NUL');
 end;
 
 // The text of a file another process may still be writing ('' until then).

@@ -40,6 +40,9 @@ type
     [Test]
     procedure DetachedNewConsole_DefaultsFluentAndClone;
 
+    [Test]
+    procedure InheritHostStdHandles_DefaultsFluentAndClone;
+
     // SetProcessAffinityMask takes a DWORD_PTR, so on Win64 a mask can name
     // CPUs 32-63. The property must not truncate it.
     [Test]
@@ -199,6 +202,21 @@ begin
   Assert.IsTrue(dst.DetachedNewConsole);
   src.DetachedNewConsole := false;
   Assert.IsTrue(dst.DetachedNewConsole, 'the clone is independent');
+end;
+
+procedure TStartInfoTests.InheritHostStdHandles_DefaultsFluentAndClone;
+var
+  src, dst, ret : IStartInfoBuilder;
+begin
+  src := MakeBuilder;
+  Assert.IsFalse(src.InheritHostStdHandles, 'off by default');
+  ret := src.WithInheritHostStdHandles(true);
+  Assert.AreSame(src, ret);
+  Assert.IsTrue(src.InheritHostStdHandles);
+  dst := src.Clone;
+  Assert.IsTrue(dst.InheritHostStdHandles);
+  src.InheritHostStdHandles := false;
+  Assert.IsTrue(dst.InheritHostStdHandles, 'the clone is independent');
 end;
 
 procedure TStartInfoTests.ProcessorAffinity_HoldsHighCpuBits;

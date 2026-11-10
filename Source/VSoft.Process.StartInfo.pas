@@ -53,6 +53,7 @@ type
     FJobMode : TProcessJobMode;
     FTerminateOnTimeout : boolean;
     FDetachedNewConsole : boolean;
+    FInheritHostStdHandles : boolean;
   protected
     function GetHideWindow : boolean;
     procedure SetHideWindow(value : boolean);
@@ -88,6 +89,8 @@ type
     procedure SetTerminateOnTimeout(value : boolean);
     function GetDetachedNewConsole : boolean;
     procedure SetDetachedNewConsole(value : boolean);
+    function GetInheritHostStdHandles : boolean;
+    procedure SetInheritHostStdHandles(value : boolean);
 
 
     function WithTimeout(timeoutMs : Cardinal) : IStartInfoBuilder;
@@ -107,6 +110,7 @@ type
     function WithJobMode(value : TProcessJobMode) : IStartInfoBuilder;
     function WithTerminateOnTimeout(value : boolean) : IStartInfoBuilder;
     function WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
+    function WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
 
 
     function Clone : IStartInfoBuilder;
@@ -140,6 +144,7 @@ begin
   FJobMode := TProcessJobMode.KillOnRelease;
   FTerminateOnTimeout := true;
   FDetachedNewConsole := false;
+  FInheritHostStdHandles := false;
 end;
 
 constructor TStartInfoBuilder.CreateClone(const source: TStartInfoBuilder);
@@ -162,6 +167,7 @@ begin
   FTerminateOnTimeout := source.FTerminateOnTimeout;
   FPipeDrainTimeoutMS := source.FPipeDrainTimeoutMS;
   FDetachedNewConsole := source.FDetachedNewConsole;
+  FInheritHostStdHandles := source.FInheritHostStdHandles;
 end;
 
 destructor TStartInfoBuilder.Destroy;
@@ -228,6 +234,11 @@ end;
 function TStartInfoBuilder.GetDetachedNewConsole : boolean;
 begin
   result := FDetachedNewConsole;
+end;
+
+function TStartInfoBuilder.GetInheritHostStdHandles : boolean;
+begin
+  result := FInheritHostStdHandles;
 end;
 
 function TStartInfoBuilder.GetTimedOutExitCode: Cardinal;
@@ -313,6 +324,11 @@ end;
 procedure TStartInfoBuilder.SetDetachedNewConsole(value : boolean);
 begin
   FDetachedNewConsole := value;
+end;
+
+procedure TStartInfoBuilder.SetInheritHostStdHandles(value : boolean);
+begin
+  FInheritHostStdHandles := value;
 end;
 
 procedure TStartInfoBuilder.SetTimedOutExitCode(value: Cardinal);
@@ -409,6 +425,12 @@ end;
 function TStartInfoBuilder.WithDetachedNewConsole(value : boolean) : IStartInfoBuilder;
 begin
   FDetachedNewConsole := value;
+  result := Self;
+end;
+
+function TStartInfoBuilder.WithInheritHostStdHandles(value : boolean) : IStartInfoBuilder;
+begin
+  FInheritHostStdHandles := value;
   result := Self;
 end;
 
