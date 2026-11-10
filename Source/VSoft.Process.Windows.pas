@@ -81,7 +81,11 @@ type
     PendingResult : ULONG;
   end;
 
-  TWindowsProcess = class(TProcessBase, IProcess)
+  // IProcess comes from TProcessBase. It is not listed again here: that would
+  // give the object a second IProcess, and the reference TProcess.Create
+  // returns would no longer equal the one handed to OnStarted / OnExit or
+  // returned by the fluent methods.
+  TWindowsProcess = class(TProcessBase)
   private
     FProcessInfo : TProcessInformation;
     FJobHandle : THandle;

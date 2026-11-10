@@ -53,6 +53,34 @@ type
     // TPipeSource.FileAsStdIn with credentials: the logon child reads the file.
     [Test]
     procedure NetOnlyLogon_FileAsStdIn_ChildReadsTheFile;
+
+    // CreateProcessWithLogonW is given the domain and the user name
+    // separately.
+    [Test]
+    procedure NetOnlyLogon_DomainAndUserName_Launches;
+
+    // No domain and no '@' in the name: the local account database ('.').
+    [Test]
+    procedure NetOnlyLogon_BareUserName_Launches;
+
+    // LoadUserProfile adds LOGON_WITH_PROFILE to the logon.
+    [Test]
+    procedure NetOnlyLogon_WithUserProfile_Launches;
+
+    // ExecuteDetached with credentials.
+    [Test]
+    procedure NetOnlyLogon_Detached_Launches;
+
+    // A console handle of the host cannot be given to a logon child, which
+    // never shares the host's console: the stream is NUL and Errors says why.
+    [Test]
+    procedure NetOnlyLogon_ShareHostConsole_StreamIsNulAndLogged;
+
+    // CreateProcessWithLogonW accepts a command line of 1024 characters.
+    [Test]
+    procedure Credentials_CommandLineAtLimit_IsAccepted;
+    [Test]
+    procedure Credentials_CommandLineOverLimit_IsRejected;
   end;
 {$ENDIF}
 
@@ -61,7 +89,8 @@ implementation
 {$IFDEF MSWINDOWS}
 uses
   VSoft.Process.Windows,
-  VSoft.Process.Tests.Common;
+  VSoft.Process.Tests.Common,
+  VSoft.Process.Tests.Helper;
 
 const
   cFakeUser = 'nobody@nowhere.example';
@@ -408,6 +437,163 @@ begin
     if FileExists(fileName) then
       DeleteFile(fileName);
   end;
+end;
+
+// Runs `echo logon-ran` through a net-only logon and checks that it ran.
+procedure CheckNetOnlyLaunch(const domain : string; const userName : string; loadProfile : boolean);
+var
+  proc : IProcess;
+  output : TStringBuilder;
+  launched : boolean;
+begin
+  output := TStringBuilder.Create;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.TimeoutInMSec := 30000;
+    TTestHelpers.SetupInlineCommand(proc, 'echo logon-ran', '');
+    proc.Credentials.Domain := domain;
+    proc.Credentials.UserName := userName;
+    proc.Credentials.Password := cFakePassword;
+    proc.Credentials.NetCredentialsOnly := True;
+    proc.Credentials.LoadUserProfile := loadProfile;
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    launched := proc.Execute;
+    IgnoreWhenNoSecondaryLogon(proc);
+    Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.Contains(output.ToString, 'logon-ran', proc.Errors.Text);
+  finally
+    proc := nil;
+    output.Free;
+  end;
+end;
+
+// A cmd.exe command line of exactly totalLength characters, as the library
+// builds it: "<cmd.exe>" /c rem aaaa...
+procedure SetupLogonCommandOfLength(const proc : IProcess; totalLength : integer);
+var
+  prefix : string;
+begin
+  prefix := '"' + ExpandFileName(TTestHelpers.ShellExePath) + '" /c rem ';
+  proc.StartInfo.Executable := TTestHelpers.ShellExePath;
+  proc.StartInfo.TimeoutInMSec := 30000;
+  proc.CommandLine.Add('/c');
+  proc.CommandLine.Add('rem ' + StringOfChar('a', totalLength - Length(prefix)), TQuoted.qtNone);
+  SetNetOnlyCredentials(proc);
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_DomainAndUserName_Launches;
+begin
+  CheckNetOnlyLaunch('NOWHERE', 'nobody', false);
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_BareUserName_Launches;
+begin
+  CheckNetOnlyLaunch('', 'nobody', false);
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_WithUserProfile_Launches;
+begin
+  CheckNetOnlyLaunch('', 'nobody', true);
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_Detached_Launches;
+var
+  proc : IProcess;
+  reportFile : string;
+  report : IChildReport;
+  launched : boolean;
+begin
+  reportFile := TTestHelpers.TempFileName('vsoft_proc_logon_info_', '.txt');
+  try
+    proc := TProcess.Create;
+    SetupChildInfo(proc, reportFile);
+    SetNetOnlyCredentials(proc);
+    launched := proc.ExecuteDetached;
+    IgnoreWhenNoSecondaryLogon(proc);
+    Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
+    Assert.AreNotEqual<Cardinal>(0, proc.ProcessId);
+    report := WaitForChildReport(reportFile, 20000);
+    Assert.IsTrue(report <> nil, 'the detached logon child never ran');
+    // The Secondary Logon service always gives the child a console.
+    Assert.AreEqual('yes', report.Value('CONSOLE'), report.Raw);
+  finally
+    proc := nil;
+    if FileExists(reportFile) then
+      DeleteFile(reportFile);
+  end;
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_ShareHostConsole_StreamIsNulAndLogged;
+var
+  allocated : boolean;
+  hostBuffer : THandle;
+  oldStdErr : THandle;
+  proc : IProcess;
+  output : TStringBuilder;
+  launched : boolean;
+  screen : string;
+begin
+  if not TTestHelpers.EnsureConsole(allocated) then
+    Assert.Pass('NOT RUN: this process has no console and could not allocate one');
+  hostBuffer := INVALID_HANDLE_VALUE;
+  output := TStringBuilder.Create;
+  try
+    hostBuffer := TTestHelpers.CreateScreenBuffer;
+    if hostBuffer = INVALID_HANDLE_VALUE then
+      Assert.Pass('NOT RUN: could not create a console screen buffer');
+    oldStdErr := GetStdHandle(STD_ERROR_HANDLE);
+    SetStdHandle(STD_ERROR_HANDLE, hostBuffer);
+    try
+      proc := TProcess.Create;
+      proc.StartInfo.InheritHostStdHandles := True;
+      proc.StartInfo.ShareHostConsole := True;
+      proc.StartInfo.TimeoutInMSec := 30000;
+      TTestHelpers.SetupInlineCommand(proc, 'echo VSP_STDOUT& echo VSP_MARKER 1>&2', '');
+      SetNetOnlyCredentials(proc);
+      proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+      launched := proc.Execute;
+    finally
+      SetStdHandle(STD_ERROR_HANDLE, oldStdErr);
+    end;
+    IgnoreWhenNoSecondaryLogon(proc);
+    Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
+    Assert.Contains(output.ToString, 'VSP_STDOUT', 'stdout is still redirected');
+    Assert.Contains(proc.Errors.Text, 'The host''s stderr is a console, which a child started with credentials can''t use');
+    screen := TTestHelpers.ReadScreenStart(hostBuffer);
+    Assert.IsTrue(Pos('VSP_MARKER', screen) = 0, 'the logon child wrote to the host''s console: "' + Trim(screen) + '"');
+  finally
+    proc := nil;
+    output.Free;
+    if hostBuffer <> INVALID_HANDLE_VALUE then
+      CloseHandle(hostBuffer);
+    if allocated then
+      FreeConsole;
+  end;
+end;
+
+procedure TProcessLogonTests.Credentials_CommandLineAtLimit_IsAccepted;
+var
+  proc : IProcess;
+  launched : boolean;
+begin
+  proc := TProcess.Create;
+  SetupLogonCommandOfLength(proc, 1024);
+  launched := proc.Execute;
+  IgnoreWhenNoSecondaryLogon(proc);
+  Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
+  Assert.AreEqual<Cardinal>(0, proc.ExitCode, proc.Errors.Text);
+end;
+
+procedure TProcessLogonTests.Credentials_CommandLineOverLimit_IsRejected;
+var
+  proc : IProcess;
+begin
+  proc := TProcess.Create;
+  SetupLogonCommandOfLength(proc, 1025);
+  Assert.IsFalse(proc.Execute, 'CreateProcessWithLogonW allows 1024 characters');
+  Assert.Contains(proc.Errors.Text, 'too long to run with credentials');
+  Assert.AreEqual<Cardinal>(0, proc.LastError, 'refused at validation, before any logon');
 end;
 
 initialization

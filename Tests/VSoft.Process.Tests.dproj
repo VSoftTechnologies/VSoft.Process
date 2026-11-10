@@ -240,6 +240,10 @@
         <DCCReference Include="VSoft.Process.Tests.Review.Core.pas"/>
         <DCCReference Include="VSoft.Process.Tests.Review.Pipes.pas"/>
         <DCCReference Include="VSoft.Process.Tests.Review.Support.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.WinLaunch.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.WinBatch.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.StdIn.pas"/>
+        <DCCReference Include="VSoft.Process.Tests.RunApi.pas"/>
         <DCCReference Include="..\Source\VSoft.Process.WinAPI.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>

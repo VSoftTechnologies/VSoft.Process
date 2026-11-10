@@ -36,6 +36,7 @@ type
     class procedure UnsetEnvVar(const name : string); static;
     class function ReadFileBytes(const fileName : string) : TBytes; static;
     class function CountByte(const bytes : TBytes; value : Byte) : integer; static;
+    class function SameBytes(const left : TBytes; const right : TBytes) : boolean; static;
     class function CountChar(const value : string; ch : Char) : integer; static;
     // The value of the first line starting with prefix (the rest of the
     // line), or '' when there is none.
@@ -79,6 +80,17 @@ type
     // code page: chcp does not change the code page used by an echo later
     // on the same cmd /c line.
     class function SetupPrintUtf8(const proc : IProcess; const text : string) : string; static;
+    // True when this process has a console.
+    class function HasConsole : boolean; static;
+    // Gives this process a (hidden) console when it has none. allocated is
+    // set when the caller has to FreeConsole afterwards.
+    class function EnsureConsole(out allocated : boolean) : boolean; static;
+    // A screen buffer of this process's console that is not the one on show:
+    // a console handle like CONOUT$, but what is written to it can be read
+    // back and never appears in the runner's own output.
+    class function CreateScreenBuffer : THandle; static;
+    // The first 2000 characters of a screen buffer.
+    class function ReadScreenStart(buffer : THandle) : string; static;
     {$ENDIF}
   end;
 
@@ -99,6 +111,7 @@ uses
 
 {$IFDEF MSWINDOWS}
 function GetProcessHandleCount(hProcess : THandle; var pdwHandleCount : DWORD) : BOOL; stdcall; external kernel32 name 'GetProcessHandleCount';
+function TestGetConsoleWindow : HWND; stdcall; external kernel32 name 'GetConsoleWindow';
 
 const
   cProcessQueryLimitedInformation = $1000;
@@ -253,6 +266,12 @@ begin
   for i := 0 to High(bytes) do
     if bytes[i] = value then
       Inc(result);
+end;
+
+class function TTestHelpers.SameBytes(const left : TBytes; const right : TBytes) : boolean;
+begin
+  result := (Length(left) = Length(right)) and
+            ((Length(left) = 0) or CompareMem(@left[0], @right[0], Length(left)));
 end;
 
 class function TTestHelpers.CountChar(const value : string; ch : Char) : integer;
@@ -530,6 +549,63 @@ begin
     fs.Free;
   end;
   SetupShellCommand(proc, 'print-file', [result]);
+end;
+
+class function TTestHelpers.HasConsole : boolean;
+var
+  console : THandle;
+begin
+  console := CreateFile('CONOUT$', GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
+  result := console <> INVALID_HANDLE_VALUE;
+  if result then
+    CloseHandle(console);
+end;
+
+class function TTestHelpers.EnsureConsole(out allocated : boolean) : boolean;
+var
+  savedIn : THandle;
+  savedOut : THandle;
+  savedErr : THandle;
+  window : HWND;
+begin
+  allocated := False;
+  if HasConsole then
+    Exit(True);
+  savedIn := GetStdHandle(STD_INPUT_HANDLE);
+  savedOut := GetStdHandle(STD_OUTPUT_HANDLE);
+  savedErr := GetStdHandle(STD_ERROR_HANDLE);
+  if AllocConsole then
+  begin
+    allocated := True;
+    window := TestGetConsoleWindow;
+    if window <> 0 then
+      ShowWindow(window, SW_HIDE);
+    // AllocConsole may replace the std handles the runner was started with.
+    SetStdHandle(STD_INPUT_HANDLE, savedIn);
+    SetStdHandle(STD_OUTPUT_HANDLE, savedOut);
+    SetStdHandle(STD_ERROR_HANDLE, savedErr);
+  end;
+  result := HasConsole;
+end;
+
+class function TTestHelpers.CreateScreenBuffer : THandle;
+begin
+  result := CreateConsoleScreenBuffer(GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
+                                      CONSOLE_TEXTMODE_BUFFER, nil);
+end;
+
+class function TTestHelpers.ReadScreenStart(buffer : THandle) : string;
+var
+  chars : array[0..1999] of WideChar;
+  got : DWORD;
+  origin : TCoord;
+begin
+  result := '';
+  origin.X := 0;
+  origin.Y := 0;
+  got := 0;
+  if ReadConsoleOutputCharacterW(buffer, @chars[0], Length(chars), origin, got) then
+    SetString(result, PWideChar(@chars[0]), got);
 end;
 {$ENDIF}
 

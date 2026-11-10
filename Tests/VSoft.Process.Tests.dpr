@@ -47,6 +47,10 @@ uses
   VSoft.Process.Tests.Review.Core in 'VSoft.Process.Tests.Review.Core.pas',
   VSoft.Process.Tests.Review.Pipes in 'VSoft.Process.Tests.Review.Pipes.pas',
   VSoft.Process.Tests.Review.Support in 'VSoft.Process.Tests.Review.Support.pas',
+  VSoft.Process.Tests.WinLaunch in 'VSoft.Process.Tests.WinLaunch.pas',
+  VSoft.Process.Tests.WinBatch in 'VSoft.Process.Tests.WinBatch.pas',
+  VSoft.Process.Tests.StdIn in 'VSoft.Process.Tests.StdIn.pas',
+  VSoft.Process.Tests.RunApi in 'VSoft.Process.Tests.RunApi.pas',
   VSoft.Process.WinAPI in '..\Source\VSoft.Process.WinAPI.pas';
 
 {$R *.RES}

@@ -87,8 +87,6 @@ const
   cDelivered = 'delivered';
   cIgnored = 'ignored';
 
-function ReviewGetConsoleWindow : HWND; stdcall; external kernel32 name 'GetConsoleWindow';
-
 type
   // Sleeps in every HandleData call.
   TReviewSlowTarget = class(TInterfacedObject, IPipeTarget)
@@ -334,68 +332,6 @@ end;
 
 { WIN-1 support }
 
-function HasConsole : boolean;
-var
-  console : THandle;
-begin
-  console := CreateFile('CONOUT$', GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
-  result := console <> INVALID_HANDLE_VALUE;
-  if result then
-    CloseHandle(console);
-end;
-
-// Gives this process a (hidden) console when it has none. allocated is set
-// when the caller has to FreeConsole afterwards.
-function EnsureConsole(out allocated : boolean) : boolean;
-var
-  savedIn : THandle;
-  savedOut : THandle;
-  savedErr : THandle;
-  window : HWND;
-begin
-  allocated := False;
-  if HasConsole then
-    Exit(True);
-  savedIn := GetStdHandle(STD_INPUT_HANDLE);
-  savedOut := GetStdHandle(STD_OUTPUT_HANDLE);
-  savedErr := GetStdHandle(STD_ERROR_HANDLE);
-  if AllocConsole then
-  begin
-    allocated := True;
-    window := ReviewGetConsoleWindow;
-    if window <> 0 then
-      ShowWindow(window, SW_HIDE);
-    // AllocConsole may replace the std handles the runner was started with.
-    SetStdHandle(STD_INPUT_HANDLE, savedIn);
-    SetStdHandle(STD_OUTPUT_HANDLE, savedOut);
-    SetStdHandle(STD_ERROR_HANDLE, savedErr);
-  end;
-  result := HasConsole;
-end;
-
-// A screen buffer of this process's console that is not the one on show: a
-// console handle like CONOUT$, but what is written to it can be read back
-// and never appears in the runner's own output.
-function CreateScreenBuffer : THandle;
-begin
-  result := CreateConsoleScreenBuffer(GENERIC_READ or GENERIC_WRITE, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
-                                      CONSOLE_TEXTMODE_BUFFER, nil);
-end;
-
-function ReadScreenStart(buffer : THandle) : string;
-var
-  chars : array[0..1999] of WideChar;
-  got : DWORD;
-  origin : TCoord;
-begin
-  result := '';
-  origin.X := 0;
-  origin.Y := 0;
-  got := 0;
-  if ReadConsoleOutputCharacterW(buffer, @chars[0], Length(chars), origin, got) then
-    SetString(result, PWideChar(@chars[0]), got);
-end;
-
 // Runs `cmd /c <command>` attached to this process's console (no creation
 // flags) with stdErr as its stderr. False when it could not be run.
 function RunCmdSharingConsole(const command : string; stdErr : THandle) : boolean;
@@ -597,20 +533,20 @@ var
   screen : string;
   executed : boolean;
 begin
-  if not EnsureConsole(allocated) then
+  if not TTestHelpers.EnsureConsole(allocated) then
     Assert.Pass('NOT RUN: this process has no console and could not allocate one');
   controlBuffer := INVALID_HANDLE_VALUE;
   hostBuffer := INVALID_HANDLE_VALUE;
   output := TStringBuilder.Create;
   try
-    controlBuffer := CreateScreenBuffer;
-    hostBuffer := CreateScreenBuffer;
+    controlBuffer := TTestHelpers.CreateScreenBuffer;
+    hostBuffer := TTestHelpers.CreateScreenBuffer;
     if (controlBuffer = INVALID_HANDLE_VALUE) or (hostBuffer = INVALID_HANDLE_VALUE) then
       Assert.Pass('NOT RUN: could not create a console screen buffer');
 
     // The same handle works for a child that shares this console; when it
     // does not, this machine cannot show the fault either way.
-    if (not RunCmdSharingConsole('echo VSP_CONTROL 1>&2', controlBuffer)) or (Pos('VSP_CONTROL', ReadScreenStart(controlBuffer)) = 0) then
+    if (not RunCmdSharingConsole('echo VSP_CONTROL 1>&2', controlBuffer)) or (Pos('VSP_CONTROL', TTestHelpers.ReadScreenStart(controlBuffer)) = 0) then
       Assert.Pass('NOT RUN: a child sharing this console could not write to the console handle either');
 
     oldStdErr := GetStdHandle(STD_ERROR_HANDLE);
@@ -629,7 +565,7 @@ begin
     Assert.IsTrue(executed, proc.Errors.Text);
     Assert.IsTrue(proc.Status = TProcessStatus.Exited, 'status ' + StatusName(proc.Status) + ' ' + proc.Errors.Text);
     Assert.Contains(output.ToString, 'VSP_STDOUT', 'stdout is still redirected');
-    screen := Trim(ReadScreenStart(hostBuffer));
+    screen := Trim(TTestHelpers.ReadScreenStart(hostBuffer));
     if shareHostConsole then
       Assert.IsTrue(Pos('VSP_MARKER', screen) > 0,
                     'the child''s stderr did not reach the host''s console: the console shows "' + screen + '", child exit code ' +
