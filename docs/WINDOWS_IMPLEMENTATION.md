@@ -14,7 +14,7 @@ Because `Status` is published last, a caller that polls `Status` sees complete o
 
 All `HandleData` calls go through `TProcessBase.ProcessStdOut` / `ProcessStdErr`, which serialise them on `FDeliveryLock`. Each call is wrapped in try/except: a target that raises is logged and skipped from then on, but the pipe keeps being read so the child never blocks on a full pipe.
 
-`Terminate` returns False straight away when no run is in progress (including from `OnExit`, which fires after the run has completed) or the run is detached. Otherwise it sets `FTerminateEvent` and waits up to 5 s for `FCompletionEvent`, returning whether the run completed in time. It doesn't wait, and returns True, when it would be waiting on itself: from the worker thread (`FWorkerThreadId`), from inside a pipe target (`FDeliveringThreadId`, set under `FDeliveryLock`), from the stdin writer (`FStdInWriterThreadId`, set before that thread starts), or before the async worker exists (`OnStarted`).
+`Terminate` returns False straight away when no run is in progress (including from `OnExit`, which fires after the run has completed) or the run is detached. Otherwise it sets `FTerminateEvent` and waits up to 5 s (`Terminate(waitMS)`: up to `waitMS`) for `FCompletionEvent`, returning whether the run completed in time. It doesn't wait, and returns True, for `Terminate(0)`, and when it would be waiting on itself: from the worker thread (`FWorkerThreadId`), from inside a pipe target (`FDeliveringThreadId`, set under `FDeliveryLock`), from the stdin writer (`FStdInWriterThreadId`, set before that thread starts), or before the async worker exists (`OnStarted`).
 
 ## Process creation
 

@@ -121,6 +121,12 @@ type
     [Test]
     procedure SyncExecute_CancelledFromAnotherThread;
 
+    // Terminate(0) from another thread only requests termination: it returns
+    // at once, however long the run then takes to complete, and the run
+    // still ends Terminated with TerminateExitCode.
+    [Test]
+    procedure TerminateNoWait_ReturnsAtOnce_RunEndsTerminated;
+
     // H13 - a long UTF-8 line read through a 4 KB buffer arrives intact.
     [Test]
     procedure Utf8LongLine_StringBuilderTarget_SmallBuffer_Intact;
@@ -401,6 +407,15 @@ type
     procedure Done;
   end;
 
+  // Done takes DelayMs, so a run using it is slow to complete.
+  TSlowDoneTarget = class(TInterfacedObject, IPipeTarget)
+  public
+    DelayMs : Cardinal;
+    procedure Start;
+    procedure HandleData(const data : TBytes; dataLength : NativeUInt);
+    procedure Done;
+  end;
+
   TEventProbe = class
   public
     StartedCount : integer;
@@ -634,6 +649,21 @@ end;
 procedure TSlowTarget.Done;
 begin
   Inc(DoneCount);
+end;
+
+{ TSlowDoneTarget }
+
+procedure TSlowDoneTarget.Start;
+begin
+end;
+
+procedure TSlowDoneTarget.HandleData(const data : TBytes; dataLength : NativeUInt);
+begin
+end;
+
+procedure TSlowDoneTarget.Done;
+begin
+  Sleep(DelayMs);
 end;
 
 { TEventProbe }
@@ -1542,6 +1572,37 @@ begin
   Assert.IsTrue(elapsed < 5000, 'Cancellation took ' + IntToStr(elapsed) + 'ms');
   Assert.AreEqual(TProcessStatus.Terminated, proc.Status);
   Assert.AreEqual<Cardinal>(777, proc.ExitCode);
+end;
+
+procedure TProcessLifecycleTests.TerminateNoWait_ReturnsAtOnce_RunEndsTerminated;
+var
+  proc : IProcess;
+  target : TSlowDoneTarget;
+  started : Int64;
+  elapsed : Int64;
+begin
+  proc := TProcess.Create;
+  proc.StartInfo.TimeoutInMSec := 60000;
+  proc.StartInfo.TerminateExitCode := 4242;
+  TTestHelpers.SetupShellCommand(proc, 'sleep', ['30']);
+  // The run takes a second to complete after the kill, so a Terminate that
+  // waited for it could not return in time.
+  target := TSlowDoneTarget.Create;
+  target.DelayMs := 1000;
+  proc.WithStdOutPipe(target);
+  Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+  Sleep(200);
+  Assert.AreEqual(TProcessStatus.Running, proc.Status, 'the child should still be running');
+
+  started := TTestHelpers.TickMs;
+  Assert.IsTrue(proc.Terminate(0), 'Terminate(0) with a run in progress');
+  elapsed := TTestHelpers.TickMs - started;
+  Assert.IsTrue(elapsed < 200, 'Terminate(0) took ' + IntToStr(elapsed) + 'ms');
+
+  Assert.IsTrue(TTestHelpers.WaitWhileRunning(proc, 15000), 'the run did not complete');
+  Assert.AreEqual(TProcessStatus.Terminated, proc.Status);
+  Assert.AreEqual<Cardinal>(4242, proc.ExitCode);
+  Assert.IsFalse(proc.Terminate(0), 'no run in progress any more');
 end;
 
 procedure TProcessLifecycleTests.Utf8LongLine_StringBuilderTarget_SmallBuffer_Intact;

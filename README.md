@@ -187,7 +187,7 @@ For the worker-thread cases, the implementation captures a live `IProcess` refer
 - **Descendants holding the pipes**: after the child exits (or is killed) the library keeps reading for at most `StartInfo.PipeDrainTimeoutMS` (default 2000 ms) for output still held by a process the child started (a background job, a build server). It then cancels the reads, logs `Output may be truncated...` to `Errors`, and completes. Set it to `INFINITE` to wait for every writer on a normal exit; after the child has been killed (Terminate / timeout / cancellation) the drain is always bounded. Terminate or cancellation during the drain after a normal exit ends it at once: the rest of the output is discarded (logged as possible truncation) and `Status` stays `Exited` with the child's own exit code. On Windows the job is terminated too, ending what the child started; with `JobMode = NoJob`, and on POSIX, those programs are left running.
 - **Slow targets**: after a normal exit, everything the child left in the pipes is delivered before the `PipeDrainTimeoutMS` clock starts, however long the targets take over it, so a slow target never loses the child's own output. The clock only limits waiting for *more* output from a descendant. After Terminate / timeout / cancellation the clock starts at once, so a slow target can still miss output that was in the pipe. Increasing `PipeBufferSize` does not help here: it means fewer calls into the target, but it also lets the child exit with more output still unread.
 - **Leftover processes**: what happens to programs the child started and left running is set by `StartInfo.JobMode` - see [Job mode](#job-mode).
-- **Terminate** called from `OnStarted`, a pipe target / source callback or the thread running a synchronous `Execute` only requests termination (it can't wait for itself) and returns `True` immediately. From `OnExit` it returns `False`: the run has already completed.
+- **Terminate** called from `OnStarted`, a pipe target / source callback or the thread running a synchronous `Execute` only requests termination (it can't wait for itself) and returns `True` immediately, and so does `Terminate(0)` from any thread. From `OnExit` it returns `False`: the run has already completed.
 - **Encodings** passed to the pipe factories or `StartInfo` are not owned by the library - keep custom `TEncoding` instances alive until the run has completed.
 - **Interactive sources** are closed automatically when the child exits; create a new one for the next run.
 - **Stdin sources** should return from `GetData` promptly. Once the child has exited and its output has been read, the stdin writer is stopped. If the source's `GetData` still hasn't returned a second later, the run completes anyway and `Errors` says so. The source's `Done` is still called, and the writer thread finishes on its own whenever `GetData` returns; until then it keeps the `IProcess` object alive.
@@ -628,6 +628,14 @@ proc.ExecuteAsync;
 
 `Terminate` waits up to 5 seconds for the run to finish cleaning up and returns `True` when it has. That includes a child that happened to exit on its own first, in which case `Status` is `Exited` and `ExitCode` is the child's own code. It returns `False` when no run is in progress, or when cleanup takes longer than 5 seconds (termination still goes ahead).
 
+`Terminate(waitMS)` waits up to `waitMS` instead (`Terminate` is `Terminate(5000)`). `Terminate(0)` only requests termination: it returns `True` at once when a run is in progress, and the thread running the run (the caller of `Execute`, or the `ExecuteAsync` worker) kills the child and waits for it. Use it to stop several runs from one thread without paying for each one's cleanup:
+
+```delphi
+for i := 0 to High(procs) do
+  procs[i].Terminate(0);   // returns at once
+// each run completes on its own thread; Status leaves Running when it has
+```
+
 ### 10. Multi-target fan-out
 
 ```delphi
@@ -804,7 +812,7 @@ To run the tests, open the test dproj in the IDE and build/run. The console runn
 ## API Reference (high level)
 
 **`IProcess`** - the central interface returned by `TProcess.Create`.
-- Execution: `Execute(cancellationToken|cancellationEvent)`, `ExecuteAsync(cancellationToken|cancellationEvent)`, `ExecuteDetached`, `Terminate`, `Clone`.
+- Execution: `Execute(cancellationToken|cancellationEvent)`, `ExecuteAsync(cancellationToken|cancellationEvent)`, `ExecuteDetached`, `Terminate` / `Terminate(waitMS)` (0 = only request), `Clone`.
 - Configuration: `WithStartInfo`, `WithCommandLine`, `WithEnvironment`, `WithCredentials`, `WithStdOutPipe`, `WithStdErrPipe`, `WithStdInPipe`.
 - State: `Status`, `ExitCode`, `TimedOut`, `ProcessId`, `ResolvedExecutable`, `StartMode`, `LastError` (the OS error code when the OS refused to start the child, otherwise 0; see [Execution modes](#execution-modes)), `Errors`, `CompletionHandle` (Windows only; see [Async execution and status](#6-async-execution-and-status)).
 - Events: `OnStarted`, `OnExit`.

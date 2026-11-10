@@ -603,15 +603,27 @@ type
     function ExecuteDetached : boolean;
 
     /// <summary>
-    ///  Terminates the process tree. When called from another thread it
-    ///  blocks until the run has fully completed (or 5 seconds elapse) and
-    ///  returns True if it did complete. When called from OnStarted, a pipe
-    ///  target / source callback, or the thread running a synchronous
-    ///  Execute, it only requests termination and returns True immediately.
-    ///  Returns False when no run is in progress (including from OnExit,
-    ///  which fires after the run has completed) or the run is detached.
+    ///  Terminates the process tree: Terminate(5000). When called from
+    ///  another thread it blocks until the run has fully completed (or 5
+    ///  seconds elapse) and returns True if it did complete. When called from
+    ///  OnStarted, a pipe target / source callback, or the thread running a
+    ///  synchronous Execute, it only requests termination and returns True
+    ///  immediately. Returns False when no run is in progress (including
+    ///  from OnExit, which fires after the run has completed) or the run is
+    ///  detached.
     ///  </summary>
-    function Terminate : boolean;
+    function Terminate : boolean;overload;
+
+    /// <summary>
+    ///  Requests termination of the process tree, then waits up to waitMS for
+    ///  the run to complete. waitMS = 0 only requests: it returns True at once
+    ///  when a run was in progress, and the thread running the run does the
+    ///  killing and the waiting. With waitMS > 0 it returns whether the run
+    ///  completed in time, except where it can't wait (the same callers as
+    ///  Terminate), which return True at once. Returns False when no run is
+    ///  in progress or the run is detached.
+    ///  </summary>
+    function Terminate(waitMS : Cardinal) : boolean;overload;
 
     /// <summary>
     ///  Create a Copy of this process with the same config

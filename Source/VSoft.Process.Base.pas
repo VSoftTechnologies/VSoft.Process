@@ -253,7 +253,8 @@ type
     function ExecuteAsync(const cancellationEvent : TEvent) : boolean;overload;
     function ExecuteDetached : boolean;
 
-    function Terminate : boolean;virtual;
+    function Terminate : boolean;overload;virtual;
+    function Terminate(waitMS : Cardinal) : boolean;overload;virtual;
     function IsCancelled : boolean;virtual;
     // Terminate has been called or the run's cancellation token / event is set.
     function IsStopRequested : boolean;
@@ -1123,12 +1124,18 @@ function TProcessBase.Terminate: boolean;
 const
   cTerminateAckTimeoutMS = 5000;
 begin
+  result := Terminate(cTerminateAckTimeoutMS);
+end;
+
+function TProcessBase.Terminate(waitMS : Cardinal) : boolean;
+begin
   if (FStartMode = TProcessStartMode.Detached) or IsReadyForRun then
     Exit(false);
   FTerminateEvent.SetEvent;
-  if not CanWaitForCompletion then
+  // 0 only requests: the thread running the run kills and waits.
+  if (waitMS = 0) or (not CanWaitForCompletion) then
     Exit(true);
-  result := FCompletionEvent.WaitFor(cTerminateAckTimeoutMS) = wrSignaled;
+  result := FCompletionEvent.WaitFor(waitMS) = wrSignaled;
 end;
 
 function TProcessBase.ValidateStartUpBuilder: boolean;
