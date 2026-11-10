@@ -142,6 +142,16 @@ type
     [Test]
     procedure DeliverOnRunThread_TimeoutAndTerminate;
 
+    // TPipeSource.FileAsStdIn: the child's stdin is the file itself (a
+    // disk file, not a pipe), it reads the content, and a missing file
+    // raises as FromFile does.
+    [Test]
+    procedure FileAsStdIn_ChildSeesAFileNotAPipe;
+    [Test]
+    procedure FileAsStdIn_ChildReadsTheFile;
+    [Test]
+    procedure FileAsStdIn_MissingFile_ExecuteRaises;
+
     // H13 - a long UTF-8 line read through a 4 KB buffer arrives intact.
     [Test]
     procedure Utf8LongLine_StringBuilderTarget_SmallBuffer_Intact;
@@ -1668,6 +1678,95 @@ begin
   Assert.AreEqual(TProcessStatus.Terminated, proc.Status);
   Assert.AreEqual<Cardinal>(4242, proc.ExitCode);
   Assert.IsFalse(proc.Terminate(0), 'no run in progress any more');
+end;
+
+function WriteTempLines(const prefix : string; const lines : array of string) : string;
+var
+  list : TStringList;
+  i : integer;
+begin
+  result := TTestHelpers.TempFileName(prefix, '.txt');
+  list := TStringList.Create;
+  try
+    for i := 0 to High(lines) do
+      list.Add(lines[i]);
+    list.SaveToFile(result);
+  finally
+    list.Free;
+  end;
+end;
+
+procedure TProcessLifecycleTests.FileAsStdIn_ChildSeesAFileNotAPipe;
+var
+  proc : IProcess;
+  output : TStringBuilder;
+  fileName : string;
+begin
+  fileName := WriteTempLines('vsoft_proc_stdinfile_', ['hello']);
+  output := TStringBuilder.Create;
+  try
+    proc := TProcess.Create;
+    {$IFDEF MSWINDOWS}
+    // Prints GetFileType of its stdin: FILE_TYPE_DISK (1) or FILE_TYPE_PIPE (3).
+    proc.StartInfo.Executable := ParamStr(0);
+    proc.CommandLine.Add(HelperCommandLine('stdin-type', []), TQuoted.qtNone);
+    {$ELSE}
+    TTestHelpers.SetupInlineCommand(proc, '', 'if [ -f /dev/stdin ]; then echo STDIN-TYPE=1; else echo STDIN-TYPE=3; fi');
+    {$ENDIF}
+    proc.WithStdInPipe(TPipeSource.FileAsStdIn(fileName));
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.Contains(output.ToString, 'STDIN-TYPE=1', 'the child''s stdin should be the file itself, not a pipe');
+  finally
+    proc := nil;
+    output.Free;
+    if FileExists(fileName) then
+      DeleteFile(fileName);
+  end;
+end;
+
+procedure TProcessLifecycleTests.FileAsStdIn_ChildReadsTheFile;
+var
+  proc : IProcess;
+  output : TStringBuilder;
+  fileName : string;
+begin
+  fileName := WriteTempLines('vsoft_proc_stdinfile_', ['first line', 'second line', 'third line']);
+  output := TStringBuilder.Create;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.TimeoutInMSec := 20000;
+    TTestHelpers.SetupShellCommand(proc, 'echo-stdin', []);
+    proc.WithStdInPipe(TPipeSource.FileAsStdIn(fileName));
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.Contains(output.ToString, 'first line');
+    Assert.Contains(output.ToString, 'third line');
+    // A re-run reads the file from the start again.
+    output.Clear;
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.Contains(output.ToString, 'first line', 'second run');
+  finally
+    proc := nil;
+    output.Free;
+    if FileExists(fileName) then
+      DeleteFile(fileName);
+  end;
+end;
+
+procedure TProcessLifecycleTests.FileAsStdIn_MissingFile_ExecuteRaises;
+var
+  proc : IProcess;
+begin
+  proc := TProcess.Create;
+  TTestHelpers.SetupShellCommand(proc, 'echo-stdin', []);
+  proc.WithStdInPipe(TPipeSource.FileAsStdIn(TTestHelpers.TempFileName('vsoft_proc_missing_', '.txt')));
+  Assert.WillRaise(
+    procedure
+    begin
+      proc.Execute;
+    end, EVSoftProcessError);
 end;
 
 { TThreadRecordingTarget }

@@ -83,6 +83,24 @@ type
     procedure SetDefaultEncoding(const value : TEncoding);
   end;
 
+  // TPipeSource.FileAsStdIn: the platform gives the child the file opened by
+  // Start as its stdin, so no data passes through GetData. A missing file
+  // raises when the run starts, as TFilePipeSource does.
+  TFileStdInPipeSource = class(TPipeSourceBase, IFileStdInPipeSource)
+  private
+    FFileName : string;
+    FFileStream : TFileStream;
+  protected
+    procedure Start;override;
+    function GetData(var data : TBytes; out dataLength: NativeUInt) : boolean;override;
+    procedure Done;override;
+    function GetFileName : string;
+    function GetFileHandle : THandle;
+  public
+    constructor Create(const fileName : string);
+    destructor Destroy;override;
+  end;
+
   // Streams the file to stdin in chunks, so large files are not loaded into
   // memory. A missing file raises when the run starts.
   TFilePipeSource = class(TPipeSourceBase)
@@ -388,6 +406,52 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+{ TFileStdInPipeSource }
+
+constructor TFileStdInPipeSource.Create(const fileName : string);
+begin
+  inherited Create;
+  FFileName := fileName;
+end;
+
+destructor TFileStdInPipeSource.Destroy;
+begin
+  FreeAndNil(FFileStream);
+  inherited;
+end;
+
+procedure TFileStdInPipeSource.Start;
+begin
+  FreeAndNil(FFileStream);
+  if not FileExists(FFileName) then
+    raise EVSoftProcessError.Create('Stdin source file not found: ' + FFileName);
+  FFileStream := TFileStream.Create(FFileName, fmOpenRead or fmShareDenyWrite);
+end;
+
+procedure TFileStdInPipeSource.Done;
+begin
+  FreeAndNil(FFileStream);
+end;
+
+function TFileStdInPipeSource.GetData(var data : TBytes; out dataLength : NativeUInt) : boolean;
+begin
+  dataLength := 0;
+  result := false;
+end;
+
+function TFileStdInPipeSource.GetFileName : string;
+begin
+  result := FFileName;
+end;
+
+function TFileStdInPipeSource.GetFileHandle : THandle;
+begin
+  if FFileStream <> nil then
+    result := FFileStream.Handle
+  else
+    result := 0;
 end;
 
 { TFilePipeSource }

@@ -990,6 +990,7 @@ var
   threadId : TThreadID;
   writer : IStdInWriter;
   pipeEnd : THandle;
+  fileSource : IFileStdInPipeSource;
 
   procedure AddInheritable(handle : THandle);
   var
@@ -1070,7 +1071,21 @@ begin
     if redirectErr then
       CreateOutputPipe(errRead, childErr);
     if redirectIn then
-      CreateInputPipe(childIn, FStdInWriteHandle);
+    begin
+      // TPipeSource.FileAsStdIn: the child's stdin is the file itself, a
+      // copy of the handle the source opened, handled like a pipe end.
+      if Supports(FRunStdIn, IFileStdInPipeSource, fileSource) then
+      begin
+        if not DuplicateHandle(GetCurrentProcess, fileSource.FileHandle, GetCurrentProcess, @childIn, 0, False,
+                               DUPLICATE_SAME_ACCESS) then
+        begin
+          childIn := 0;
+          RaiseLastOSError;
+        end;
+      end
+      else
+        CreateInputPipe(childIn, FStdInWriteHandle);
+    end;
     // InheritHostStdHandles: a stream that is not redirected gets a copy of
     // our own std handle. Like the pipe ends it is created non-inheritable,
     // made inheritable only under GSpawnLock and closed after the spawn.
@@ -1260,7 +1275,8 @@ begin
       if not QueueAsyncPipeRead(@FStdErrIO) then
         SetEvent(FStdErrIO.DoneEvent);
     end;
-    if redirectIn then
+    // A stdin that is a file (FileAsStdIn) needs no writer.
+    if redirectIn and (fileSource = nil) then
     begin
       writer := TWindowsStdInWriter.Create(Self, FRunStdIn, FStdInWriteHandle);
       FStdInWriteHandle := 0;

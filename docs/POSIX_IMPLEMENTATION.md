@@ -42,6 +42,8 @@ A loop of time slices (≤ 100 ms) moves through Running → Killing → Drainin
 
 ## Stdin writer
 
+`TPipeSource.FileAsStdIn` (`IFileStdInPipeSource`) has no writer. Its `Start` opens the file. Under the spawn lock `DoCreateProcess` takes an `F_DUPFD_CLOEXEC` copy (at 3 or above, like the pipe ends) of that fd in place of the stdin pipe and passes it to `RunChild` as `stdinFd`, so the existing `dup2` makes the file the child's fd 0. The copy is closed with the other child ends after `fork`.
+
 The write end is `O_NONBLOCK`. The writer retries on `EINTR`, waits in `poll(POLLOUT, 100 ms)` on `EAGAIN` so it notices the abort flag, stops on any other write error (`EPIPE` when the child closed stdin or exited), and closes the write end when it finishes, which is EOF for the child.
 
 Each run's writer is a `TPosixStdInWriter` (`TStdInWriter` in `VSoft.Process.Base.pas`) that owns the write end and holds the source, the abort flag and any error; the process doesn't keep the fd. The thread is a self-freeing anonymous `TThread` that holds a reference to the writer, and the writer holds one to the process until it finishes. Its id is set in `FStdInWriterThreadId` before it starts, and the writer clears it with a compare-exchange when it finishes, only if it is still its own. `StopStdInWriter` waits up to 1 s for the writer. One that is still blocked in its source's `GetData` is logged and left to finish on its own, without touching the next run.

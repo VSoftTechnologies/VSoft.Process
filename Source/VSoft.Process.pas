@@ -560,12 +560,29 @@ type
     function WaitForData(timeoutMS : Cardinal) : Boolean;
   end;
 
+  // The source made by TPipeSource.FileAsStdIn: the platform gives the child
+  // the file itself as its stdin (no pipe, no writer thread), so GetData is
+  // never used. Start opens the file and Done closes it.
+  IFileStdInPipeSource = interface(IPipeSource)
+  ['{DA8EB52B-32D2-46B4-8BB2-2385C69B671E}']
+    function GetFileName : string;
+    // The file opened by Start (a Windows handle, a POSIX file descriptor);
+    // 0 before Start and after Done.
+    function GetFileHandle : THandle;
+    property FileName : string read GetFileName;
+    property FileHandle : THandle read GetFileHandle;
+  end;
+
   TPipeSource = record
   public
     class function FromString(const value : string; const encoding : TEncoding = nil) : IPipeSource;static;
     class function FromBytes(const bytes : TBytes) : IPipeSource;static;
     class function FromStream(const stream : TStream) : IPipeSource;static;
     class function FromFile(const fileName : string) : IPipeSource;static;
+    // The child's stdin is the file itself rather than a pipe the file is
+    // written to: the child sees a real, seekable file (no writer thread). A
+    // missing file raises EVSoftProcessError from Execute*, as FromFile does.
+    class function FileAsStdIn(const fileName : string) : IPipeSource;static;
     // Create an interactive pipe source for runtime writing during process execution
     class function Interactive : IInteractivePipeSource;static;
   end;
@@ -840,6 +857,11 @@ end;
 class function TPipeSource.FromFile(const fileName : string): IPipeSource;
 begin
   result := TFilePipeSource.Create(fileName);
+end;
+
+class function TPipeSource.FileAsStdIn(const fileName : string) : IPipeSource;
+begin
+  result := TFileStdInPipeSource.Create(fileName);
 end;
 
 class function TPipeSource.FromStream(const stream : TStream): IPipeSource;

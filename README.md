@@ -18,7 +18,7 @@ The goals are:
 - **Cross-platform**: Win32, Win64, Windows ARM64EC (Delphi 13.2+), Linux, macOS share a single `IProcess` API.
 - **Fluent or imperative**: chain `WithStartInfo(...).WithCommandLine(...).Execute` or set properties step-by-step.
 - **Three execution modes**: synchronous `Execute`, fire-and-monitor `ExecuteAsync`, fully-detached `ExecuteDetached`.
-- **I/O redirection**: bind stdout/stderr to streams, files, `TStringBuilder`, or per-line delegates; feed stdin from strings, bytes, files, streams, or an interactive source.
+- **I/O redirection**: bind stdout/stderr to streams, files, `TStringBuilder`, or per-line delegates; feed stdin from strings, bytes, files, streams, or an interactive source, or make a file the child's stdin itself (`TPipeSource.FileAsStdIn`).
 - **Interactive stdin**: write to a running child's stdin from anywhere; the writer thread blocks on an event instead of busy-spinning.
 - **Command-line builder**: declarative argument construction with per-argument quoting; sensitive arguments are masked in `ToLogString` but emitted normally to `ToString`.
 - **Environment builder**: inherit, override, or strip variables; the platform impl only builds a custom block when you actually modify it.
@@ -864,7 +864,7 @@ To run the tests, open the test dproj in the IDE and build/run. The console runn
 
 **`TPipeTarget`** factory - `ToStream`, `ToFile(name, append)`, `ToStringBuilder(sb, enc)`, `ToDelegate`, `ToMethod`, `ToProcedure`, `ToLineDelegate`, `ToLineMethod`, `ToLineProcedure`, `ToAll([target, ...])` (an open array; the targets are copied).
 
-**`TPipeSource`** factory - `FromString(s, enc)`, `FromBytes(b)`, `FromStream(s)` (streams from the current position; a re-run sends the same data again), `FromFile(path)` (streamed in chunks; a missing file raises `EVSoftProcessError` from `Execute*`), `Interactive`.
+**`TPipeSource`** factory - `FromString(s, enc)`, `FromBytes(b)`, `FromStream(s)` (streams from the current position; a re-run sends the same data again), `FromFile(path)` (streamed in chunks; a missing file raises `EVSoftProcessError` from `Execute*`), `FileAsStdIn(path)` (the child's stdin is the file itself, not a pipe: no writer thread, and a program that seeks on stdin or checks its size or type sees a real file; opened for each run, so a re-run reads it from the start; a missing file raises `EVSoftProcessError` from `Execute*`), `Interactive`.
 
 **`IInteractivePipeSource`** - `Write(bytes|text)`, `Close`, `IsClosed`, `WaitForData(timeoutMs)`.
 

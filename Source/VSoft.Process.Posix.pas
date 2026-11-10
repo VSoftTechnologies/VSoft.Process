@@ -1038,6 +1038,7 @@ var
   redirectOut, redirectErr, redirectIn : boolean;
   writer : IStdInWriter;
   writerThread : TThread;
+  fileSource : IFileStdInPipeSource;
 begin
   result := False;
   FProcessId := INVALID_PID;
@@ -1067,7 +1068,19 @@ begin
         if redirectErr then
           CreatePipe(errRead, errWrite);
         if redirectIn then
-          CreatePipe(inRead, inWrite);
+        begin
+          // TPipeSource.FileAsStdIn: the child's fd 0 is the file itself, a
+          // CLOEXEC copy (at 3 or above, as for the pipe ends) of the fd the
+          // source opened, closed like inRead once the child has its own.
+          if Supports(FRunStdIn, IFileStdInPipeSource, fileSource) then
+          begin
+            inRead := fcntl(Integer(fileSource.FileHandle), F_DUPFD_CLOEXEC, 3);
+            if inRead < 0 then
+              raise EOSError.Create('Failed to duplicate the stdin file: ' + SysErrorMessage(errno));
+          end
+          else
+            CreatePipe(inRead, inWrite);
+        end;
         // Child-error self-pipe: CLOEXEC, so a successful execve closes the
         // write end and the parent's read sees EOF.
         CreatePipe(errPipeRead, errPipeWrite);
@@ -1132,7 +1145,8 @@ begin
       SetNonBlocking(FStdErrReadFd);
       WatchFd(FStdErrReadFd);
     end;
-    if redirectIn then
+    // A stdin that is a file (FileAsStdIn) needs no writer.
+    if redirectIn and (fileSource = nil) then
     begin
       // Non-blocking so the writer can give up when the run ends even if a
       // descendant holds the pipe and never reads.

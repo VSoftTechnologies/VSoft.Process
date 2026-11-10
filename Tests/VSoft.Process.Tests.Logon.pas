@@ -49,6 +49,10 @@ type
     // stderr reaches the logon child (the service duplicates it in).
     [Test]
     procedure NetOnlyLogon_InheritHostStdHandles_StdErrGoesToHostStdErr;
+
+    // TPipeSource.FileAsStdIn with credentials: the logon child reads the file.
+    [Test]
+    procedure NetOnlyLogon_FileAsStdIn_ChildReadsTheFile;
   end;
 {$ENDIF}
 
@@ -362,6 +366,42 @@ begin
     Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
     Assert.Contains(output.ToString, 'this-is-stdout', proc.Errors.Text);
     Assert.Contains(TEncoding.ANSI.GetString(TTestHelpers.ReadFileBytes(fileName)), 'this-is-stderr', proc.Errors.Text);
+  finally
+    proc := nil;
+    output.Free;
+    if FileExists(fileName) then
+      DeleteFile(fileName);
+  end;
+end;
+
+procedure TProcessLogonTests.NetOnlyLogon_FileAsStdIn_ChildReadsTheFile;
+var
+  fileName : string;
+  lines : TStringList;
+  proc : IProcess;
+  output : TStringBuilder;
+  launched : boolean;
+begin
+  fileName := TTestHelpers.TempFileName('vsoft_proc_logonin_', '.txt');
+  lines := TStringList.Create;
+  try
+    lines.Add('line-for-the-logon-child');
+    lines.SaveToFile(fileName);
+  finally
+    lines.Free;
+  end;
+  output := TStringBuilder.Create;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.TimeoutInMSec := 30000;
+    TTestHelpers.SetupShellCommand(proc, 'echo-stdin', []);
+    SetNetOnlyCredentials(proc);
+    proc.WithStdInPipe(TPipeSource.FileAsStdIn(fileName));
+    proc.WithStdOutPipe(TPipeTarget.ToStringBuilder(output));
+    launched := proc.Execute;
+    IgnoreWhenNoSecondaryLogon(proc);
+    Assert.IsTrue(launched, 'LastError ' + IntToStr(proc.LastError) + ': ' + proc.Errors.Text);
+    Assert.Contains(output.ToString, 'line-for-the-logon-child', proc.Errors.Text);
   finally
     proc := nil;
     output.Free;
