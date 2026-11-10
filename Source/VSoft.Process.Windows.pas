@@ -87,6 +87,9 @@ type
     FStdInWriter : IStdInWriter;
 
     function BuildCommandLine : string;
+    // The Windows message for a launch failure, with the program in place
+    // of its %1 placeholder. Never the arguments: they can hold secrets.
+    function LaunchErrorText(error : DWORD) : string;
     function GetEnvironmentBlock : Pointer;
     function LaunchWithLogon(const command : string; creationFlags : DWORD; pEnvironment : Pointer; pWorkingDir : PChar;
                              const startupInfo : TStartupInfoW; var processInfo : TProcessInformation) : BOOL;
@@ -697,6 +700,11 @@ begin
   UniqueString(result); //CreateProcess can modify this value.
 end;
 
+function TWindowsProcess.LaunchErrorText(error : DWORD) : string;
+begin
+  result := StringReplace(SysErrorMessage(error), '%1', FResolvedExecutable, [rfReplaceAll]);
+end;
+
 function TWindowsProcess.GetEnvironmentBlock : Pointer;
 begin
   // Only build a custom block when the caller has changed the environment;
@@ -1026,7 +1034,7 @@ begin
     if not success then
     begin
       FLastError := error;
-      LogError(SysErrorMessage(error));
+      LogError(LaunchErrorText(error));
       Exit;
     end;
     created := true;
@@ -1493,7 +1501,7 @@ begin
   begin
     error := Winapi.Windows.GetLastError;
     FLastError := error;
-    LogError(SysErrorMessage(error));
+    LogError(LaunchErrorText(error));
   end;
 end;
 

@@ -174,6 +174,11 @@ type
     [Test]
     procedure LaunchFails_LastErrorIsTheOsError;
 
+    // The launch error names the program in place of the %1 in the Windows
+    // message, and never shows the arguments (they can hold secrets).
+    [Test]
+    procedure LaunchFails_ErrorNamesTheProgramNotItsArguments;
+
     // IProcess.CompletionHandle: no run in progress, so it is signalled.
     [Test]
     procedure CompletionHandle_NewProcess_IsSignalled;
@@ -1789,10 +1794,11 @@ var
   proc : IProcess;
   expectedMessage : string;
 begin
-  // The file exists, so validation passes, but it is not a program.
-  expectedMessage := SysErrorMessage(ERROR_BAD_EXE_FORMAT);
+  // The file exists, so validation passes, but it is not a program. The
+  // message names it in place of the %1 placeholder.
   proc := TProcess.Create;
   proc.StartInfo.Executable := TTestHelpers.ScriptsDir + 'invalid-utf8.bin';
+  expectedMessage := StringReplace(SysErrorMessage(ERROR_BAD_EXE_FORMAT), '%1', proc.StartInfo.Executable, [rfReplaceAll]);
 
   Assert.IsFalse(proc.Execute, 'Execute');
   Assert.AreEqual<Cardinal>(ERROR_BAD_EXE_FORMAT, proc.LastError, 'Execute: ' + proc.Errors.Text);
@@ -1805,6 +1811,56 @@ begin
   Assert.IsFalse(proc.ExecuteDetached, 'ExecuteDetached');
   Assert.AreEqual<Cardinal>(ERROR_BAD_EXE_FORMAT, proc.LastError, 'ExecuteDetached: ' + proc.Errors.Text);
   Assert.Contains(proc.Errors.Text, expectedMessage, 'ExecuteDetached');
+end;
+
+procedure TProcessLifecycleTests.LaunchFails_ErrorNamesTheProgramNotItsArguments;
+const
+  cSecret = 'hunter2-not-for-logs';
+var
+  proc : IProcess;
+  exeName : string;
+  textFile : TStringList;
+
+  procedure CheckErrors(const call : string);
+  var
+    errors : string;
+  begin
+    errors := proc.Errors.Text;
+    // The code depends on the Windows version (216, "This version of %1 is
+    // not compatible ...", on Windows 11); its message has a %1 either way.
+    Assert.AreNotEqual<Cardinal>(0, proc.LastError, call + ': ' + errors);
+    Assert.Contains(errors, exeName, call + ': the error must name the program');
+    Assert.AreEqual(0, Pos('%1', errors), call + ': the %1 placeholder must be replaced: ' + errors);
+    Assert.AreEqual(0, Pos(cSecret, errors), call + ': the arguments must not be in the error: ' + errors);
+  end;
+
+begin
+  // A text file renamed to .exe: validation passes and CreateProcess refuses
+  // it with an error whose message has a %1 placeholder.
+  exeName := TTestHelpers.TempFileName('vsoft_proc_notexe_', '.exe');
+  textFile := TStringList.Create;
+  try
+    textFile.Add('This is a text file, not a program.');
+    textFile.SaveToFile(exeName);
+  finally
+    textFile.Free;
+  end;
+  try
+    proc := TProcess.Create;
+    proc.StartInfo.Executable := exeName;
+    proc.CommandLine.Add('--password', cSecret);
+
+    Assert.IsFalse(proc.Execute, 'Execute');
+    CheckErrors('Execute');
+    Assert.IsFalse(proc.ExecuteAsync, 'ExecuteAsync');
+    CheckErrors('ExecuteAsync');
+    Assert.IsFalse(proc.ExecuteDetached, 'ExecuteDetached');
+    CheckErrors('ExecuteDetached');
+  finally
+    proc := nil;
+    if FileExists(exeName) then
+      DeleteFile(exeName);
+  end;
 end;
 
 procedure TProcessLifecycleTests.CompletionHandle_NewProcess_IsSignalled;
