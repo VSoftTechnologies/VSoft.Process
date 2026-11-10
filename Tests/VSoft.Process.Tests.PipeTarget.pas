@@ -1466,7 +1466,9 @@ begin
     Assert.AreEqual(2, capture.Lines.Count);
     Assert.AreEqual(cMaxPendingLineBytes - 1, Length(capture.Lines[0]), 'The incomplete character must not be in the forced piece');
     Assert.AreEqual(0, Pos(#$FFFD, capture.Lines[0]), 'No replacement character in the forced piece');
-    Assert.AreEqual(#$E9, capture.Lines[1], 'The character is completed by its second byte');
+    // WideChar: a bare #$E9 is an AnsiChar here, converted through the ANSI
+    // code page (U+FFFD when that is UTF-8).
+    Assert.AreEqual(string(WideChar($E9)), capture.Lines[1], 'The character is completed by its second byte');
   finally
     capture.Free;
   end;
