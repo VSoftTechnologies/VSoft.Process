@@ -20,19 +20,43 @@ type
     [Setup]
     procedure SetUp;
 
-    // OnStarted / OnExit. A handler that raises is logged and the run goes
-    // on, whether the handler is called directly or queued to the main
-    // thread (StartInfo.MarshallEventsToMainThread).
+    // OnStarted / OnExit. A handler called on the thread that called
+    // Execute* raises to that caller; when it is OnStarted the run is stopped
+    // and completed first, so no run is left in progress behind the exception.
     [Test]
-    procedure OnStartedRaises_CalledDirectly_LoggedAndRunCompletes;
+    procedure OnStartedRaises_Execute_StopsTheRunAndRaises;
     [Test]
-    procedure OnExitRaises_CalledDirectly_LoggedAndRunCompletes;
+    procedure OnStartedRaises_ExecuteAsync_StopsTheRunAndRaises;
+    [Test]
+    procedure OnStartedRaises_ExecuteDetached_Raises;
+    [Test]
+    procedure OnStartedRaisesNonException_Execute_StopsTheRunAndRaises;
+    [Test]
+    procedure OnStartedRaises_Execute_ProcessCanRunAgain;
+    [Test]
+    procedure OnExitRaises_Execute_RaisesAfterTheRunCompleted;
+    // The caller gets the first exception; the second is logged.
+    [Test]
+    procedure OnStartedAndOnExitRaise_Execute_RaisesTheOnStartedException;
+    [Test]
+    procedure OnStartedAndOnExitRaise_ExecuteAsync_RaisesTheOnStartedException;
+    // Where there is no caller to raise to, the exception is reported and the
+    // run goes on: OnExit on the ExecuteAsync worker thread is logged; a
+    // handler queued to the main thread (StartInfo.MarshallEventsToMainThread)
+    // goes to the application's exception handler when there is one and is
+    // logged otherwise.
+    [Test]
+    procedure OnExitRaises_ExecuteAsync_LoggedAndRunCompletes;
     [Test]
     procedure OnStarted_Marshalled_ExecuteOnWorkerThread_FiresOnMainThread;
     [Test]
     procedure OnStartedRaises_Marshalled_LoggedAndRunCompletes;
     [Test]
     procedure OnExitRaises_Marshalled_LoggedAndRunCompletes;
+    [Test]
+    procedure OnStartedRaises_Marshalled_GoesToTheApplicationHandler;
+    [Test]
+    procedure OnExitRaises_Marshalled_GoesToTheApplicationHandler;
     [Test]
     procedure EventProperties_ReturnWhatWasAssigned;
 
@@ -119,6 +143,7 @@ type
   TEventRecorder = class
   private
     FRaiseInStarted : boolean;
+    FRaiseObjectInStarted : boolean;
     FRaiseInExited : boolean;
     FClearPipesInStarted : boolean;
     FStartedCalls : integer;
@@ -133,6 +158,8 @@ type
     function StartedFired : boolean;
     function ExitedFired : boolean;
     property RaiseInStarted : boolean read FRaiseInStarted write FRaiseInStarted;
+    // HandleStarted raises an object that is not an Exception.
+    property RaiseObjectInStarted : boolean read FRaiseObjectInStarted write FRaiseObjectInStarted;
     property RaiseInExited : boolean read FRaiseInExited write FRaiseInExited;
     // HandleStarted detaches the process's stdout and stderr targets.
     property ClearPipesInStarted : boolean read FClearPipesInStarted write FClearPipesInStarted;
@@ -143,6 +170,25 @@ type
     // The IProcess the OnStarted handler was given.
     property StartedProcess : Pointer read FStartedProcess;
     property ExitCode : Cardinal read FExitCode;
+  end;
+
+  TApplicationHandler = procedure(sender : TObject) of object;
+
+  // Stands in for the application's exception handler
+  // (System.Classes.ApplicationHandleException, which a VCL or FMX
+  // application sets) for as long as it exists.
+  TApplicationHandlerStub = class
+  private
+    FPrevious : TApplicationHandler;
+    FCalls : integer;
+    FLastMessage : string;
+    procedure HandleException(sender : TObject);
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property Calls : integer read FCalls;
+    // The message of the exception that was being handled at the last call.
+    property LastMessage : string read FLastMessage;
   end;
 
   // Collects the lines a line target is given. Safe to read while a run is
@@ -258,6 +304,8 @@ begin
     process.ClearStdErrPipes;
   end;
   TInterlocked.Increment(FStartedCalls);
+  if FRaiseObjectInStarted then
+    raise TObject.Create;
   if FRaiseInStarted then
     raise Exception.Create('started-boom');
 end;
@@ -279,6 +327,31 @@ end;
 function TEventRecorder.ExitedFired : boolean;
 begin
   result := FExitedCalls > 0;
+end;
+
+{ TApplicationHandlerStub }
+
+constructor TApplicationHandlerStub.Create;
+begin
+  inherited Create;
+  FPrevious := ApplicationHandleException;
+  ApplicationHandleException := HandleException;
+end;
+
+destructor TApplicationHandlerStub.Destroy;
+begin
+  ApplicationHandleException := FPrevious;
+  inherited;
+end;
+
+procedure TApplicationHandlerStub.HandleException(sender : TObject);
+var
+  raised : TObject;
+begin
+  raised := ExceptObject;
+  if raised is Exception then
+    FLastMessage := Exception(raised).Message;
+  Inc(FCalls);
 end;
 
 { TLineRecorder }
@@ -533,6 +606,26 @@ begin
   TTestHelpers.SetupShellCommand(result, 'exit-with', [IntToStr(exitCode)]);
 end;
 
+// A process set up to run the sleep fixture: a child that stays around.
+function NewSleepProcess(seconds : integer) : IProcess;
+begin
+  result := TProcess.Create;
+  result.StartInfo.TimeoutInMSec := 60000;
+  TTestHelpers.SetupShellCommand(result, 'sleep', [IntToStr(seconds)]);
+end;
+
+// Waits until the process has logged something. A run's own thread writes
+// the log, so the text is only to be read once an entry is there.
+function WaitForLoggedError(const proc : IProcess; timeoutMs : Cardinal) : boolean;
+var
+  deadline : Int64;
+begin
+  deadline := TTestHelpers.TickMs + timeoutMs;
+  while (proc.Errors.Count = 0) and (TTestHelpers.TickMs < deadline) do
+    Sleep(10);
+  result := proc.Errors.Count > 0;
+end;
+
 // Writes bytes to a new temp file and returns its name; the caller deletes it.
 function WriteTempFile(const bytes : TBytes) : string;
 var
@@ -569,29 +662,263 @@ begin
   TTestHelpers.ScriptsDir;
 end;
 
-procedure TProcessRunApiTests.OnStartedRaises_CalledDirectly_LoggedAndRunCompletes;
+procedure TProcessRunApiTests.OnStartedRaises_Execute_StopsTheRunAndRaises;
 var
   proc : IProcess;
   recorder : TEventRecorder;
+  target : IRecordingTarget;
+  raisedMessage : string;
 begin
   recorder := TEventRecorder.Create;
   try
     recorder.RaiseInStarted := True;
-    proc := NewExitProcess(5);
+    proc := NewSleepProcess(30);
+    target := TRecordingTarget.Create(False);
+    proc.WithStdOutPipe(target);
     proc.OnStarted := recorder.HandleStarted;
-    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    proc.OnExit := recorder.HandleExited;
+    raisedMessage := '';
+    try
+      proc.Execute;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('started-boom', raisedMessage, 'Execute should raise what the handler raised');
     Assert.AreEqual<Integer>(1, recorder.StartedCalls, 'OnStarted should be called once');
-    Assert.AreEqual(TProcessStatus.Exited, proc.Status, 'the run should go on after the handler raised');
-    Assert.AreEqual<Cardinal>(5, proc.ExitCode, 'the child should have run to its end');
-    Assert.Contains(proc.Errors.Text, 'OnStarted handler raised');
-    Assert.Contains(proc.Errors.Text, 'started-boom');
+    Assert.AreEqual(TProcessStatus.Terminated, proc.Status, 'the child should have been stopped: ' + proc.Errors.Text);
+    Assert.AreEqual<Integer>(1, target.DoneCalls, 'the run should have completed: Done for its targets');
+    Assert.AreEqual<Integer>(1, recorder.ExitedCalls, 'the run should have completed: OnExit');
   finally
     proc := nil;
     recorder.Free;
   end;
 end;
 
-procedure TProcessRunApiTests.OnExitRaises_CalledDirectly_LoggedAndRunCompletes;
+procedure TProcessRunApiTests.OnStartedRaises_ExecuteAsync_StopsTheRunAndRaises;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  target : IRecordingTarget;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseInStarted := True;
+    proc := NewSleepProcess(30);
+    target := TRecordingTarget.Create(False);
+    proc.WithStdOutPipe(target);
+    proc.OnStarted := recorder.HandleStarted;
+    proc.OnExit := recorder.HandleExited;
+    raisedMessage := '';
+    try
+      proc.ExecuteAsync;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('started-boom', raisedMessage, 'ExecuteAsync should raise what the handler raised');
+    // Nothing is polled: no run may be in progress once ExecuteAsync has raised.
+    Assert.AreEqual(TProcessStatus.Terminated, proc.Status, 'the run should have been stopped and completed: ' + proc.Errors.Text);
+    Assert.AreEqual<Integer>(1, target.DoneCalls, 'the run should have completed: Done for its targets');
+    Assert.AreEqual<Integer>(1, recorder.ExitedCalls, 'the run should have completed: OnExit');
+    Assert.AreEqual<TThreadID>(TThread.CurrentThread.ThreadID, recorder.ExitedThreadId, 'the calling thread completes the run');
+  finally
+    // A run left in progress (there should be none) must end before the
+    // recorder goes.
+    if proc <> nil then
+    begin
+      proc.OnExit := nil;
+      proc.Terminate;
+    end;
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnStartedRaises_ExecuteDetached_Raises;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseInStarted := True;
+    proc := NewExitProcess(0);
+    proc.OnStarted := recorder.HandleStarted;
+    raisedMessage := '';
+    try
+      proc.ExecuteDetached;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('started-boom', raisedMessage, 'ExecuteDetached should raise what the handler raised');
+    Assert.AreEqual<Integer>(1, recorder.StartedCalls, 'OnStarted should be called once');
+  finally
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnStartedRaisesNonException_Execute_StopsTheRunAndRaises;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  raisedObject : boolean;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseObjectInStarted := True;
+    proc := NewSleepProcess(30);
+    proc.OnStarted := recorder.HandleStarted;
+    raisedObject := False;
+    raisedMessage := '';
+    try
+      proc.Execute;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+      else
+        raisedObject := True;
+    end;
+    Assert.IsTrue(raisedObject, 'Execute should raise the object the handler raised ' + raisedMessage);
+    Assert.AreEqual(TProcessStatus.Terminated, proc.Status, 'the run should have been stopped and completed: ' + proc.Errors.Text);
+  finally
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnStartedRaises_Execute_ProcessCanRunAgain;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseInStarted := True;
+    proc := NewExitProcess(5);
+    proc.OnStarted := recorder.HandleStarted;
+    raisedMessage := '';
+    try
+      proc.Execute;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('started-boom', raisedMessage, 'Execute should raise what the handler raised');
+    recorder.RaiseInStarted := False;
+    Assert.IsTrue(proc.Execute, proc.Errors.Text);
+    Assert.AreEqual<Integer>(2, recorder.StartedCalls, 'OnStarted should be called for each run');
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.AreEqual<Cardinal>(5, proc.ExitCode);
+  finally
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnExitRaises_Execute_RaisesAfterTheRunCompleted;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseInExited := True;
+    proc := NewExitProcess(5);
+    proc.OnExit := recorder.HandleExited;
+    raisedMessage := '';
+    try
+      proc.Execute;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('exited-boom', raisedMessage, 'Execute should raise what the handler raised');
+    Assert.AreEqual<Integer>(1, recorder.ExitedCalls, 'OnExit should be called once');
+    Assert.AreEqual<Cardinal>(5, recorder.ExitCode, 'OnExit should be given the child''s exit code');
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.AreEqual<Cardinal>(5, proc.ExitCode);
+  finally
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnStartedAndOnExitRaise_Execute_RaisesTheOnStartedException;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseInStarted := True;
+    recorder.RaiseInExited := True;
+    proc := NewExitProcess(0);
+    proc.OnStarted := recorder.HandleStarted;
+    proc.OnExit := recorder.HandleExited;
+    raisedMessage := '';
+    try
+      proc.Execute;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('started-boom', raisedMessage, 'Execute should raise what the first handler raised');
+    Assert.AreEqual<Integer>(1, recorder.ExitedCalls, 'OnExit should be called once');
+    Assert.Contains(proc.Errors.Text, 'OnExit handler raised');
+    Assert.Contains(proc.Errors.Text, 'exited-boom');
+  finally
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnStartedAndOnExitRaise_ExecuteAsync_RaisesTheOnStartedException;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  raisedMessage : string;
+begin
+  recorder := TEventRecorder.Create;
+  try
+    recorder.RaiseInStarted := True;
+    recorder.RaiseInExited := True;
+    proc := NewExitProcess(0);
+    proc.OnStarted := recorder.HandleStarted;
+    proc.OnExit := recorder.HandleExited;
+    raisedMessage := '';
+    try
+      proc.ExecuteAsync;
+    except
+      on E : Exception do
+        raisedMessage := E.Message;
+    end;
+    Assert.AreEqual('started-boom', raisedMessage, 'ExecuteAsync should raise what the first handler raised');
+    Assert.AreEqual<Integer>(1, recorder.ExitedCalls, 'OnExit should be called once');
+    Assert.Contains(proc.Errors.Text, 'OnExit handler raised');
+    Assert.Contains(proc.Errors.Text, 'exited-boom');
+  finally
+    // A run left in progress (there should be none) must end before the
+    // recorder goes.
+    if proc <> nil then
+    begin
+      proc.OnExit := nil;
+      proc.Terminate;
+    end;
+    proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnExitRaises_ExecuteAsync_LoggedAndRunCompletes;
 var
   proc : IProcess;
   recorder : TEventRecorder;
@@ -599,13 +926,17 @@ begin
   recorder := TEventRecorder.Create;
   try
     recorder.RaiseInExited := True;
-    proc := NewExitProcess(5);
+    proc := NewExitProcess(3);
     proc.OnExit := recorder.HandleExited;
-    Assert.IsTrue(proc.Execute, 'Execute should not pass the handler''s exception on: ' + proc.Errors.Text);
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    Assert.IsTrue(TTestHelpers.WaitWhileRunning(proc, 30000), 'the run did not complete');
+    // The handler is called on the run's worker thread once the run has
+    // completed, and what it raised is logged after that.
+    Assert.IsTrue(WaitForLoggedError(proc, 15000), 'what the handler raised was not logged');
     Assert.AreEqual<Integer>(1, recorder.ExitedCalls, 'OnExit should be called once');
-    Assert.AreEqual<Cardinal>(5, recorder.ExitCode, 'OnExit should be given the child''s exit code');
+    Assert.AreNotEqual<TThreadID>(TThread.CurrentThread.ThreadID, recorder.ExitedThreadId, 'OnExit should be called on the worker thread');
     Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
-    Assert.AreEqual<Cardinal>(5, proc.ExitCode);
+    Assert.AreEqual<Cardinal>(3, proc.ExitCode);
     Assert.Contains(proc.Errors.Text, 'OnExit handler raised');
     Assert.Contains(proc.Errors.Text, 'exited-boom');
   finally
@@ -698,6 +1029,68 @@ begin
     Assert.Contains(proc.Errors.Text, 'exited-boom');
   finally
     proc := nil;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnStartedRaises_Marshalled_GoesToTheApplicationHandler;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  appHandler : TApplicationHandlerStub;
+  runner : TExecuteThread;
+begin
+  recorder := TEventRecorder.Create;
+  appHandler := TApplicationHandlerStub.Create;
+  runner := nil;
+  try
+    recorder.RaiseInStarted := True;
+    proc := NewExitProcess(0);
+    proc.StartInfo.MarshallEventsToMainThread := True;
+    proc.OnStarted := recorder.HandleStarted;
+    runner := TExecuteThread.Create(proc);
+    Assert.IsTrue(PumpUntil(runner.HasCompleted, 30000), 'Execute did not return');
+    Assert.IsTrue(PumpUntil(recorder.StartedFired, 15000), 'OnStarted was never called');
+    Assert.IsTrue(runner.Executed, proc.Errors.Text);
+    Assert.AreEqual<Integer>(1, appHandler.Calls, 'the application''s exception handler should be called once');
+    Assert.AreEqual('started-boom', appHandler.LastMessage, 'with the handler''s exception as the one being handled');
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.IsFalse(Pos('handler raised', proc.Errors.Text) > 0, 'reported to the application, so not logged as well: ' + proc.Errors.Text);
+  finally
+    if runner <> nil then
+    begin
+      runner.WaitFor;
+      runner.Free;
+    end;
+    proc := nil;
+    appHandler.Free;
+    recorder.Free;
+  end;
+end;
+
+procedure TProcessRunApiTests.OnExitRaises_Marshalled_GoesToTheApplicationHandler;
+var
+  proc : IProcess;
+  recorder : TEventRecorder;
+  appHandler : TApplicationHandlerStub;
+begin
+  recorder := TEventRecorder.Create;
+  appHandler := TApplicationHandlerStub.Create;
+  try
+    recorder.RaiseInExited := True;
+    proc := NewExitProcess(3);
+    proc.StartInfo.MarshallEventsToMainThread := True;
+    proc.OnExit := recorder.HandleExited;
+    Assert.IsTrue(proc.ExecuteAsync, proc.Errors.Text);
+    // Queued by the run's worker thread to this one.
+    Assert.IsTrue(PumpUntil(recorder.ExitedFired, 30000), 'OnExit was never called');
+    Assert.AreEqual<Integer>(1, appHandler.Calls, 'the application''s exception handler should be called once');
+    Assert.AreEqual('exited-boom', appHandler.LastMessage, 'with the handler''s exception as the one being handled');
+    Assert.AreEqual(TProcessStatus.Exited, proc.Status, proc.Errors.Text);
+    Assert.IsFalse(Pos('handler raised', proc.Errors.Text) > 0, 'reported to the application, so not logged as well: ' + proc.Errors.Text);
+  finally
+    proc := nil;
+    appHandler.Free;
     recorder.Free;
   end;
 end;

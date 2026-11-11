@@ -182,7 +182,19 @@ Values added with `AddSensitive(name, value)` render as `****` in `ToLogString` 
 
 With `MarshallEventsToMainThread := True`, a handler that would run on any thread other than the main thread is queued to the main thread with `TThread.Queue` instead (for `OnExit` the exit code is snapshotted at queue time). This applies to a synchronous `Execute` called from a background thread too; a handler that would already run on the main thread is called directly.
 
-If your handler touches the VCL/FMX UI from an async run, set `MarshallEventsToMainThread := True` (or `Synchronize` / `TThread.Queue` inside your handler). Queued events are run by the main thread's message loop; a console application must call `CheckSynchronize` for them to run. Exceptions raised by a handler are caught and appended to `IProcess.Errors` rather than propagating.
+If your handler touches the VCL/FMX UI from an async run, set `MarshallEventsToMainThread := True` (or `Synchronize` / `TThread.Queue` inside your handler). Queued events are run by the main thread's message loop; a console application must call `CheckSynchronize` for them to run.
+
+**A handler that raises.** A handler called on the thread that called `Execute*` raises to that caller. Where there is no caller to raise to, the exception is reported instead and the run goes on:
+
+| Where the handler runs | What happens to its exception |
+|------------------------|-------------------------------|
+| `OnStarted`, on the thread that called `Execute` / `ExecuteAsync` | The child is stopped and the run is completed (targets get their `Done`, `OnExit` fires, `Status` ends `Terminated` unless the child had already exited by itself). Then the exception is raised from `Execute` / `ExecuteAsync`, so no run is in progress when the caller gets it. |
+| `OnStarted`, from `ExecuteDetached` | Raised from `ExecuteDetached`. The child is already detached and stays running. |
+| `OnExit`, on the thread that called `Execute` | Raised from `Execute`. The run has completed, so `Status`, `ExitCode` and the output are valid. |
+| `OnExit`, on the `ExecuteAsync` worker thread | Logged to `Errors`, shortly after `Status` has left `Running`: that thread has no caller. |
+| Either event, queued to the main thread | Passed to the application's exception handler when there is one (`System.Classes.ApplicationHandleException`, which a VCL or FMX application sets), otherwise logged to `Errors`. |
+
+When `OnStarted` and `OnExit` both raise in one run, the caller gets what `OnStarted` raised and what `OnExit` raised is logged to `Errors`.
 
 For the worker-thread cases, the implementation captures a live `IProcess` reference so the process object cannot be destroyed under the handler; safe to drop your `IProcess` ref immediately after `ExecuteAsync` returns. `OnExit` fires after the run has completed, so a handler may start the next run.
 

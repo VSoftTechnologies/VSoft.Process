@@ -132,7 +132,9 @@ type
     FTerminateLock : TCriticalSection;
 
     function StartRun(const cancellationToken : ICancellationToken; const cancellationEvent : TEvent; mode : TProcessStartMode) : boolean;
-    procedure RunWorker;
+    // Waits for the child, completes the run and fires OnExit, on the calling
+    // thread. raiseToCaller is passed to DoOnExited.
+    procedure RunWorker(raiseToCaller : boolean);
     procedure CompleteRun(const outcome : TProcessOutcome);
     procedure AbortStart;
     procedure DeliverTo(const slots : TArray<TPipeTargetSlot>; isStdErr : boolean; const buffer : TBytes; count : NativeUInt);
@@ -224,11 +226,21 @@ type
     // How long to keep reading after the child has gone.
     function GetDrainTimeout(killed : boolean) : Cardinal;
 
-    // Fire the user-supplied OnStarted / OnExit handlers. Wrapped in try/except
-    // so a misbehaving handler can't crash the worker thread or leak an
-    // exception out of an internal start path.
+    // Fire the user-supplied OnStarted / OnExit handlers. A handler queued to
+    // the main thread has no caller to raise to: what it raises goes to the
+    // application's exception handler, or to Errors when there is none.
+    //
+    // Called directly, DoOnStarted raises what the handler raised. It is then
+    // for the caller to stop and complete the run before passing it on.
     procedure DoOnStarted;
-    procedure DoOnExited(exitCode : Cardinal);
+    // Called directly, what the handler raised is raised from here when
+    // raiseToCaller is set (a synchronous Execute, whose caller gets it) and
+    // logged to Errors otherwise: the ExecuteAsync worker thread has no caller,
+    // and a run being completed for an earlier exception passes that one on.
+    procedure DoOnExited(exitCode : Cardinal; raiseToCaller : boolean);
+    // For use in an except block, where an OnStarted / OnExit handler raised.
+    procedure LogHandlerException(const eventName : string);
+    procedure ReportQueuedHandlerException(const eventName : string);
 
     procedure ResetStatus;virtual;
     function IsReadyForRun : boolean;
@@ -417,6 +429,18 @@ begin
     result[i].Target := list[i];
     result[i].StartedIndex := -1;
   end;
+end;
+
+// The exception being handled, as text for Errors. For use in an except block.
+function CurrentExceptionText : string;
+var
+  raised : TObject;
+begin
+  raised := ExceptObject;
+  if raised is Exception then
+    result := raised.ClassName + ' - ' + Exception(raised).Message
+  else
+    result := 'a non-Exception object';
 end;
 
 { TProcessBase }
@@ -609,7 +633,8 @@ begin
     ReleaseRunClaim;
   end;
   // OnStarted fires for detached too. OnExit cannot - the OS never tells us a
-  // detached process exited.
+  // detached process exited. What the handler raises goes to the caller; the
+  // child is out of reach by now and stays running.
   if result then
     DoOnStarted;
 end;
@@ -743,8 +768,18 @@ begin
   if not result then
     exit;
   SetStatusAtomic(TProcessStatus.Running);
-  DoOnStarted;
-  RunWorker;
+  try
+    DoOnStarted;
+  except
+    // The caller gets what the handler raised, and no run may be left in
+    // progress behind it: stop the child and complete the run first. What
+    // OnExit raises now is logged, the first exception being the one to pass
+    // on.
+    FTerminateEvent.SetEvent;
+    RunWorker(false);
+    raise;
+  end;
+  RunWorker(true);
 end;
 
 function TProcessBase.InternalStartAsync: boolean;
@@ -776,28 +811,31 @@ begin
   if not result then
     exit;
   SetStatusAtomic(TProcessStatus.Running);
-  // Fired on the calling thread before ExecuteAsync returns.
-  DoOnStarted;
   // The closure holds an IProcess reference so the worker keeps Self alive
   // even if the caller drops theirs while the child is still running.
   selfRef := Self;
   try
+    // Fired on the calling thread before ExecuteAsync returns.
+    DoOnStarted;
     worker := TThread.CreateAnonymousThread(
       procedure
       begin
         try
-          RunWorker;
+          // The worker thread has no caller for an OnExit handler to raise to.
+          RunWorker(false);
         finally
           selfRef := nil;
         end;
       end);
   except
-    // No monitor thread: stop the child and clean up on this thread. selfRef
-    // is kept until RunWorker has returned, so an OnExit handler that drops
-    // the caller's last reference cannot free this object under it.
+    // OnStarted raised, or there is no monitor thread. The caller gets the
+    // exception, and no run may be left in progress behind it: stop the child
+    // and complete the run on this thread. selfRef is kept until RunWorker
+    // has returned, so an OnExit handler that drops the caller's last
+    // reference cannot free this object under it.
     FTerminateEvent.SetEvent;
     FWorkerThreadId := CurrentThreadId;
-    RunWorker;
+    RunWorker(false);
     selfRef := nil;
     raise;
   end;
@@ -805,7 +843,7 @@ begin
   worker.Start;
 end;
 
-procedure TProcessBase.RunWorker;
+procedure TProcessBase.RunWorker(raiseToCaller : boolean);
 var
   outcome : TProcessOutcome;
   keepAlive : IInterface;
@@ -834,7 +872,7 @@ begin
       FDetachedOwnerRef := nil;
       CompleteRun(outcome);
     end;
-    DoOnExited(outcome.ExitCode);
+    DoOnExited(outcome.ExitCode, raiseToCaller);
   finally
     keepAlive := nil;
   end;
@@ -907,21 +945,31 @@ begin
         try
           handler(selfRef);
         except
-          on E: Exception do
-            LogError('OnStarted handler raised: ' + E.ClassName + ' - ' + E.Message);
+          ReportQueuedHandlerException('OnStarted');
         end;
       end);
     Exit;
   end;
-  try
-    handler(Self);
-  except
-    on E: Exception do
-      LogError('OnStarted handler raised: ' + E.ClassName + ' - ' + E.Message);
-  end;
+  handler(Self);
 end;
 
-procedure TProcessBase.DoOnExited(exitCode : Cardinal);
+procedure TProcessBase.LogHandlerException(const eventName : string);
+begin
+  LogError(eventName + ' handler raised: ' + CurrentExceptionText);
+end;
+
+procedure TProcessBase.ReportQueuedHandlerException(const eventName : string);
+begin
+  // On the main thread, where a VCL / FMX application installs its handler.
+  // Later RTL versions do the same in CheckSynchronize, but drop the
+  // exception when there is no handler; earlier ones raise it from there.
+  if Assigned(ApplicationHandleException) then
+    ApplicationHandleException(Self)
+  else
+    LogHandlerException(eventName);
+end;
+
+procedure TProcessBase.DoOnExited(exitCode : Cardinal; raiseToCaller : boolean);
 var
   handler : TProcessExitedEvent;
   selfRef : IProcess;
@@ -938,8 +986,7 @@ begin
         try
           handler(selfRef, exitCode);
         except
-          on E: Exception do
-            LogError('OnExit handler raised: ' + E.ClassName + ' - ' + E.Message);
+          ReportQueuedHandlerException('OnExit');
         end;
       end);
     Exit;
@@ -947,8 +994,9 @@ begin
   try
     handler(Self, exitCode);
   except
-    on E: Exception do
-      LogError('OnExit handler raised: ' + E.ClassName + ' - ' + E.Message);
+    if raiseToCaller then
+      raise;
+    LogHandlerException('OnExit');
   end;
 end;
 

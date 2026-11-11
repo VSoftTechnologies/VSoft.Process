@@ -360,6 +360,9 @@ type
     // (UI-safe). Default False - events fire on the worker thread (no
     // marshalling overhead, but UI access must Synchronize/Queue itself).
     // Console apps must pump CheckSynchronize for queued events to run.
+    // What a queued handler raises goes to the application's exception
+    // handler (System.Classes.ApplicationHandleException) when there is one,
+    // otherwise to Errors.
     property MarshallEventsToMainThread : boolean read GetMarshallEventsToMainThread write SetMarshallEventsToMainThread;
     // How long to keep reading stdout/stderr after the child has exited, for
     // output still held by a descendant that inherited the pipe (a background
@@ -679,13 +682,17 @@ type
 
     /// <summary>
     ///  Executes the process and returns when the process exits;
-    ///  returns true if the process started
+    ///  returns true if the process started.
+    ///  Raises what an OnStarted / OnExit handler called on this thread
+    ///  raised, once the run has completed (see the events below).
     ///  </summary>
     function Execute(const cancellationToken : ICancellationToken = nil) : boolean;overload;
 
     /// <summary>
     ///  Executes the process and returns when the process exits;
-    ///  returns true if the process started.                                    `
+    ///  returns true if the process started.
+    ///  Raises what an OnStarted / OnExit handler called on this thread
+    ///  raised, once the run has completed (see the events below).
     ///  </summary>
     function Execute(const cancellationEvent : TEvent) : boolean;overload;
 
@@ -693,6 +700,8 @@ type
     /// <summary>
     ///  Executes the process and returns true if process started;
     ///  Use the status method or events to determine when process completed.
+    ///  Raises what an OnStarted handler called on this thread raised, with
+    ///  the child stopped and the run completed (see the events below).
     ///  </summary>
     function ExecuteAsync(const cancellationToken : ICancellationToken = nil) : boolean;overload;
 
@@ -700,6 +709,8 @@ type
     /// <summary>
     ///  Executes the process and returns true if process started;
     ///  Use the status method or events to determine when process completed.
+    ///  Raises what an OnStarted handler called on this thread raised, with
+    ///  the child stopped and the run completed (see the events below).
     ///  </summary>
     function ExecuteAsync(const cancellationEvent : TEvent) : boolean;overload;
 
@@ -720,6 +731,8 @@ type
     ///  - Terminate returns False (cannot terminate a detached process).
     ///  - ProcessId is populated on Windows (the immediate child) but is
     ///    0 on POSIX (the grandchild PID is lost across the double-fork).
+    ///  - What an OnStarted handler called on this thread raises is raised
+    ///    from here; the child is already detached and stays running.
     /// </summary>
     function ExecuteDetached : boolean;
 
@@ -802,6 +815,18 @@ type
     {$ENDIF}
 
     //events
+    // A handler called on the thread that called Execute* raises to that
+    // caller. When it is OnStarted, the child is stopped and the run
+    // completed first (targets get Done, OnExit fires), so no run is in
+    // progress when Execute / ExecuteAsync raises; ExecuteDetached can't stop
+    // its child. OnExit raises from a synchronous Execute, the run having
+    // completed. If both raise, the caller gets what OnStarted raised and
+    // OnExit's exception is logged to Errors.
+    // Where there is no caller the exception is reported instead: OnExit on
+    // the ExecuteAsync worker thread is logged to Errors, and a handler
+    // queued to the main thread (StartInfo.MarshallEventsToMainThread) goes
+    // to the application's exception handler when there is one, otherwise
+    // to Errors.
     property OnStarted : TProcessStartedEvent read GetOnStarted write SetOnStarted;
     property OnExit : TProcessExitedEvent read GetOnExited write SetOnExited;
 
