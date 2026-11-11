@@ -3,6 +3,10 @@
 interface
 
 uses
+  {$IFDEF MSWINDOWS}
+  // First, so that nothing in it hides a name from the units below.
+  Winapi.Windows,
+  {$ENDIF}
   DUnitX.TestFramework,
   System.SysUtils,
   System.Classes,
@@ -23,6 +27,18 @@ type
     function FeedLines(const encoding : TEncoding; const chunks : array of TBytes) : string;
     // Feeds bytes to a fresh line target split in two at every position.
     procedure CheckEverySplitPoint(const encoding : TEncoding; const text : string; const expected : string);
+    {$IFDEF MSWINDOWS}
+    // Feeds each chunk to a fresh ToStringBuilder target and returns its text.
+    function FeedBuilder(const encoding : TEncoding; const chunks : array of TBytes) : string;
+    // The code page a pseudo code page (CP_OEMCP, CP_THREAD_ACP) stands for
+    // on this machine.
+    function RealCodePageOf(pseudoCodePage : Cardinal) : Cardinal;
+    // text in the encoding's bytes, after a byte order mark when the encoding
+    // is UTF-8.
+    function SampleBytes(const encoding : TEncoding; const text : string) : TBytes;
+    procedure CheckStringBuilderPseudoCodePage(pseudoCodePage : Cardinal);
+    procedure CheckLineTargetPseudoCodePage(pseudoCodePage : Cardinal);
+    {$ENDIF}
   public
     // C1 - TStreamPipeTarget.HandleData previously called
     //   FStream.WriteBuffer(data, dataLength)
@@ -246,6 +262,24 @@ type
     // lines by the new encoding, not the old run's code unit size.
     [Test]
     procedure LineTarget_WithoutStart_InjectedUtf16ThenUtf8_SplitsLines;
+
+    {$IFDEF MSWINDOWS}
+    // TEncoding.GetEncoding(CP_OEMCP) (and CP_THREAD_ACP) reports the pseudo
+    // code page number as its CodePage, not the code page that stands for on
+    // this machine. A target given such an encoding must decode exactly as
+    // with the real code page: where that is UTF-8 (the system code page set
+    // to UTF-8) a character split across two reads stays whole and the byte
+    // order mark is dropped. With a single-byte code page there is nothing
+    // to get wrong, so these only bite on a UTF-8 or double-byte system.
+    [Test]
+    procedure StringBuilderTarget_OemPseudoCodePage_DecodesAsTheRealCodePage;
+    [Test]
+    procedure StringBuilderTarget_ThreadAnsiPseudoCodePage_DecodesAsTheRealCodePage;
+    [Test]
+    procedure LineTarget_OemPseudoCodePage_DecodesAsTheRealCodePage;
+    [Test]
+    procedure LineTarget_ThreadAnsiPseudoCodePage_DecodesAsTheRealCodePage;
+    {$ENDIF}
 
 
     // An injected OutputEncoding belongs to one run: a later run with no
@@ -1774,6 +1808,138 @@ begin
     stream.Free;
   end;
 end;
+
+{$IFDEF MSWINDOWS}
+function TPipeTargetTests.FeedBuilder(const encoding : TEncoding; const chunks : array of TBytes) : string;
+var
+  target : IPipeTarget;
+  sb : TStringBuilder;
+  i : integer;
+begin
+  sb := TStringBuilder.Create;
+  try
+    target := TPipeTarget.ToStringBuilder(sb, encoding);
+    target.Start;
+    for i := 0 to High(chunks) do
+      target.HandleData(chunks[i], Length(chunks[i]));
+    target.Done;
+    target := nil;
+    result := sb.ToString;
+  finally
+    sb.Free;
+  end;
+end;
+
+function TPipeTargetTests.RealCodePageOf(pseudoCodePage : Cardinal) : Cardinal;
+var
+  info : TCPInfoEx;
+begin
+  if pseudoCodePage = CP_OEMCP then
+    exit(GetOEMCP);
+  Assert.IsTrue(GetCPInfoEx(pseudoCodePage, 0, info), 'GetCPInfoEx failed for code page ' + IntToStr(pseudoCodePage));
+  result := info.CodePage;
+end;
+
+function TPipeTargetTests.SampleBytes(const encoding : TEncoding; const text : string) : TBytes;
+var
+  body : TBytes;
+begin
+  body := encoding.GetBytes(text);
+  if encoding.CodePage <> CP_UTF8 then
+    exit(body);
+  SetLength(result, 3 + Length(body));
+  result[0] := $EF;
+  result[1] := $BB;
+  result[2] := $BF;
+  Move(body[0], result[3], Length(body));
+end;
+
+procedure TPipeTargetTests.CheckStringBuilderPseudoCodePage(pseudoCodePage : Cardinal);
+var
+  realCodePage : Cardinal;
+  realEncoding : TEncoding;
+  pseudoEncoding : TEncoding;
+  full : TBytes;
+  part1 : TBytes;
+  part2 : TBytes;
+  expected : string;
+  splitAt : integer;
+begin
+  realCodePage := RealCodePageOf(pseudoCodePage);
+  realEncoding := TEncoding.GetEncoding(Integer(realCodePage));
+  pseudoEncoding := TEncoding.GetEncoding(Integer(pseudoCodePage));
+  try
+    full := SampleBytes(realEncoding, 'a' + Char($E9) + Char($4E2D) + 'b');
+    expected := FeedBuilder(realEncoding, [full]);
+    Assert.AreEqual(expected, FeedBuilder(pseudoEncoding, [full]),
+                    'single read, pseudo code page ' + IntToStr(pseudoCodePage) + ' standing for ' + IntToStr(realCodePage));
+    for splitAt := 1 to Length(full) - 1 do
+    begin
+      part1 := Copy(full, 0, splitAt);
+      part2 := Copy(full, splitAt, Length(full) - splitAt);
+      Assert.AreEqual(expected, FeedBuilder(pseudoEncoding, [part1, part2]),
+                      'split at byte ' + IntToStr(splitAt) + ' of ' + IntToStr(Length(full)) + ', pseudo code page ' +
+                      IntToStr(pseudoCodePage) + ' standing for ' + IntToStr(realCodePage));
+    end;
+  finally
+    pseudoEncoding.Free;
+    realEncoding.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.CheckLineTargetPseudoCodePage(pseudoCodePage : Cardinal);
+var
+  realCodePage : Cardinal;
+  realEncoding : TEncoding;
+  pseudoEncoding : TEncoding;
+  full : TBytes;
+  part1 : TBytes;
+  part2 : TBytes;
+  expected : string;
+  splitAt : integer;
+begin
+  realCodePage := RealCodePageOf(pseudoCodePage);
+  realEncoding := TEncoding.GetEncoding(Integer(realCodePage));
+  pseudoEncoding := TEncoding.GetEncoding(Integer(pseudoCodePage));
+  try
+    full := SampleBytes(realEncoding, 'a' + Char($E9) + Char($4E2D) + 'b'#10'second'#10);
+    expected := FeedLines(realEncoding, [full]);
+    Assert.AreEqual(expected, FeedLines(pseudoEncoding, [full]),
+                    'single read, pseudo code page ' + IntToStr(pseudoCodePage) + ' standing for ' + IntToStr(realCodePage));
+    for splitAt := 1 to Length(full) - 1 do
+    begin
+      part1 := Copy(full, 0, splitAt);
+      part2 := Copy(full, splitAt, Length(full) - splitAt);
+      Assert.AreEqual(expected, FeedLines(pseudoEncoding, [part1, part2]),
+                      'split at byte ' + IntToStr(splitAt) + ' of ' + IntToStr(Length(full)) + ', pseudo code page ' +
+                      IntToStr(pseudoCodePage) + ' standing for ' + IntToStr(realCodePage));
+    end;
+  finally
+    pseudoEncoding.Free;
+    realEncoding.Free;
+  end;
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_OemPseudoCodePage_DecodesAsTheRealCodePage;
+begin
+  CheckStringBuilderPseudoCodePage(CP_OEMCP);
+end;
+
+procedure TPipeTargetTests.StringBuilderTarget_ThreadAnsiPseudoCodePage_DecodesAsTheRealCodePage;
+begin
+  CheckStringBuilderPseudoCodePage(CP_THREAD_ACP);
+end;
+
+procedure TPipeTargetTests.LineTarget_OemPseudoCodePage_DecodesAsTheRealCodePage;
+begin
+  CheckLineTargetPseudoCodePage(CP_OEMCP);
+end;
+
+procedure TPipeTargetTests.LineTarget_ThreadAnsiPseudoCodePage_DecodesAsTheRealCodePage;
+begin
+  CheckLineTargetPseudoCodePage(CP_THREAD_ACP);
+end;
+{$ENDIF}
 
 initialization
   TDUnitX.RegisterTestFixture(TPipeTargetTests);

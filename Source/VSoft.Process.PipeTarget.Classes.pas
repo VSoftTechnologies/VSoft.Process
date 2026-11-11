@@ -255,6 +255,27 @@ type
   // ended by a zero pair (the layout of TCPInfo.LeadByte).
   TLeadByteRanges = array[0..11] of Byte;
 
+// The code page an encoding converts with. TEncoding.GetEncoding(CP_OEMCP)
+// (and CP_MACCP, CP_THREAD_ACP) keeps the pseudo code page number as its
+// CodePage, whatever code page that stands for on this machine, so looking
+// for UTF-8 by CodePage alone misses it where the system code page is UTF-8.
+// CP_ACP needs nothing: the RTL resolves it itself.
+function EffectiveCodePage(const encoding : TEncoding) : Cardinal;
+{$IFDEF MSWINDOWS}
+var
+  info : TCPInfoEx;
+{$ENDIF}
+begin
+  result := encoding.CodePage;
+  {$IFDEF MSWINDOWS}
+  case result of
+    CP_OEMCP, CP_MACCP, CP_THREAD_ACP :
+      if GetCPInfoEx(result, 0, info) then
+        result := info.CodePage;
+  end;
+  {$ENDIF}
+end;
+
 // Length of the byte order mark of the code page at the start of data: 0 when
 // there is none, -1 when data is too short to tell (all of it is the start of
 // the mark).
@@ -604,7 +625,7 @@ begin
   result := dataLength;
   if (encoding = nil) or (dataLength <= 0) then
     exit;
-  case encoding.CodePage of
+  case EffectiveCodePage(encoding) of
     CP_UTF8_VALUE : result := Utf8CompleteLength(data, dataLength);
     CP_UTF16LE    : result := Utf16CompleteLength(data, dataLength, false);
     CP_UTF16BE    : result := Utf16CompleteLength(data, dataLength, true);
@@ -782,7 +803,7 @@ begin
   skipLen := 0;
   if not FBomChecked[isStdErr] then
   begin
-    skipLen := BomLength(FEncoding.CodePage, bytes, totalLen);
+    skipLen := BomLength(EffectiveCodePage(FEncoding), bytes, totalLen);
     if skipLen < 0 then
     begin
       // A read ended inside what may be the byte order mark.
@@ -1022,7 +1043,7 @@ begin
     // ends inside the mark while more bytes can follow: the mark holds no
     // line feed and is shorter than the forced break.
     state.BomChecked := true;
-    skipLen := BomLength(FEncoding.CodePage, state.PendingBytes, decodeLen);
+    skipLen := BomLength(EffectiveCodePage(FEncoding), state.PendingBytes, decodeLen);
     if skipLen < 0 then
       skipLen := 0;
   end;
